@@ -206,7 +206,9 @@ function AdminEquityChart({ points, height = 200 }: { points: number[]; height?:
             vectorEffect="non-scaling-stroke"
           />
         </svg>
-        <span className="chart__placeholder">no fills to plot yet</span>
+        <span className="chart__placeholder">
+          {points.length === 1 ? 'one fill so far — a curve needs two' : 'no fills to plot yet'}
+        </span>
       </div>
     );
   }
@@ -667,7 +669,11 @@ export function AdminPanel({
           <Panel
             title="Equity curve"
             hint={usingLive ? 'live fills' : 'simulated fills'}
-            actions={<span className="panel__badge">{summary.totalTrades} fills</span>}
+            actions={
+              <span className="panel__badge">
+                {summary.totalTrades} {summary.totalTrades === 1 ? 'fill' : 'fills'}
+              </span>
+            }
           >
             <AdminEquityChart points={equitySeries} />
           </Panel>
