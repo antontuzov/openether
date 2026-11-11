@@ -303,6 +303,14 @@ ticks/errors.
 The dashboard is a static bundle, so GitHub Pages hosts it for free at
 `https://<user>.github.io/<repo>/` — no domain purchase, no DNS, no expiry.
 
+This repo is published at **https://antontuzov.github.io/openether/**.
+
+A published page has no Rust core behind it. The dashboard detects that on
+boot and switches itself to the **simulator**, so a visitor gets a working
+paper-trading terminal rather than an empty screen: 50 markets priced from the
+free CoinGecko feed, the same risk caps, and fills persisted to `localStorage`.
+Nothing there is real money and no keys are involved.
+
 `.github/workflows/pages.yml` builds and deploys on every push to `main`.
 Vite uses `base: '/openether/'` for production builds and `/` in dev; override
 with `VITE_BASE_PATH` for a custom domain.
@@ -368,6 +376,14 @@ Checked locally on macOS (arm64):
   `symbol_not_allowed`, a 2 SOL round trip charging 5 bps per side and booking
   the realized PnL, and equity reconciling to the cent
   (`10000 − fees + realized`).
+- The **published** site exercised in a real browser with no core running: it
+  falls back to the simulator on its own, prices 50 markets from the free
+  CoinGecko feed, refuses a 0.05 BTC order with the 20% position cap, fills
+  0.02 BTC while locking margin and charging exactly one fee, and persists to
+  `localStorage`. The admin gate rejects a wrong password and unlocks on the
+  right one, revealing the pivot table and charts.
+- Contrast re-audited on the deployed bundle in both themes — 855 visible text
+  nodes each, zero WCAG AA failures.
 
 **Not verified:** live exchange connections (no credentials were used), real
 on-chain transactions (no broadcast path exists), and the <10µs dispatch target
@@ -405,6 +421,9 @@ Bugs found and fixed during that verification:
   does not exist — reset confirmation is unconditional and cannot be disabled.
 - `CORE_MCP_ARGS` used a manifest path relative to the repo root, but pnpm runs
   the agent from `ts/packages/agent`, so the MCP server could not start.
+- The admin equity curve needs two points to draw, but with exactly one fill it
+  said "no fills to plot yet" beside a badge reading "1 fills". Both now
+  describe what is on screen.
 
 ---
 
