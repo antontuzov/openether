@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/mcp-server"]
+exclude = ["crates/strategies/momentum"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+aes-gcm = "0.10"
+anyhow = "1.0"
+argon2 = "0.5"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws", "macros"] }
+base64 = "0.22"
+bs58 = "0.5"
+ed25519-dalek = "2"
+futures-util = "0.3"
+hmac = "0.12"
+k256 = { version = "0.13", features = ["ecdsa"] }
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+rustls = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sha3 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.27", default-features = false, features = ["rustls-tls-webpki-roots", "connect", "handshake"] }
+tokio-util = "0.7"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+wasmtime = { version = "37", default-features = false, features = ["cranelift", "runtime", "std", "gc", "gc-drc"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

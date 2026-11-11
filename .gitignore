@@ -1,0 +1,24 @@
+# Build output
+dist/
+target/
+node_modules/
+
+# Local secrets and configuration
+.env
+.env.local
+*.keystore
+*.key
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Agent runtime state (memory + logs)
+data/

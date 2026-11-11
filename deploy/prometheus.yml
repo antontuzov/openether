@@ -1,0 +1,23 @@
+# Prometheus scrape configuration for a local openEther run.
+#
+#   prometheus --config.file=deploy/prometheus.yml
+#
+# The core exposes its metrics on :8080/metrics and the agent on :9090/metrics.
+# Both run as ordinary local processes — no container runtime involved.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: openether-core
+    static_configs:
+      - targets: ['127.0.0.1:8080']
+        labels:
+          service: openether-core
+
+  - job_name: openether-agent
+    static_configs:
+      - targets: ['127.0.0.1:9090']
+        labels:
+          service: openether-agent

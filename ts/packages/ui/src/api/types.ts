@@ -1,0 +1,181 @@
+/**
+ * Wire types for the openEther core engine.
+ *
+ * Mirrors `docs/api-contract.md` and the serde types in
+ * `rust/crates/core/src/types.rs`. Field names are kept exactly as the engine
+ * serialises them (snake_case) so no mapping layer is needed.
+ */
+
+/** Venues the engine can trade on. */
+export type Venue = 'paper' | 'binance' | 'kraken' | 'hyperliquid';
+
+/** Order side as serialised by the engine (`buy` / `sell`). */
+export type Side = 'buy' | 'sell';
+
+/** Circuit breaker state. */
+export type BreakerState = 'closed' | 'half_open' | 'open';
+
+/** A single market data point. */
+export interface MarketTick {
+  venue: Venue;
+  symbol: string;
+  price: number;
+  size: number;
+  ts_ms: number;
+}
+
+/** An open position. `qty` is signed: positive = long, negative = short. */
+export interface Position {
+  venue: Venue;
+  symbol: string;
+  qty: number;
+  avg_entry: number;
+  mark_price: number;
+  unrealized_pnl: number;
+  notional_usd: number;
+  ts_ms: number;
+}
+
+/** A completed fill. */
+export interface TradeRecord {
+  id: string;
+  venue: Venue;
+  symbol: string;
+  side: Side;
+  qty: number;
+  price: number;
+  fee: number;
+  realized_pnl: number;
+  ts_ms: number;
+  rationale: string;
+  /** `agent` | `strategy` | `manual` */
+  source: string;
+}
+
+/** A log line pushed by the engine or the AI agent. */
+export interface LogEntry {
+  id: string;
+  ts_ms: number;
+  /** `agent` | `risk` | `strategy` | `engine` | `mcp` */
+  source: string;
+  /** `info` | `warn` | `error` (free-form in practice) */
+  level: string;
+  message: string;
+  context: unknown;
+}
+
+/** Account-level snapshot. */
+export interface PortfolioSnapshot {
+  venue: Venue;
+  equity_usd: number;
+  cash_usd: number;
+  unrealized_pnl_usd: number;
+  realized_pnl_usd: number;
+  total_pnl_pct: number;
+  positions: Position[];
+  ts_ms: number;
+}
+
+/** Hard limits enforced by the risk layer. */
+export interface RiskLimits {
+  max_position_pct_of_equity: number;
+  max_gross_exposure_pct: number;
+  max_daily_loss_pct: number;
+  max_drawdown_pct: number;
+  max_open_positions: number;
+  max_order_notional_usd: number;
+}
+
+/** Live risk state, also pushed over the WebSocket. */
+export interface RiskState {
+  breaker_state: BreakerState;
+  breaker_reason: string | null;
+  equity_usd: number;
+  peak_equity_usd: number;
+  drawdown_pct: number;
+  daily_pnl_usd: number;
+  open_positions: number;
+  gross_exposure_usd: number;
+  limits: RiskLimits;
+}
+
+/** Metadata about the currently loaded WASM strategy. */
+export interface StrategyInfo {
+  name: string;
+  loaded_at_ms: number;
+  wasm_sha256: string;
+  ticks_processed: number;
+  fuel_used: number;
+}
+
+/** Health of a single venue. */
+export interface VenueHealth {
+  venue: Venue;
+  healthy: boolean;
+  live: boolean;
+}
+
+/** Engine lifecycle status pushed as a `status` frame. */
+export interface EngineStatus {
+  state: string;
+  detail: string;
+  ts_ms: number;
+}
+
+/**
+ * Response of `POST /api/strategy/reload`.
+ * The contract does not pin the body down, so every field is optional and the
+ * panel renders whatever the server sends.
+ */
+export interface StrategyReloadResponse {
+  name?: string;
+  loaded_at_ms?: number;
+  wasm_sha256?: string;
+  ticks_processed?: number;
+  fuel_used?: number;
+  ok?: boolean;
+  message?: string;
+  error?: string;
+}
+
+/** Response of `POST /api/breaker/reset`. */
+export interface BreakerResetResponse {
+  ok?: boolean;
+  message?: string;
+  error?: string;
+  breaker_state?: BreakerState;
+}
+
+/** A raw WebSocket frame: always `{ "type": ..., "data": ... }`. */
+export interface WsFrame {
+  type: string;
+  data?: unknown;
+}
+
+/** Maps a frame type to the payload carried in `data`. */
+export interface WsFrameDataMap {
+  tick: MarketTick;
+  trade: TradeRecord;
+  log: LogEntry;
+  portfolio: PortfolioSnapshot;
+  risk: RiskState;
+  status: EngineStatus;
+  pong: null;
+}
+
+/** Frame types with a known payload shape. */
+export type WsFrameType = keyof WsFrameDataMap;
+
+/**
+ * Narrow a raw frame to a known type without casting at the call site.
+ *
+ * ```ts
+ * if (isWsFrame(frame, 'tick')) frame.data.price; // MarketTick
+ * ```
+ */
+export function isWsFrame<K extends WsFrameType>(
+  frame: WsFrame,
+  type: K,
+): frame is WsFrame & { type: K; data: WsFrameDataMap[K] } {
+  return frame.type === type;
+}

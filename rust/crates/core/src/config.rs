@@ -1,0 +1,199 @@
+use crate::risk::RiskConfig;
+use crate::types::{Chain, Venue};
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub host: String,
+    pub port: u16,
+    pub venue: Venue,
+    pub symbols: Vec<String>,
+    pub live_trading: bool,
+    pub risk: RiskConfig,
+    /// Starting equity of the paper venue, used as the PnL baseline.
+    pub paper_start_equity: f64,
+    pub strategy_wasm: Option<PathBuf>,
+    pub wasm_fuel: u64,
+    pub wasm_memory_pages: u32,
+    pub contract_allowlist: HashSet<String>,
+    pub solana_rpc_url: Option<String>,
+    pub evm_rpc_urls: Vec<(String, String)>,
+    pub wallet: WalletConfig,
+}
+
+/// Wallet configuration.
+///
+/// The core never stores a private key in clear text. The keystore is an
+/// encrypted file; it is only unlocked for the duration of a dry-run
+/// signature and the unlocked key is wiped again when the lease expires.
+#[derive(Debug, Clone)]
+pub struct WalletConfig {
+    /// Path to the encrypted keystore. `None` disables the wallet entirely.
+    pub keystore_path: Option<PathBuf>,
+    /// Chain the keystore is expected to hold. `None` means "whatever the
+    /// keystore says".
+    pub chain: Option<Chain>,
+    /// When `false` the core refuses to sign, because live broadcast is not
+    /// implemented in this build. Only dry-run signing exists.
+    pub dry_run: bool,
+    /// How long an unlocked key may stay in memory before it is re-locked.
+    pub unlock_timeout_ms: i64,
+}
+
+impl Default for WalletConfig {
+    fn default() -> Self {
+        Self {
+            keystore_path: None,
+            chain: None,
+            dry_run: true,
+            unlock_timeout_ms: 300_000,
+        }
+    }
+}
+
+impl Config {
+    pub fn from_env() -> Self {
+        let live_trading = env_flag("OPENETHER_LIVE_TRADING");
+        let venue = std::env::var("OPENETHER_VENUE")
+            .ok()
+            .and_then(|v| Venue::parse(&v))
+            .unwrap_or(Venue::Paper);
+
+        let symbols = env_list("OPENETHER_SYMBOLS", &["SOL/USDT", "BTC/USDT", "ETH/USDT"]);
+        let allowlist = env_list(
+            "OPENETHER_SYMBOL_ALLOWLIST",
+            &["SOL/USDT", "BTC/USDT", "ETH/USDT"],
+        );
+        let venue_allowlist = env_list("OPENETHER_VENUE_ALLOWLIST", &["paper"])
+            .iter()
+            .filter_map(|v| Venue::parse(v))
+            .collect();
+
+        let risk = RiskConfig {
+            max_position_pct_of_equity: env_f64("OPENETHER_MAX_POSITION_PCT", 20.0),
+            max_gross_exposure_pct: env_f64("OPENETHER_MAX_GROSS_EXPOSURE_PCT", 60.0),
+            max_daily_loss_pct: env_f64("OPENETHER_MAX_DAILY_LOSS_PCT", 3.0),
+            max_drawdown_pct: env_f64("OPENETHER_MAX_DRAWDOWN_PCT", 10.0),
+            max_open_positions: env_usize("OPENETHER_MAX_OPEN_POSITIONS", 5),
+            max_order_notional_usd: env_f64("OPENETHER_MAX_ORDER_NOTIONAL_USD", 5000.0),
+            min_order_notional_usd: env_f64("OPENETHER_MIN_ORDER_NOTIONAL_USD", 10.0),
+            symbol_allowlist: allowlist.into_iter().collect(),
+            venue_allowlist,
+            contract_allowlist: env_list("OPENETHER_CONTRACT_ALLOWLIST", &[])
+                .into_iter()
+                .collect(),
+            breaker_cooldown_ms: env_i64("OPENETHER_BREAKER_COOLDOWN_MS", 300_000),
+            hard_halt_on_oversized_order: env_flag_or(
+                "OPENETHER_BREAKER_HALT_ON_OVERSIZED_ORDER",
+                true,
+            ),
+        };
+
+        Self {
+            host: std::env::var("CORE_HOST").unwrap_or_else(|_| "0.0.0.0".into()),
+            port: env_u16("CORE_PORT", 8080),
+            venue,
+            symbols,
+            live_trading,
+            risk,
+            paper_start_equity: env_f64("OPENETHER_PAPER_CASH", 10_000.0),
+            strategy_wasm: std::env::var("OPENETHER_STRATEGY_WASM")
+                .ok()
+                .map(PathBuf::from),
+            wasm_fuel: env_u64("OPENETHER_WASM_FUEL", 200_000_000),
+            wasm_memory_pages: env_u64("OPENETHER_WASM_MEMORY_PAGES", 32) as u32,
+            contract_allowlist: env_list("OPENETHER_CONTRACT_ALLOWLIST", &[])
+                .into_iter()
+                .collect(),
+            solana_rpc_url: std::env::var("SOLANA_RPC_URL")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            evm_rpc_urls: [("ethereum", "ETHEREUM_RPC_URL"), ("base", "BASE_RPC_URL")]
+                .iter()
+                .filter_map(|(name, key)| {
+                    std::env::var(key)
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .map(|url| ((*name).to_string(), url))
+                })
+                .collect(),
+            wallet: WalletConfig {
+                keystore_path: std::env::var("OPENETHER_WALLET_KEYSTORE")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .map(PathBuf::from),
+                chain: std::env::var("OPENETHER_WALLET_CHAIN")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .and_then(|v| crate::onchain::parse_chain(&v)),
+                dry_run: env_flag_or("OPENETHER_WALLET_DRY_RUN", true),
+                unlock_timeout_ms: env_i64("OPENETHER_WALLET_UNLOCK_TIMEOUT_MS", 300_000),
+            },
+        }
+    }
+
+    pub fn addr(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+fn env_flag(key: &str) -> bool {
+    matches!(
+        std::env::var(key)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn env_flag_or(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(v) if !v.is_empty() => env_flag(key),
+        _ => default,
+    }
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    env_u64(key, default as u64) as usize
+}
+
+fn env_u16(key: &str, default: u16) -> u16 {
+    env_u64(key, default as u64) as u16
+}
+
+fn env_i64(key: &str, default: i64) -> i64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_list(key: &str, default: &[&str]) -> Vec<String> {
+    let raw = std::env::var(key).unwrap_or_default();
+    let source: Vec<String> = if raw.trim().is_empty() {
+        default.iter().map(|s| s.to_string()).collect()
+    } else {
+        raw.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    source
+}

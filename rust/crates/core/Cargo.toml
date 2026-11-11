@@ -1,0 +1,42 @@
+[package]
+name = "openether-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "openEther event-driven trading core: event bus, exchange connectors, risk layer, WASM strategy sandbox"
+
+[dependencies]
+aes-gcm.workspace = true
+anyhow.workspace = true
+argon2.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+bs58.workspace = true
+ed25519-dalek.workspace = true
+futures-util.workspace = true
+hex = "0.4"
+hmac.workspace = true
+k256.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+wasmtime.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tower = { version = "0.5", features = ["util"] }
+wat = "1"

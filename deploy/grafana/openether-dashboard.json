@@ -1,0 +1,206 @@
+{
+  "title": "openEther",
+  "uid": "openether-main",
+  "tags": ["openether", "trading"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "venue",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(openether_orders_submitted_total, venue)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Equity (USD)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "openether_equity_usd{venue=~\"$venue\"}",
+          "legendFormat": "{{venue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "PnL (USD)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "openether_pnl_usd{venue=~\"$venue\"}",
+          "legendFormat": "{{venue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Event bus dispatch latency (p99)",
+      "description": "Target: under 10 microseconds.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum(rate(openether_event_dispatch_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.50, sum(rate(openether_event_dispatch_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "showPoints": "never" } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Order funnel",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(openether_orders_submitted_total[5m])) by (venue)",
+          "legendFormat": "submitted {{venue}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(openether_orders_filled_total[5m])) by (venue)",
+          "legendFormat": "filled {{venue}}"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(openether_orders_rejected_total[5m])) by (venue)",
+          "legendFormat": "rejected {{venue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "showPoints": "never" } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Drawdown (%)",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "openether_drawdown_pct{venue=~\"$venue\"}",
+          "legendFormat": "{{venue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "max": 100, "custom": { "lineWidth": 2, "showPoints": "never" } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Circuit breaker",
+      "description": "0 = closed, 1 = half open, 2 = open.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "openether_breaker_state{venue=~\"$venue\"}", "legendFormat": "{{venue}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "closed", "color": "green" } } },
+            { "type": "value", "options": { "1": { "text": "half open", "color": "orange" } } },
+            { "type": "value", "options": { "2": { "text": "open", "color": "red" } } }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Risk rejections per second",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(openether_orders_rejected_total[5m]))", "legendFormat": "rejected" },
+        { "refId": "B", "expr": "sum(rate(openether_breaker_trips_total[5m]))", "legendFormat": "breaker trips" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "showPoints": "never" } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Agent LLM latency (p95)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(openether_agent_llm_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "showPoints": "never" } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Strategy ticks and errors",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(openether_strategy_ticks_total[5m]))", "legendFormat": "ticks" },
+        { "refId": "B", "expr": "sum(rate(openether_strategy_errors_total[5m]))", "legendFormat": "errors" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "showPoints": "never" } },
+        "overrides": []
+      }
+    }
+  ]
+}
