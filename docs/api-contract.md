@@ -24,6 +24,8 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 | POST | `/api/orders` | Body `OrderRequest` → runs the risk layer, then submits |
 | POST | `/api/breaker/reset` | Body `{ "confirm": true }` → manual breaker reset |
 | GET | `/api/venues` | `[{ "venue": "paper", "healthy": true, "live": false }]` |
+| GET | `/api/wallet` | `WalletMetadata` — public wallet metadata, never a secret |
+| POST | `/api/wallet/sign-dry-run` | Body `{ "passphrase", "envelope", "account"? }` → `DryRunSignature` |
 
 ### `POST /api/orders`
 
@@ -49,6 +51,59 @@ Response `403` (rejected by the risk layer — never overridable):
 ```json
 { "approved": false, "reason": "position_size_exceeds_max_pct", "detail": "…", "breaker_state": "closed" }
 ```
+
+### `POST /api/wallet/sign-dry-run`
+
+Signs an envelope locally. The transaction is **never** broadcast: the answer
+always carries `"dry_run": true` and `"broadcast": false`.
+
+```json
+{
+  "passphrase": "…",
+  "envelope": {
+    "chain": "evm",
+    "nonce": 7,
+    "timestamp_ms": 1700000000000,
+    "to": "0x…",
+    "amount": 1.5,
+    "amount_raw": 1500000,
+    "fee": 21000,
+    "memo": ""
+  },
+  "account": { "chain": "solana", "index": 2 }
+}
+```
+
+`account` is optional. Omitted means the primary account. `chain` is `"evm"` or
+`"solana"`, `index` is the account index of an HD keystore. An account the
+keystore does not hold is refused with `account_not_found`.
+
+Response `200`:
+```json
+{
+  "dry_run": true,
+  "broadcast": false,
+  "chain": "evm",
+  "address": "0x…",
+  "public_key": "0x…",
+  "tx_hash": "0x…",
+  "signature": "0x…",
+  "envelope": { … },
+  "account": { "chain": "evm", "index": 0, "path": "m/44'/60'/0'/0/0", "address": "0x…", "public_key": "0x…" },
+  "signed_at_ms": 1700000000000,
+  "note": "dry run only: …"
+}
+```
+
+Error `4xx`:
+```json
+{ "ok": false, "error": "…", "code": "invalid_passphrase", "broadcast": false, "dry_run": true }
+```
+
+Codes: `wallet_not_configured`, `wallet_locked`, `wallet_lease_expired`,
+`invalid_passphrase`, `keystore_decrypt_failed`, `live_broadcast_unsupported`,
+`chain_mismatch`, `account_not_found`, `invalid_key`, `invalid_envelope`,
+`signature_invalid`, `unsupported_keystore_format`, `keystore_io_error`.
 
 ## Risk state
 

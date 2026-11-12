@@ -180,7 +180,7 @@ and memory limits and can be hot-swapped at runtime via
 ### Tests
 
 ```bash
-cargo test --workspace --manifest-path rust/Cargo.toml   # 84 tests
+cargo test --workspace --manifest-path rust/Cargo.toml   # 116 tests
 pnpm --dir ts -r test                                    # 92 tests
 pnpm --dir ts -r typecheck
 pnpm --dir ts -r build
@@ -253,6 +253,99 @@ flight.
 Leaving the variable unset (or set to `memory`) keeps everything in RAM. That is
 fine for a throwaway demo and **wrong for a live run**: equity would reset to
 zero and every limit would re-open.
+
+---
+
+## Wallet
+
+The wallet is **non-custodial and offline**: openEther holds an encrypted
+keystore on your disk, derives addresses from it and signs locally. There is no
+server in the middle, no key escrow and no keystore upload.
+
+### One keystore, many accounts
+
+A keystore is a single encrypted file that holds one of two things:
+
+| Type | Holds | Accounts |
+| --- | --- | --- |
+| `single` | one raw private key | one |
+| `hd` | a BIP-39 mnemonic | one per index per chain |
+
+An HD wallet derives **EVM** accounts over BIP-44 (`m/44'/60'/0'/0/i`) and
+**Solana** accounts over SLIP-0010 (`m/44'/501'/i'/0'`), so one recovery phrase
+covers both chains. The derivation is implemented in
+[rust/crates/core/src/hd.rs](rust/crates/core/src/hd.rs) against the published
+test vectors.
+
+### Creating a keystore
+
+```bash
+cd rust
+export OPENETHER_WALLET_PASSPHRASE='a long passphrase'
+
+# An HD wallet: 5 accounts per chain, recovery phrase printed once.
+cargo run --bin openether-wallet -- create-hd --path ../wallet.json --chain evm --accounts 5
+
+# Restore an existing recovery phrase.
+cargo run --bin openether-wallet -- import-hd --path ../wallet.json --chain evm \
+  --mnemonic "word one word two …"
+
+# One raw key (32 bytes of hex).
+cargo run --bin openether-wallet -- create --path ../wallet.json --chain solana \
+  --secret <64 hex characters>
+
+# Public metadata, without unlocking anything.
+cargo run --bin openether-wallet -- show --path ../wallet.json
+```
+
+The passphrase is read from `OPENETHER_WALLET_PASSPHRASE`, never from the
+command line, so it stays out of the shell history and the process list.
+
+Then point the core at the file:
+
+```bash
+OPENETHER_WALLET_KEYSTORE=./wallet.json
+OPENETHER_WALLET_CHAIN=evm
+```
+
+### How the file is protected
+
+- **Argon2id** (19 MiB, 2 passes) turns the passphrase into a 256-bit key.
+  The parameters are stored in the file, so a keystore written by an older
+  build still opens.
+- **AES-256-GCM** encrypts the payload. The associated data is a canonical
+  serialisation of every public header field, plus the wallet type and the
+  account list — so neither the wallet type nor the advertised addresses can
+  be edited after the fact. Tampering breaks decryption.
+- An **HMAC key-check tag** tells a wrong passphrase apart from a corrupted
+  file, in constant time.
+- The file is written with mode `0600` and holds **no secret in clear text**:
+  for an HD wallet the mnemonic is inside the ciphertext, so the words you
+  wrote down are the real backup.
+- The unlocked key lives in a `zeroize` wrapper, is bounded by an **unlock
+  lease** (`OPENETHER_WALLET_UNLOCK_TIMEOUT_MS`) and is wiped when the lease
+  expires — even if nothing asks for it again.
+- Version 1 keystores (one raw key) still open unchanged: their associated
+  data is kept byte-for-byte identical.
+
+### Choosing an account
+
+`POST /api/wallet/sign-dry-run` takes an optional `account` object:
+
+```json
+{ "passphrase": "…", "envelope": { … }, "account": { "chain": "solana", "index": 2 } }
+```
+
+Omitting it signs with the primary account. Asking for an account the keystore
+does not hold is refused — a single-key keystore answers `account_not_found`
+rather than quietly signing with the wrong key.
+
+### What it still cannot do
+
+The wallet **signs and logs, it does not broadcast**. Every response carries
+`"dry_run": true` and `"broadcast": false`, and `wallet.rs` contains no HTTP
+client, no RPC client and no socket. On-chain transactions need a signer the
+operator controls.
 
 ---
 
@@ -366,6 +459,7 @@ Copy `.env.example` to `.env`. The important defaults:
 | `OPENETHER_LIVE_TRADING` | `0` | master switch for real orders |
 | `OPENETHER_VENUE` | `paper` | `paper` / `binance` / `kraken` / `hyperliquid` (read-only) |
 | `OPENETHER_WALLET_DRY_RUN` | `1` | sign and log, never broadcast |
+| `OPENETHER_WALLET_ACCOUNTS` | `5` | accounts per chain in an HD keystore |
 | `OPENETHER_SYMBOL_ALLOWLIST` | `SOL/USDT,BTC/USDT,ETH/USDT` | tradable symbols |
 | `OPENETHER_CONTRACT_ALLOWLIST` | *(empty)* | permitted on-chain contracts |
 | `LLM_PROVIDER` | `local` | `local` / `openai` / `anthropic` / `openai-compatible` |
@@ -389,9 +483,13 @@ Exchange credentials are only read when `OPENETHER_LIVE_TRADING=1`. `.env`,
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **98 passing**, including the encrypted keystore,
+- `cargo test --workspace` — **116 passing**, including the encrypted keystore,
   EVM and Solana dry-run signing, signature tampering, wrong-passphrase
   rejection, and the API refusing to sign when dry run is off.
+- The HD wallet cross-validated against an independent Python implementation
+  of BIP-39, BIP-32/BIP-44 and SLIP-0010: all six derived addresses (3 EVM,
+  3 Solana) matched exactly, so the recovery phrase really does restore the
+  same accounts.
 - `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings`
   — clean, so the CI gate passes as written.
 - `pnpm -r test` — **92 passing** across the agent guard, the data server and

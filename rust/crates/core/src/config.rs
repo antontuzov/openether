@@ -43,6 +43,8 @@ pub struct WalletConfig {
     pub dry_run: bool,
     /// How long an unlocked key may stay in memory before it is re-locked.
     pub unlock_timeout_ms: i64,
+    /// How many accounts per chain an HD keystore holds.
+    pub accounts: u32,
 }
 
 impl Default for WalletConfig {
@@ -52,6 +54,7 @@ impl Default for WalletConfig {
             chain: None,
             dry_run: true,
             unlock_timeout_ms: 300_000,
+            accounts: 5,
         }
     }
 }
@@ -138,6 +141,7 @@ impl Config {
                     .and_then(|v| crate::onchain::parse_chain(&v)),
                 dry_run: env_flag_or("OPENETHER_WALLET_DRY_RUN", true),
                 unlock_timeout_ms: env_i64("OPENETHER_WALLET_UNLOCK_TIMEOUT_MS", 300_000),
+                accounts: env_u32("OPENETHER_WALLET_ACCOUNTS", 5),
             },
         }
     }
@@ -192,6 +196,10 @@ fn env_i64(key: &str, default: i64) -> i64 {
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(default)
+}
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    env_u64(key, default as u64) as u32
 }
 
 fn env_list(key: &str, default: &[&str]) -> Vec<String> {

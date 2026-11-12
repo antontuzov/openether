@@ -1,6 +1,6 @@
 use crate::engine::AppState;
 use crate::types::*;
-use crate::wallet::{TxEnvelope, WalletError, WalletService};
+use crate::wallet::{AccountSelector, TxEnvelope, WalletError, WalletService};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
@@ -343,6 +343,9 @@ struct WalletSignRequest {
     passphrase: String,
     /// The transaction envelope to sign.
     envelope: TxEnvelope,
+    /// Which account signs. Omitted means the primary account.
+    #[serde(default)]
+    account: AccountSelector,
 }
 
 async fn wallet_sign_dry_run(
@@ -350,7 +353,7 @@ async fn wallet_sign_dry_run(
     Json(request): Json<WalletSignRequest>,
 ) -> Response {
     let passphrase = Zeroizing::new(request.passphrase);
-    match wallet.sign_dry_run_with_passphrase(&passphrase, &request.envelope) {
+    match wallet.sign_dry_run_with_passphrase(&passphrase, &request.envelope, &request.account) {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(error) => {
             let status = wallet_error_status(&error);
@@ -378,6 +381,7 @@ fn wallet_error_status(error: &WalletError) -> StatusCode {
         WalletError::NotConfigured
         | WalletError::LiveBroadcastUnsupported
         | WalletError::ChainMismatch { .. }
+        | WalletError::AccountNotFound(_)
         | WalletError::InvalidKey
         | WalletError::InvalidEnvelope(_)
         | WalletError::UnsupportedFormat(_) => StatusCode::BAD_REQUEST,
@@ -393,6 +397,7 @@ fn wallet_error_code(error: &WalletError) -> &'static str {
         WalletError::DecryptFailed => "keystore_decrypt_failed",
         WalletError::LiveBroadcastUnsupported => "live_broadcast_unsupported",
         WalletError::ChainMismatch { .. } => "chain_mismatch",
+        WalletError::AccountNotFound(_) => "account_not_found",
         WalletError::InvalidKey => "invalid_key",
         WalletError::InvalidEnvelope(_) => "invalid_envelope",
         WalletError::SignatureInvalid => "signature_invalid",
@@ -491,6 +496,7 @@ mod tests {
             chain: None,
             dry_run: true,
             unlock_timeout_ms: 1_000,
+            accounts: 5,
         }))
     }
 
@@ -549,6 +555,7 @@ mod tests {
             Json(WalletSignRequest {
                 passphrase: passphrase.to_string(),
                 envelope: envelope(),
+                account: AccountSelector::default(),
             }),
         )
         .await;
@@ -567,12 +574,14 @@ mod tests {
             chain: Some(Chain::Evm),
             dry_run: false,
             unlock_timeout_ms: 1_000,
+            accounts: 5,
         }));
         let response = wallet_sign_dry_run(
             Extension(wallet),
             Json(WalletSignRequest {
                 passphrase: "unused".to_string(),
                 envelope: envelope(),
+                account: AccountSelector::default(),
             }),
         )
         .await;
@@ -612,6 +621,7 @@ mod tests {
             chain: Some(Chain::Evm),
             dry_run: true,
             unlock_timeout_ms: 5_000,
+            accounts: 5,
         };
         let state = crate::engine::AppState::new(config).unwrap();
         let app = router(Arc::clone(&state));

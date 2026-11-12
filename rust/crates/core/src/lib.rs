@@ -2,6 +2,7 @@ pub mod bus;
 pub mod config;
 pub mod engine;
 pub mod exchange;
+pub mod hd;
 pub mod metrics;
 pub mod onchain;
 pub mod risk;
