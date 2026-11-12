@@ -10,7 +10,9 @@
 //! # Live trading guard
 //!
 //! The connector never talks to the order endpoint unless it was built with
-//! `live_enabled = true` (see `OPENETHER_LIVE_TRADING`). Read-only calls
+//! `live_enabled = true`. That flag comes from the arming ceremony in
+//! `crate::live_arm`, so it is only ever set when the operator armed live
+//! trading for this venue and this risk configuration. Read-only calls
 //! (account, open orders, ticker) are always allowed. The API secret is never
 //! logged.
 
@@ -33,9 +35,9 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const DEFAULT_BASE_URL: &str = "https://api.binance.com";
 pub const DEFAULT_WS_URL: &str = "wss://stream.binance.com:9443/stream";
-/// Message returned when live trading is switched off.
+/// Message returned when live trading is not armed.
 pub const LIVE_TRADING_DISABLED: &str =
-    "live trading is disabled; set OPENETHER_LIVE_TRADING=1 to enable";
+    "live trading is not armed; run `openether-live arm` and set OPENETHER_LIVE_TRADING=1";
 
 /// Canonical symbols the core trades; used to map Binance's compact symbol
 /// names back to the `BASE/QUOTE` form used everywhere else.
@@ -69,17 +71,6 @@ pub fn to_stream_symbol(symbol: &str) -> String {
     to_binance_symbol(symbol).to_ascii_lowercase()
 }
 
-/// `true` when the process was started with live trading enabled.
-pub fn live_trading_enabled() -> bool {
-    matches!(
-        std::env::var("OPENETHER_LIVE_TRADING")
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
-}
-
 /// Binance spot connector.
 #[derive(Clone)]
 pub struct BinanceConnector {
@@ -106,9 +97,12 @@ impl BinanceConnector {
     /// Build a connector from the environment.
     ///
     /// Reads `BINANCE_API_KEY`, `BINANCE_API_SECRET`, `BINANCE_BASE_URL`
-    /// (default `https://api.binance.com`), `BINANCE_WS_URL` (default
-    /// `wss://stream.binance.com:9443/stream`) and `OPENETHER_LIVE_TRADING`.
-    pub fn from_env() -> ExchangeResult<Self> {
+    /// (default `https://api.binance.com`) and `BINANCE_WS_URL` (default
+    /// `wss://stream.binance.com:9443/stream`).
+    ///
+    /// `live_enabled` is the decision of the arming ceremony, not of an
+    /// environment variable: the engine passes it in.
+    pub fn from_env(live_enabled: bool) -> ExchangeResult<Self> {
         let cfg = ConnectorConfig {
             base_url: env_var("BINANCE_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             ws_url: env_var("BINANCE_WS_URL").unwrap_or_else(|| DEFAULT_WS_URL.to_string()),
@@ -121,7 +115,7 @@ impl BinanceConnector {
             ),
             max_inflight: 4,
         };
-        Self::new(cfg, live_trading_enabled())
+        Self::new(cfg, live_enabled)
     }
 
     /// Build a connector with an explicit configuration.

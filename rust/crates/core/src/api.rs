@@ -41,6 +41,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/venues", get(venues))
         .route("/api/wallet", get(wallet_metadata))
         .route("/api/wallet/sign-dry-run", post(wallet_sign_dry_run))
+        .route("/api/live", get(live_status))
         .route("/ws", get(ws_handler))
         .layer(Extension(wallet))
         .layer(CorsLayer::permissive())
@@ -72,6 +73,7 @@ async fn config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "venue": cfg.venue.as_str(),
         "live_trading": cfg.live_trading,
+        "live_arming": live_arming_json(&cfg.live_arming),
         "symbols": cfg.symbols,
         "risk": {
             "max_position_pct_of_equity": cfg.risk.max_position_pct_of_equity,
@@ -88,6 +90,39 @@ async fn config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "strategy_wasm": cfg.strategy_wasm.as_ref().map(|p| p.display().to_string()),
         "chains": state.onchain.chains(),
     }))
+}
+
+/// `GET /api/live`
+///
+/// Whether live trading is armed, and why not when it is not. The response is
+/// read-only on purpose: arming is a CLI act, so an agent that can reach this
+/// API can never arm live trading.
+async fn live_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let cfg = &state.config;
+    Json(serde_json::json!({
+        "live_trading": cfg.live_trading,
+        "venue": cfg.venue.as_str(),
+        "arming": live_arming_json(&cfg.live_arming),
+    }))
+}
+
+/// The arming state as plain JSON.
+///
+/// The confirmation phrase is not repeated here: it is not a secret, but there
+/// is no reason to echo it into a log.
+fn live_arming_json(state: &crate::live_arm::LiveArmingState) -> serde_json::Value {
+    let record = state.record.as_ref();
+    serde_json::json!({
+        "live_enabled": state.live_enabled,
+        "reason": state.reason,
+        "detail": state.detail,
+        "effective_max_order_notional_usd": state.effective_max_order_notional_usd,
+        "venue": record.map(|r| r.venue.clone()),
+        "armed_at_ms": record.map(|r| r.armed_at_ms),
+        "expires_at_ms": record.map(|r| r.expires_at_ms),
+        "max_order_notional_usd": record.map(|r| r.max_order_notional_usd),
+        "operator_note": record.map(|r| r.operator_note.clone()),
+    })
 }
 
 async fn portfolio(State(state): State<Arc<AppState>>) -> Json<PortfolioSnapshot> {

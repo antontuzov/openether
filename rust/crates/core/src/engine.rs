@@ -792,12 +792,15 @@ impl AppState {
 }
 
 fn build_connector(config: &Config) -> anyhow::Result<Arc<dyn ExchangeConnector>> {
+    // The arming ceremony decides whether this connector may place real
+    // orders. The connector never decides that for itself.
+    let live = config.live_trading;
     Ok(match config.venue {
         Venue::Paper => Arc::new(crate::exchange::paper::PaperConnector::new()),
-        Venue::Binance => Arc::new(crate::exchange::binance::BinanceConnector::from_env()?),
-        Venue::Kraken => Arc::new(crate::exchange::kraken::KrakenConnector::from_env()?),
+        Venue::Binance => Arc::new(crate::exchange::binance::BinanceConnector::from_env(live)?),
+        Venue::Kraken => Arc::new(crate::exchange::kraken::KrakenConnector::from_env(live)?),
         Venue::Hyperliquid => {
-            Arc::new(crate::exchange::hyperliquid::HyperliquidConnector::from_env()?)
+            Arc::new(crate::exchange::hyperliquid::HyperliquidConnector::from_env(live)?)
         }
     })
 }

@@ -20,6 +20,10 @@ Read this before running anything.
 
 - **Paper by default.** `OPENETHER_LIVE_TRADING=0` and `OPENETHER_VENUE=paper`.
   Orders go to a deterministic simulated venue.
+- **Live trading needs a ceremony, not a flag.** The environment variable only
+  asks for live trading. The core also needs a valid, expiring arming record
+  that the operator wrote from the CLI. See
+  [Live trading](#live-trading).
 - **No broadcast path exists.** The wallet signs and logs; it never sends a
   transaction. `dry_run` is `true` and `broadcast` is `false` in every response,
   and the API refuses to sign at all if dry run is switched off.
@@ -256,6 +260,98 @@ zero and every limit would re-open.
 
 ---
 
+## Live trading
+
+Live trading is not a flag. `OPENETHER_LIVE_TRADING=1` only says *"I would like
+to trade live"* — on its own it arms nothing and the core stays on paper.
+
+Two things are needed, and the core refuses to trade unless **both** are true:
+
+1. `OPENETHER_LIVE_TRADING=1` — the operator asks for live trading.
+2. A valid **arming record** at `OPENETHER_LIVE_ARMING_FILE` — the operator
+   proves they meant it.
+
+The record is written by the `openether-live` CLI, never over HTTP. Run this
+from the repository root and use an absolute path for the record, so the CLI
+and the core agree on where it is:
+
+```bash
+cargo build --release --manifest-path rust/Cargo.toml
+
+export OPENETHER_LIVE_ARMING_FILE="$PWD/data/live-arming.json"
+
+# See what the core would do right now.
+./rust/target/release/openether-live status
+
+# Arm it. The CLI prints the limits it is about to run under and then demands
+# the confirmation phrase on stdin.
+printf 'I UNDERSTAND THIS SENDS REAL ORDERS\n' | \
+  ./rust/target/release/openether-live arm \
+    --venue binance --max-notional 500 --hours 4 --note "morning session"
+
+# Run the core with OPENETHER_LIVE_TRADING=1 and that arming file.
+OPENETHER_LIVE_TRADING=1 ./scripts/run-core.sh
+
+# Turn it off again. This is the only way to disarm.
+./rust/target/release/openether-live disarm
+```
+
+### What the record binds
+
+The arming is a record, not a permission slip you can copy around:
+
+| Property | Rule |
+| --- | --- |
+| Venue | The record names one venue. The core must run on that venue. |
+| Expiry | It expires (default 4 hours, maximum 30 days). |
+| Config binding | It carries a SHA-256 digest of the risk configuration it was written against. Change a limit and the arming is stale. |
+| Direction | It may only *tighten* the per-order cap. Raising it above the risk layer's cap is refused. |
+| Confirmation | The phrase is typed by the operator; the CLI refuses without it. |
+| Write path | Only the CLI writes it. There is no HTTP endpoint that can arm the engine. |
+
+The digest covers the limits that decide how much money can be lost: position
+cap, gross exposure, daily loss, drawdown, open positions, minimum notional,
+breaker cooldown, the hard-halt flag and the symbol / venue / contract
+allowlists. The per-order cap is not in the digest — the arming tightens that
+one itself, and the effective cap is always the *smaller* of the risk layer's
+cap and the armed cap, so it can only ever tighten.
+
+So the full sequence to trade live is: set the risk configuration first, then
+arm, then start the core. Re-order those and the arming is stale on purpose.
+
+### When the core refuses
+
+`GET /api/live` reports the decision and the reason:
+
+| Reason | Meaning |
+| --- | --- |
+| `arming_file_unset` | `OPENETHER_LIVE_ARMING_FILE` is not set. |
+| `arming_file_missing` | The path is set but there is no record. |
+| `arming_file_unreadable` | The record cannot be read or parsed. |
+| `arming_version_unsupported` | The record was written by a different build. |
+| `arming_venue_mismatch` | The record is for another venue. |
+| `arming_confirmation_invalid` | The record was never confirmed. |
+| `arming_expired` | The record ran out. |
+| `arming_config_changed` | A risk limit changed after the arming was written. |
+| `live_not_requested` | The record is valid but `OPENETHER_LIVE_TRADING` is not set. |
+
+While live trading is armed, the armed cap is what the risk layer enforces — it
+is not an advisory number. An order above it is refused with
+`notional_too_large` before it reaches the exchange.
+
+### What live trading covers
+
+- **Binance and Kraken place real orders.** The connectors sign the request
+  and broadcast it; the risk layer has already approved it by then.
+- **Hyperliquid is read-only.** It has no signer in this build, so
+  `place_order` returns `Unsupported`.
+- **The paper venue never trades live**, and `openether-live arm` refuses to
+  arm it.
+- **On-chain transactions are still dry-run only.** The wallet signs and logs;
+  there is no broadcast path.
+
+---
+
 ## Wallet
 
 The wallet is **non-custodial and offline**: openEther holds an encrypted
@@ -456,7 +552,8 @@ Copy `.env.example` to `.env`. The important defaults:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `OPENETHER_LIVE_TRADING` | `0` | master switch for real orders |
+| `OPENETHER_LIVE_TRADING` | `0` | asks for real orders; needs an arming record too |
+| `OPENETHER_LIVE_ARMING_FILE` | *(empty)* | path to the arming record written by `openether-live arm` |
 | `OPENETHER_VENUE` | `paper` | `paper` / `binance` / `kraken` / `hyperliquid` (read-only) |
 | `OPENETHER_WALLET_DRY_RUN` | `1` | sign and log, never broadcast |
 | `OPENETHER_WALLET_ACCOUNTS` | `5` | accounts per chain in an HD keystore |
@@ -465,14 +562,14 @@ Copy `.env.example` to `.env`. The important defaults:
 | `LLM_PROVIDER` | `local` | `local` / `openai` / `anthropic` / `openai-compatible` |
 | `VITE_ADMIN_PASSWORD_HASH` | *(empty)* | build-time admin gate digest |
 
-Exchange credentials are only read when `OPENETHER_LIVE_TRADING=1`. `.env`,
+Exchange credentials are only read when live trading is armed. `.env`,
 `*.keystore` and `*.key` are gitignored.
 
 ### HTTP API
 
 `GET /healthz`, `/metrics`, `/api/config`, `/api/portfolio`, `/api/positions`,
 `/api/trades`, `/api/logs`, `/api/ticks`, `/api/risk`, `/api/risk/decisions`,
-`/api/strategy`, `/api/venues`, `/api/wallet`;
+`/api/strategy`, `/api/venues`, `/api/wallet`, `/api/live`;
 `POST /api/orders`, `/api/logs`, `/api/onchain`, `/api/strategy/reload`,
 `/api/breaker/reset`, `/api/wallet/sign-dry-run`;
 `GET /ws` for the live stream. Full shapes in [docs/api-contract.md](docs/api-contract.md).
@@ -483,9 +580,19 @@ Exchange credentials are only read when `OPENETHER_LIVE_TRADING=1`. `.env`,
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **116 passing**, including the encrypted keystore,
+- `cargo test --workspace` — **130 passing**, including the encrypted keystore,
   EVM and Solana dry-run signing, signature tampering, wrong-passphrase
   rejection, and the API refusing to sign when dry run is off.
+- The live-trading arming ceremony exercised end to end against the real
+  binaries: the env var alone arms nothing; arming without the confirmation
+  phrase is refused; arming writes a record that flips `GET /api/live` to
+  `live_enabled: true`; widening a risk limit afterwards turns it back into
+  `arming_config_changed`; lowering the per-order cap tightens the effective
+  cap; an expired record and a record for another venue are both refused; and
+  `disarm` removes it. With the core running against an armed record, an order
+  above the armed cap was refused with `notional_too_large` against the $500
+  armed cap, while a smaller one passed the risk layer and only stopped at the
+  missing exchange credentials.
 - The HD wallet cross-validated against an independent Python implementation
   of BIP-39, BIP-32/BIP-44 and SLIP-0010: all six derived addresses (3 EVM,
   3 Solana) matched exactly, so the recovery phrase really does restore the
@@ -566,6 +673,11 @@ Bugs found and fixed during that verification:
   left the engine holding a position the simulator knew nothing about — two
   accounts disagreeing about every margin calculation. The venue is now handed
   its account back on boot.
+- The arming record's config digest covered the per-order cap, but the arming
+  tightens that cap — so the digest could never match the record it was written
+  with, and every armed core refused its own arming as stale. The cap is now
+  bound by taking the smaller of the two caps instead, and it is excluded from
+  the digest.
 
 ---
 

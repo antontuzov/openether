@@ -26,6 +26,7 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 | GET | `/api/venues` | `[{ "venue": "paper", "healthy": true, "live": false }]` |
 | GET | `/api/wallet` | `WalletMetadata` — public wallet metadata, never a secret |
 | POST | `/api/wallet/sign-dry-run` | Body `{ "passphrase", "envelope", "account"? }` → `DryRunSignature` |
+| GET | `/api/live` | Live-trading arming state (see below) |
 
 ### `POST /api/orders`
 
@@ -104,6 +105,45 @@ Codes: `wallet_not_configured`, `wallet_locked`, `wallet_lease_expired`,
 `invalid_passphrase`, `keystore_decrypt_failed`, `live_broadcast_unsupported`,
 `chain_mismatch`, `account_not_found`, `invalid_key`, `invalid_envelope`,
 `signature_invalid`, `unsupported_keystore_format`, `keystore_io_error`.
+
+### `GET /api/live`
+
+Reports whether the engine is allowed to place real orders, and why not when
+it is not. Live trading needs **both** `OPENETHER_LIVE_TRADING=1` and a valid
+arming record at `OPENETHER_LIVE_ARMING_FILE`. The record is written by the
+`openether-live` CLI; there is no HTTP endpoint that can arm the engine.
+
+Response `200`:
+```json
+{
+  "live_trading": false,
+  "venue": "paper",
+  "arming": {
+    "live_enabled": false,
+    "reason": "live_not_requested",
+    "detail": "live trading is off: OPENETHER_LIVE_TRADING is not set. The arming record is valid, but live trading was not requested.",
+    "effective_max_order_notional_usd": 5000.0,
+    "venue": "binance",
+    "armed_at_ms": 1700000000000,
+    "expires_at_ms": 1700014400000,
+    "max_order_notional_usd": 500.0,
+    "operator_note": "morning session"
+  }
+}
+```
+
+`reason` is `null` when live trading is on. Otherwise it is one of
+`arming_file_unset`, `arming_file_missing`, `arming_file_unreadable`,
+`arming_version_unsupported`, `arming_venue_mismatch`,
+`arming_confirmation_invalid`, `arming_expired`, `arming_config_changed`,
+`live_not_requested`.
+
+`effective_max_order_notional_usd` is the per-order cap the risk layer
+enforces: the smaller of the configured cap and the armed cap. While live
+trading is on it is what an oversized order is measured against
+(`notional_too_large`).
+
+`GET /api/config` carries the same object under `live_arming`.
 
 ## Risk state
 

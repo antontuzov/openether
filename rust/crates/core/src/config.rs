@@ -1,3 +1,4 @@
+use crate::live_arm::LiveArmingState;
 use crate::risk::RiskConfig;
 use crate::types::{Chain, Venue};
 use std::collections::HashSet;
@@ -10,6 +11,9 @@ pub struct Config {
     pub venue: Venue,
     pub symbols: Vec<String>,
     pub live_trading: bool,
+    /// Why live trading is on or off. The core refuses to trade live unless
+    /// the arming ceremony succeeded.
+    pub live_arming: LiveArmingState,
     pub risk: RiskConfig,
     /// Starting equity of the paper venue, used as the PnL baseline.
     pub paper_start_equity: f64,
@@ -61,7 +65,6 @@ impl Default for WalletConfig {
 
 impl Config {
     pub fn from_env() -> Self {
-        let live_trading = env_flag("OPENETHER_LIVE_TRADING");
         let venue = std::env::var("OPENETHER_VENUE")
             .ok()
             .and_then(|v| Venue::parse(&v))
@@ -77,7 +80,7 @@ impl Config {
             .filter_map(|v| Venue::parse(v))
             .collect();
 
-        let risk = RiskConfig {
+        let mut risk = RiskConfig {
             max_position_pct_of_equity: env_f64("OPENETHER_MAX_POSITION_PCT", 20.0),
             max_gross_exposure_pct: env_f64("OPENETHER_MAX_GROSS_EXPOSURE_PCT", 60.0),
             max_daily_loss_pct: env_f64("OPENETHER_MAX_DAILY_LOSS_PCT", 3.0),
@@ -97,12 +100,22 @@ impl Config {
             ),
         };
 
+        // The arming record decides whether live trading may run. The
+        // environment variable only asks for it; the record is the proof.
+        let live_arming = crate::live_arm::evaluate(venue, &risk);
+        if live_arming.live_enabled {
+            // An arming may only tighten the per-order cap, never raise it.
+            risk.max_order_notional_usd = live_arming.effective_max_order_notional_usd;
+        }
+        let live_trading = live_arming.live_enabled;
+
         Self {
             host: std::env::var("CORE_HOST").unwrap_or_else(|_| "0.0.0.0".into()),
             port: env_u16("CORE_PORT", 8080),
             venue,
             symbols,
             live_trading,
+            live_arming,
             risk,
             paper_start_equity: env_f64("OPENETHER_PAPER_CASH", 10_000.0),
             strategy_wasm: std::env::var("OPENETHER_STRATEGY_WASM")

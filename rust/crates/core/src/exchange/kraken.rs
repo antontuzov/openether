@@ -18,8 +18,8 @@
 //! # Live trading guard
 //!
 //! Order flow is refused unless the connector was built with
-//! `live_enabled = true` (see `OPENETHER_LIVE_TRADING`). The API secret is
-//! never logged.
+//! `live_enabled = true`. That flag comes from the arming ceremony in
+//! `crate::live_arm`. The API secret is never logged.
 
 use crate::exchange::{
     ConnectorConfig, ExchangeConnector, ExchangeError, ExchangeResult, OpenOrder, TickSink,
@@ -44,7 +44,7 @@ pub const DEFAULT_BASE_URL: &str = "https://api.kraken.com";
 pub const DEFAULT_WS_URL: &str = "wss://ws.kraken.com/v2";
 /// Message returned when live trading is switched off.
 pub const LIVE_TRADING_DISABLED: &str =
-    "live trading is disabled; set OPENETHER_LIVE_TRADING=1 to enable";
+    "live trading is not armed; run `openether-live arm` and set OPENETHER_LIVE_TRADING=1";
 
 /// Canonical symbols the core trades (Kraken form → canonical form).
 const KRAKEN_PAIRS: [(&str, &str); 6] = [
@@ -108,16 +108,6 @@ pub fn from_kraken_pair(pair: &str) -> String {
 }
 
 /// `true` when the process was started with live trading enabled.
-pub fn live_trading_enabled() -> bool {
-    matches!(
-        std::env::var("OPENETHER_LIVE_TRADING")
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
-}
-
 /// Kraken spot connector.
 #[derive(Clone)]
 pub struct KrakenConnector {
@@ -146,8 +136,9 @@ impl KrakenConnector {
     ///
     /// Reads `KRAKEN_API_KEY`, `KRAKEN_API_SECRET`, `KRAKEN_BASE_URL`
     /// (default `https://api.kraken.com`), `KRAKEN_WS_URL` (default
-    /// `wss://ws.kraken.com/v2`) and `OPENETHER_LIVE_TRADING`.
-    pub fn from_env() -> ExchangeResult<Self> {
+    /// `wss://ws.kraken.com/v2`). `live_enabled` is the decision of the
+    /// arming ceremony, not of an environment variable.
+    pub fn from_env(live_enabled: bool) -> ExchangeResult<Self> {
         let cfg = ConnectorConfig {
             base_url: env_var("KRAKEN_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             ws_url: env_var("KRAKEN_WS_URL").unwrap_or_else(|| DEFAULT_WS_URL.to_string()),
@@ -160,7 +151,7 @@ impl KrakenConnector {
             ),
             max_inflight: 4,
         };
-        Self::new(cfg, live_trading_enabled())
+        Self::new(cfg, live_enabled)
     }
 
     /// Build a connector with an explicit configuration.

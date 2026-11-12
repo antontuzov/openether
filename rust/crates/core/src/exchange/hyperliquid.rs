@@ -52,7 +52,7 @@ pub const DEFAULT_BASE_URL: &str = "https://api.hyperliquid.xyz";
 pub const DEFAULT_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 /// Message returned when live trading is switched off.
 pub const LIVE_TRADING_DISABLED: &str =
-    "live trading is disabled; set OPENETHER_LIVE_TRADING=1 to enable";
+    "live trading is not armed; run `openether-live arm` and set OPENETHER_LIVE_TRADING=1";
 /// Message returned for every order flow operation.
 pub const UNSUPPORTED_ORDER_FLOW: &str = "hyperliquid order placement requires an EIP-712 signer; use the paper venue or a CEX connector";
 
@@ -87,16 +87,6 @@ pub fn canonical_symbol(coin: &str) -> String {
 }
 
 /// `true` when the process was started with live trading enabled.
-pub fn live_trading_enabled() -> bool {
-    matches!(
-        std::env::var("OPENETHER_LIVE_TRADING")
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
-}
-
 /// Read-only Hyperliquid connector.
 #[derive(Clone)]
 pub struct HyperliquidConnector {
@@ -122,8 +112,9 @@ impl HyperliquidConnector {
     ///
     /// Reads `HYPERLIQUID_WALLET_ADDRESS`, `HYPERLIQUID_BASE_URL` (default
     /// `https://api.hyperliquid.xyz`), `HYPERLIQUID_WS_URL` (default
-    /// `wss://api.hyperliquid.xyz/ws`) and `OPENETHER_LIVE_TRADING`.
-    pub fn from_env() -> ExchangeResult<Self> {
+    /// `wss://api.hyperliquid.xyz/ws`). `live_enabled` is the decision of the
+    /// arming ceremony, not of an environment variable.
+    pub fn from_env(live_enabled: bool) -> ExchangeResult<Self> {
         let wallet_address = env_var("HYPERLIQUID_WALLET_ADDRESS").unwrap_or_default();
         let cfg = ConnectorConfig {
             base_url: env_var("HYPERLIQUID_BASE_URL")
@@ -138,7 +129,7 @@ impl HyperliquidConnector {
             ),
             max_inflight: 4,
         };
-        Self::new(cfg, wallet_address, live_trading_enabled())
+        Self::new(cfg, wallet_address, live_enabled)
     }
 
     /// Build a connector with an explicit configuration.

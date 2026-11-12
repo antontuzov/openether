@@ -43,6 +43,14 @@ impl Venue {
             _ => None,
         }
     }
+
+    /// `true` when the venue can place real orders.
+    ///
+    /// The paper venue never trades live and Hyperliquid is read-only in this
+    /// build, so neither of them can be armed.
+    pub fn trades_live(self) -> bool {
+        matches!(self, Venue::Binance | Venue::Kraken)
+    }
 }
 
 impl fmt::Display for Venue {

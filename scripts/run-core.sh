@@ -4,8 +4,9 @@
 #   ./scripts/run-core.sh              # paper venue, API on :8080
 #   OPENETHER_VENUE=binance ./scripts/run-core.sh
 #
-# Live trading stays off unless OPENETHER_LIVE_TRADING is set, and the
-# venue allowlist defaults to paper only.
+# Live trading stays off unless OPENETHER_LIVE_TRADING is set *and* a valid
+# arming record is present at OPENETHER_LIVE_ARMING_FILE, and the venue
+# allowlist defaults to paper only.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -37,6 +38,15 @@ if [ -n "${OPENETHER_STATE_DB:-}" ]; then
     *) export OPENETHER_STATE_DB="$root/${OPENETHER_STATE_DB#./}" ;;
   esac
   mkdir -p "$(dirname "$OPENETHER_STATE_DB")"
+fi
+
+# The arming record has the same problem: the core runs from rust/, so a
+# repo-relative path would land in rust/data instead of at the repo root.
+if [ -n "${OPENETHER_LIVE_ARMING_FILE:-}" ]; then
+  case "$OPENETHER_LIVE_ARMING_FILE" in
+    /*) ;;
+    *) export OPENETHER_LIVE_ARMING_FILE="$root/${OPENETHER_LIVE_ARMING_FILE#./}" ;;
+  esac
 fi
 
 echo "openEther core → http://$CORE_HOST:$CORE_PORT (venue: $OPENETHER_VENUE, live trading: ${OPENETHER_LIVE_TRADING:-off})"
