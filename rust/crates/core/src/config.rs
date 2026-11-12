@@ -19,6 +19,10 @@ pub struct Config {
     pub contract_allowlist: HashSet<String>,
     pub solana_rpc_url: Option<String>,
     pub evm_rpc_urls: Vec<(String, String)>,
+    /// Where the engine keeps its durable state. `None` keeps everything in
+    /// memory, which is only sensible for a throwaway run: a restart would
+    /// reset equity to zero and silently re-open every risk limit.
+    pub state_db_path: Option<PathBuf>,
     pub wallet: WalletConfig,
 }
 
@@ -118,6 +122,11 @@ impl Config {
                         .map(|url| ((*name).to_string(), url))
                 })
                 .collect(),
+            state_db_path: std::env::var("OPENETHER_STATE_DB")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("memory"))
+                .map(PathBuf::from),
             wallet: WalletConfig {
                 keystore_path: std::env::var("OPENETHER_WALLET_KEYSTORE")
                     .ok()

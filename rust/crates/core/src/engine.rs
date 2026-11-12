@@ -1,9 +1,10 @@
 use crate::bus::{Event, EventBus, StatusEvent};
 use crate::config::Config;
-use crate::exchange::{ExchangeConnector, ExchangeError, OpenOrder, TickSink};
+use crate::exchange::{AccountRestore, ExchangeConnector, ExchangeError, OpenOrder, TickSink};
 use crate::metrics::Metrics;
 use crate::onchain::OnchainClient;
 use crate::risk::{RiskContext, RiskEngine, RiskState, RiskVerdict};
+use crate::store::{PortfolioRow, PositionRow, Store};
 use crate::strategy::{StrategyHost, StrategySignal};
 use crate::types::*;
 use serde::Serialize;
@@ -56,6 +57,9 @@ pub struct AppState {
     pub connector: Arc<dyn ExchangeConnector>,
     pub onchain: Arc<OnchainClient>,
     pub ws_clients: std::sync::atomic::AtomicUsize,
+    /// Durable state. `None` when the run is configured to keep everything in
+    /// memory.
+    pub store: Option<Arc<Store>>,
     data: std::sync::Mutex<DataStore>,
 }
 
@@ -90,11 +94,20 @@ impl AppState {
         }
 
         let equity = config.paper_start_equity;
-        {
-            let mut data = data_store();
-            data.equity_usd = equity;
-            data.cash_usd = equity;
-        }
+        let store = match config.state_db_path.as_deref() {
+            Some(path) => match Store::open(path) {
+                Ok(store) => Some(Arc::new(store)),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "could not open the state database; running without persistence"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
 
         let state = Arc::new(Self {
             config,
@@ -105,6 +118,7 @@ impl AppState {
             connector,
             onchain,
             ws_clients: std::sync::atomic::AtomicUsize::new(0),
+            store,
             data: std::sync::Mutex::new(DataStore::default()),
         });
         {
@@ -112,7 +126,164 @@ impl AppState {
             data.equity_usd = equity;
             data.cash_usd = equity;
         }
+        state.restore_persisted();
         Ok(state)
+    }
+
+    /// Load the persisted account back into the engine.
+    ///
+    /// A restart must not look like a fresh account. The positions, the equity
+    /// baseline and the risk layer's peak and daily anchors all come back,
+    /// otherwise every limit would be measured against a fresh start — and a
+    /// breaker that was open would quietly close itself.
+    fn restore_persisted(&self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+
+        let portfolio = match store.load_portfolio() {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the persisted portfolio");
+                None
+            }
+        };
+        let positions = match store.load_positions() {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the persisted positions");
+                Vec::new()
+            }
+        };
+        let risk_row = match store.load_risk_state() {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the persisted risk state");
+                None
+            }
+        };
+
+        let restored_positions = !positions.is_empty();
+        {
+            let mut data = self.lock_data();
+            if let Some(p) = portfolio {
+                data.equity_usd = p.equity_usd;
+                data.cash_usd = p.cash_usd;
+                data.realized_pnl = p.realized_pnl;
+            }
+            for p in &positions {
+                data.position_qty.insert(p.symbol.clone(), p.qty);
+                data.avg_entry.insert(p.symbol.clone(), p.avg_entry);
+            }
+        }
+
+        // Hand the account back to the venue. The simulated venue has no
+        // server to ask, so without this it would come back from a restart
+        // holding its starting cash and no positions, while the engine
+        // believed it held a position — two accounts that disagree.
+        //
+        // Only when something was persisted: a fresh run must keep the
+        // venue's starting balance.
+        if let Some(p) = portfolio.as_ref() {
+            let restored_account = AccountRestore {
+                cash_usd: p.cash_usd,
+                realized_pnl: p.realized_pnl,
+                positions: positions
+                    .iter()
+                    .map(|p| (p.symbol.clone(), p.qty, p.avg_entry))
+                    .collect(),
+            };
+            if let Err(e) = self.connector.restore_account(&restored_account) {
+                tracing::warn!(error = %e, "could not restore the venue account");
+            }
+        }
+
+        if let Some(row) = risk_row {
+            let triples: Vec<(String, f64, f64)> = positions
+                .iter()
+                .map(|p| (p.symbol.clone(), p.qty, p.avg_entry))
+                .collect();
+            self.risk.restore(&row, &triples);
+        }
+
+        let trades = store.trades(MAX_TRADES).unwrap_or_default();
+        let trade_count = trades.len();
+        {
+            let mut data = self.lock_data();
+            for trade in trades.into_iter().rev() {
+                data.trades.push_back(trade);
+            }
+        }
+
+        if restored_positions || portfolio.is_some() {
+            tracing::info!(
+                positions = positions.len(),
+                trades = trade_count,
+                "restored the persisted account"
+            );
+        }
+    }
+
+    /// Write the engine's risk-relevant state to disk.
+    ///
+    /// Called after every fill. The portfolio, the positions and the risk
+    /// state are written together, because the risk layer measures exposure
+    /// from the position map: if the two were written separately a crash
+    /// could leave them disagreeing.
+    fn persist(&self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+
+        let account = self.connector.account_state();
+        let (portfolio, positions, orders) = {
+            let data = self.lock_data();
+            let portfolio = PortfolioRow {
+                equity_usd: data.equity_usd,
+                cash_usd: account
+                    .as_ref()
+                    .map(|a| a.cash_usd)
+                    .unwrap_or(data.cash_usd),
+                realized_pnl: data.realized_pnl,
+            };
+            let positions: Vec<PositionRow> = match &account {
+                // The venue owns the account, so its positions are the truth.
+                Some(a) if !a.positions.is_empty() => a
+                    .positions
+                    .iter()
+                    .map(|(symbol, qty, avg_entry)| PositionRow {
+                        symbol: symbol.clone(),
+                        qty: *qty,
+                        avg_entry: *avg_entry,
+                    })
+                    .collect(),
+                _ => data
+                    .position_qty
+                    .iter()
+                    .filter(|(_, qty)| qty.abs() > 0.000_001)
+                    .map(|(symbol, qty)| PositionRow {
+                        symbol: symbol.clone(),
+                        qty: *qty,
+                        avg_entry: data.avg_entry.get(symbol).copied().unwrap_or(0.0),
+                    })
+                    .collect(),
+            };
+            let orders = data.open_orders.clone();
+            (portfolio, positions, orders)
+        };
+
+        if let Err(e) = store.save_portfolio(portfolio) {
+            tracing::warn!(error = %e, "could not persist the portfolio");
+        }
+        if let Err(e) = store.save_positions(&positions) {
+            tracing::warn!(error = %e, "could not persist the positions");
+        }
+        if let Err(e) = store.save_open_orders(&orders) {
+            tracing::warn!(error = %e, "could not persist the open orders");
+        }
+        if let Err(e) = store.save_risk_state(&self.risk.export()) {
+            tracing::warn!(error = %e, "could not persist the risk state");
+        }
     }
 
     pub fn venue(&self) -> Venue {
@@ -327,6 +498,17 @@ impl AppState {
             1.0,
         );
 
+        // Keep the client id as the stable handle for this order, so it can
+        // still be found and cancelled after the process restarts. The
+        // connectors keep this mapping in memory only.
+        if let Some(store) = self.store.as_ref() {
+            if let Err(e) =
+                store.remember_order_client(&req.client_id, req.venue, &ack.order_id, &req.symbol)
+            {
+                tracing::warn!(error = %e, "could not persist the order client mapping");
+            }
+        }
+
         let fills = self
             .connector
             .fills_since(before - 1)
@@ -451,7 +633,14 @@ impl AppState {
         data.trades.push_back(record.clone());
         drop(data);
 
+        if let Some(store) = self.store.as_ref() {
+            if let Err(e) = store.record_trade(&record) {
+                tracing::warn!(error = %e, "could not journal the trade");
+            }
+        }
+
         self.risk.on_fill(fill, self.equity());
+        self.persist();
         self.bus.publish(Event::Trade(record));
     }
 
@@ -602,10 +791,6 @@ impl AppState {
     }
 }
 
-fn data_store() -> DataStore {
-    DataStore::default()
-}
-
 fn build_connector(config: &Config) -> anyhow::Result<Arc<dyn ExchangeConnector>> {
     Ok(match config.venue {
         Venue::Paper => Arc::new(crate::exchange::paper::PaperConnector::new()),
@@ -674,5 +859,187 @@ pub fn error_reason(error: &ExchangeError) -> &'static str {
         ExchangeError::RateLimited(_) => "rate_limited",
         ExchangeError::Config(_) => "config_error",
         ExchangeError::Internal(_) => "internal_error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::risk::BreakerState;
+    use std::path::{Path, PathBuf};
+
+    fn temp_db() -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("oe-engine-{}", uuid::Uuid::new_v4()));
+        let db = dir.join("state.db");
+        (dir, db)
+    }
+
+    fn config_with_db(db: &Path) -> Config {
+        let mut config = Config::from_env();
+        config.venue = Venue::Paper;
+        config.live_trading = false;
+        config.paper_start_equity = 10_000.0;
+        config.state_db_path = Some(db.to_path_buf());
+        config.strategy_wasm = None;
+        config
+    }
+
+    #[tokio::test]
+    async fn a_restart_restores_the_account() {
+        let (dir, db) = temp_db();
+
+        let equity_before;
+        {
+            let state = AppState::new(config_with_db(&db)).unwrap();
+            let outcome = state
+                .submit_order(
+                    OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 1.0),
+                    "test",
+                )
+                .await;
+            assert!(outcome.approved, "{outcome:?}");
+            equity_before = state.equity();
+            // The fee is charged, the margin is locked rather than spent.
+            assert!(equity_before < 10_000.0, "the fee should have been charged");
+        }
+
+        // A second handle on the same database is what a restarted process gets.
+        let state = AppState::new(config_with_db(&db)).unwrap();
+        let portfolio = state.portfolio();
+        assert!(
+            (portfolio.equity_usd - equity_before).abs() < 1e-9,
+            "equity should survive a restart: {} != {}",
+            portfolio.equity_usd,
+            equity_before
+        );
+        assert_eq!(portfolio.positions.len(), 1, "the position should survive");
+        assert_eq!(portfolio.positions[0].symbol, "SOL/USDT");
+        assert!((portfolio.positions[0].qty - 1.0).abs() < 1e-9);
+        assert_eq!(
+            state.trades(10).len(),
+            1,
+            "the trade journal should survive"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_restart_restores_the_venue_account_too() {
+        let (dir, db) = temp_db();
+        {
+            let state = AppState::new(config_with_db(&db)).unwrap();
+            let outcome = state
+                .submit_order(
+                    OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 5.0),
+                    "test",
+                )
+                .await;
+            assert!(outcome.approved, "{outcome:?}");
+        }
+
+        let state = AppState::new(config_with_db(&db)).unwrap();
+        // The simulator keeps the account, not just the engine's mirror of it.
+        // If the venue came back empty it would hold its starting cash while
+        // the engine believed it held a position.
+        let account = state.connector.account().await.unwrap();
+        assert!(
+            account.equity_usd < 10_000.0,
+            "the fee must survive the restart: {}",
+            account.equity_usd
+        );
+        assert!(
+            account.free_usd < account.equity_usd,
+            "the margin must still be locked after the restart: free {} vs equity {}",
+            account.free_usd,
+            account.equity_usd
+        );
+        let venue_positions = state.connector.positions().await.unwrap();
+        assert_eq!(venue_positions.len(), 1, "the venue must hold the position");
+        assert_eq!(venue_positions[0].symbol, "SOL/USDT");
+        assert!((venue_positions[0].qty - 5.0).abs() < 1e-9);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_restart_keeps_the_risk_layer_aware_of_the_position() {
+        let (dir, db) = temp_db();
+        {
+            let state = AppState::new(config_with_db(&db)).unwrap();
+            let outcome = state
+                .submit_order(
+                    OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 1.0),
+                    "test",
+                )
+                .await;
+            assert!(outcome.approved, "{outcome:?}");
+            assert!(
+                state.risk.gross_exposure() > 0.0,
+                "the risk layer should know about the fill"
+            );
+        }
+
+        let state = AppState::new(config_with_db(&db)).unwrap();
+        assert!(
+            state.risk.gross_exposure() > 0.0,
+            "the restored position must be visible to the risk layer, otherwise \
+             the gross exposure cap would be measured against nothing"
+        );
+        assert_eq!(state.risk.open_positions(), 1);
+        assert!((state.risk.position_qty("SOL/USDT") - 1.0).abs() < 1e-9);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_open_breaker_survives_a_restart() {
+        let (dir, db) = temp_db();
+        {
+            let state = AppState::new(config_with_db(&db)).unwrap();
+            // Establish a peak, then collapse the equity to trip the drawdown
+            // limit the same way a real loss would.
+            state.risk.update_equity(10_000.0, now_ms());
+            state.risk.update_equity(1_000.0, now_ms());
+            assert_eq!(state.risk.breaker_state(), BreakerState::Open);
+            state.persist();
+        }
+
+        let state = AppState::new(config_with_db(&db)).unwrap();
+        assert_eq!(
+            state.risk.breaker_state(),
+            BreakerState::Open,
+            "restarting must not close the breaker — that would make a restart \
+             a way around the risk layer"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_restored_position_is_still_capped_by_the_risk_layer() {
+        let (dir, db) = temp_db();
+        {
+            let state = AppState::new(config_with_db(&db)).unwrap();
+            let outcome = state
+                .submit_order(
+                    OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 10.0),
+                    "test",
+                )
+                .await;
+            assert!(outcome.approved, "{outcome:?}");
+        }
+
+        let state = AppState::new(config_with_db(&db)).unwrap();
+        // The restored position is already at the 20% cap, so another order of
+        // the same size must be refused.
+        let outcome = state
+            .submit_order(
+                OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 10.0),
+                "test",
+            )
+            .await;
+        assert!(
+            !outcome.approved,
+            "the position cap must still apply to a restored position"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

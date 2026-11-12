@@ -29,5 +29,15 @@ if [ -n "${OPENETHER_STRATEGY_WASM:-}" ]; then
   esac
 fi
 
+# The state database has the same problem: the core runs from rust/, so a
+# repo-relative path would land in rust/data instead of at the repo root.
+if [ -n "${OPENETHER_STATE_DB:-}" ]; then
+  case "$OPENETHER_STATE_DB" in
+    /*) ;;
+    *) export OPENETHER_STATE_DB="$root/${OPENETHER_STATE_DB#./}" ;;
+  esac
+  mkdir -p "$(dirname "$OPENETHER_STATE_DB")"
+fi
+
 echo "openEther core → http://$CORE_HOST:$CORE_PORT (venue: $OPENETHER_VENUE, live trading: ${OPENETHER_LIVE_TRADING:-off})"
 exec cargo run --release --bin openether-core

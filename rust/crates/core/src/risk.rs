@@ -21,6 +21,15 @@ impl BreakerState {
         }
     }
 
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "closed" => Some(BreakerState::Closed),
+            "half_open" | "halfopen" => Some(BreakerState::HalfOpen),
+            "open" => Some(BreakerState::Open),
+            _ => None,
+        }
+    }
+
     fn gauge(self) -> f64 {
         match self {
             BreakerState::Closed => 0.0,
@@ -109,6 +118,36 @@ pub struct RiskState {
     pub gross_exposure_usd: f64,
     pub limits: RiskLimits,
     pub ts_ms: i64,
+}
+
+/// The risk engine's mutable state in the shape it is persisted in.
+///
+/// This is the part of the risk layer that must survive a restart: the peak
+/// equity the drawdown limit is measured from, the day's opening equity the
+/// daily-loss limit is measured from, and whether the breaker is open.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RiskRow {
+    pub breaker: BreakerState,
+    pub breaker_reason: Option<String>,
+    pub breaker_opened_at_ms: i64,
+    pub peak_equity: f64,
+    pub day_start_equity: f64,
+    pub day_start_ms: i64,
+    pub daily_realized_pnl: f64,
+}
+
+impl Default for RiskRow {
+    fn default() -> Self {
+        Self {
+            breaker: BreakerState::Closed,
+            breaker_reason: None,
+            breaker_opened_at_ms: 0,
+            peak_equity: 0.0,
+            day_start_equity: 0.0,
+            day_start_ms: 0,
+            daily_realized_pnl: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -593,6 +632,61 @@ impl RiskEngine {
             limits: RiskLimits::from(&self.config),
             ts_ms,
         }
+    }
+
+    /// Export the mutable state for persistence.
+    pub fn export(&self) -> RiskRow {
+        let state = self.lock();
+        RiskRow {
+            breaker: state.breaker.unwrap_or(BreakerState::Closed),
+            breaker_reason: state.breaker_reason.clone(),
+            breaker_opened_at_ms: state.breaker_opened_at_ms,
+            peak_equity: state.peak_equity,
+            day_start_equity: state.day_start_equity,
+            day_start_ms: state.day_start_ms,
+            daily_realized_pnl: state.daily_realized_pnl,
+        }
+    }
+
+    /// Restore the mutable state after a restart.
+    ///
+    /// A breaker that was open when the process died stays open: restarting
+    /// must not be a way around the risk layer. The position map is restored
+    /// as well, because the gross-exposure cap is measured from it — without
+    /// it a restarted process would believe it holds no positions and would
+    /// happily open a fresh full-size position.
+    pub fn restore(&self, row: &RiskRow, positions: &[(String, f64, f64)]) {
+        let mut state = self.lock();
+        state.breaker = Some(row.breaker);
+        state.breaker_reason = row.breaker_reason.clone();
+        state.breaker_opened_at_ms = row.breaker_opened_at_ms;
+        state.peak_equity = row.peak_equity;
+        state.day_start_equity = row.day_start_equity;
+        state.day_start_ms = row.day_start_ms;
+        state.daily_realized_pnl = row.daily_realized_pnl;
+
+        state.position_qty.clear();
+        state.position_notional.clear();
+        for (symbol, qty, avg_entry) in positions {
+            state.position_qty.insert(symbol.clone(), *qty);
+            state
+                .position_notional
+                .insert(symbol.clone(), qty.abs() * avg_entry);
+        }
+        state.gross_exposure_usd = state.position_notional.values().sum();
+        state.open_positions = state
+            .position_notional
+            .values()
+            .filter(|n| **n > 0.01)
+            .count();
+
+        self.metrics
+            .gauge_set("openether_breaker_state", &[], row.breaker.gauge());
+        self.metrics.gauge_set(
+            "openether_gross_exposure_usd",
+            &[],
+            state.gross_exposure_usd,
+        );
     }
 
     pub fn decisions(&self, limit: usize) -> Vec<RiskDecision> {

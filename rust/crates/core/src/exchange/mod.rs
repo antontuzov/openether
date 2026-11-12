@@ -35,7 +35,7 @@ pub enum ExchangeError {
 
 pub type ExchangeResult<T> = Result<T, ExchangeError>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenOrder {
     pub venue: Venue,
     pub order_id: String,
@@ -44,6 +44,21 @@ pub struct OpenOrder {
     pub qty: f64,
     pub price: f64,
     pub ts_ms: i64,
+}
+
+/// A venue account captured for persistence and handed back after a restart.
+///
+/// A live venue keeps its balances on the exchange and re-reports them on
+/// every call to `account()`, so it never needs this. The simulated venue has
+/// no server to ask, so the engine captures its state here and restores it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AccountRestore {
+    /// Spendable cash, i.e. the wallet balance minus the margin locked
+    /// against open positions.
+    pub cash_usd: f64,
+    pub realized_pnl: f64,
+    /// Symbol, signed quantity and average entry price.
+    pub positions: Vec<(String, f64, f64)>,
 }
 
 /// Unified connector surface for every venue (CEX spot/perps and the paper simulator).
@@ -92,6 +107,24 @@ pub trait ExchangeConnector: Send + Sync {
     /// Open positions as reported by the venue.
     async fn positions(&self) -> ExchangeResult<Vec<Position>> {
         Ok(Vec::new())
+    }
+
+    /// The venue's account, in the form it can be restored from.
+    ///
+    /// `None` means the venue keeps its own balances somewhere the engine
+    /// cannot reach — a live exchange re-reports them on every call to
+    /// `account()`. The simulated venue has no such server, so it hands the
+    /// engine its state here instead.
+    fn account_state(&self) -> Option<AccountRestore> {
+        None
+    }
+
+    /// Hand a persisted account back to the venue after a restart.
+    ///
+    /// The default does nothing, because a live venue has nothing to restore:
+    /// its balances never left the exchange.
+    fn restore_account(&self, _account: &AccountRestore) -> ExchangeResult<()> {
+        Ok(())
     }
 }
 

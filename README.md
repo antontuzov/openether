@@ -221,6 +221,39 @@ rather than spending cash. Only fees and realised PnL move the wallet balance.
 The browser engine mirrors this exactly — buying $1,000 of SOL costs you the
 fee, not $1,000 of equity.
 
+### Durable state
+
+The core keeps its risk-relevant state in a SQLite database so a restart is not
+a way around the risk layer. Set `OPENETHER_STATE_DB` to a path and the engine
+writes there:
+
+```bash
+OPENETHER_STATE_DB=./data/openether.db
+```
+
+It stores the portfolio (equity, cash, realised P&L), the open positions, the
+full trade journal, the open orders, the client-order-id → venue-order-id
+mapping, and the circuit-breaker state.
+
+Three details matter:
+
+- **A breaker that was open stays open.** Restarting does not close it.
+- **The risk layer restores its own position map**, not just the engine's. The
+  gross-exposure cap is measured from that map, so without it a restarted
+  process would believe it holds nothing and open a fresh full-size position.
+- **The venue gets its account back.** A live exchange re-reports its balances
+  on every poll, but the simulator has no server to ask — so the engine hands
+  it the persisted cash, realised P&L and positions. Without that the engine
+  would believe it held a position while the simulator believed it held cash,
+  and the two would disagree about every margin calculation.
+
+The state is written on every fill, so a crash loses at most the trade in
+flight.
+
+Leaving the variable unset (or set to `memory`) keeps everything in RAM. That is
+fine for a throwaway demo and **wrong for a live run**: equity would reset to
+zero and every limit would re-open.
+
 ---
 
 ## Dashboard
@@ -356,7 +389,7 @@ Exchange credentials are only read when `OPENETHER_LIVE_TRADING=1`. `.env`,
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **84 passing**, including the encrypted keystore,
+- `cargo test --workspace` — **98 passing**, including the encrypted keystore,
   EVM and Solana dry-run signing, signature tampering, wrong-passphrase
   rejection, and the API refusing to sign when dry run is off.
 - `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings`
@@ -384,6 +417,10 @@ Checked locally on macOS (arm64):
   right one, revealing the pivot table and charts.
 - Contrast re-audited on the deployed bundle in both themes — 855 visible text
   nodes each, zero WCAG AA failures.
+- The core run against a SQLite state file, stopped and restarted: the
+  position, the fee-charged equity, the locked margin, the trade journal, the
+  client-order-id mapping and the risk anchors all came back. A second run
+  against the same file refused an order that the position cap had to refuse.
 
 **Not verified:** live exchange connections (no credentials were used), real
 on-chain transactions (no broadcast path exists), and the <10µs dispatch target
@@ -424,6 +461,13 @@ Bugs found and fixed during that verification:
 - The admin equity curve needs two points to draw, but with exactly one fill it
   said "no fills to plot yet" beside a badge reading "1 fills". Both now
   describe what is on screen.
+- The core kept nothing on disk, so a restart reset equity to zero and re-opened
+  every risk limit. It now persists to SQLite, and a breaker that was open
+  stays open across a restart.
+- The simulator kept its account in memory, so restoring the engine's copy alone
+  left the engine holding a position the simulator knew nothing about — two
+  accounts disagreeing about every margin calculation. The venue is now handed
+  its account back on boot.
 
 ---
 

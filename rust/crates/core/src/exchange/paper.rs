@@ -31,7 +31,9 @@
 //! * Resting limit orders fill at their limit price (conservative) when the
 //!   simulated market price crosses them; the mark price then follows the fill.
 
-use crate::exchange::{ExchangeConnector, ExchangeError, ExchangeResult, OpenOrder, TickSink};
+use crate::exchange::{
+    AccountRestore, ExchangeConnector, ExchangeError, ExchangeResult, OpenOrder, TickSink,
+};
 use crate::types::*;
 use async_trait::async_trait;
 use rand::rngs::StdRng;
@@ -932,6 +934,46 @@ impl ExchangeConnector for PaperConnector {
 
     async fn positions(&self) -> ExchangeResult<Vec<Position>> {
         Ok(PaperConnector::positions(self))
+    }
+
+    fn account_state(&self) -> Option<AccountRestore> {
+        let state = self.lock();
+        Some(AccountRestore {
+            cash_usd: state.cash - state.locked_margin(),
+            realized_pnl: state.realized_pnl,
+            positions: state
+                .positions
+                .iter()
+                .map(|(symbol, p)| (symbol.clone(), p.qty, p.avg_entry))
+                .collect(),
+        })
+    }
+
+    fn restore_account(&self, account: &AccountRestore) -> ExchangeResult<()> {
+        let mut state = self.lock();
+        let locked: f64 = account
+            .positions
+            .iter()
+            .map(|(_, qty, avg_entry)| qty.abs() * avg_entry)
+            .sum();
+        // The persisted cash is spendable cash, so the wallet balance is that
+        // plus the margin the restored positions lock up again.
+        state.cash = account.cash_usd + locked;
+        state.realized_pnl = account.realized_pnl;
+        state.positions = account
+            .positions
+            .iter()
+            .map(|(symbol, qty, avg_entry)| {
+                (
+                    symbol.clone(),
+                    PaperPosition {
+                        qty: *qty,
+                        avg_entry: *avg_entry,
+                    },
+                )
+            })
+            .collect();
+        Ok(())
     }
 
     async fn subscribe_trades(&self, symbols: &[String], sink: TickSink) -> ExchangeResult<()> {
