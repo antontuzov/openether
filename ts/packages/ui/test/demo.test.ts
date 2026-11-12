@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-  DEFAULT_LIMITS,
   EQUITY_HISTORY_POINTS,
   STARTING_CASH,
   checkOrder,
@@ -8,10 +7,12 @@ import {
   equityOf,
   executeOrder,
   freeCash,
+  freshState,
   lockedMargin,
   markToMarket,
   type DemoState,
 } from '../src/lib/demo';
+import { DEFAULT_LIMITS, RISK_CONTRACT, toBrowserContract, type RiskContract } from '../src/lib/riskRules';
 
 const SOL = 'SOL/USDT';
 const BTC = 'BTC/USDT';
@@ -83,45 +84,62 @@ describe('accounting', () => {
 describe('risk limits', () => {
   it('rejects a non-positive size', () => {
     const state = priced();
-    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: 0 }).reason).toBe('invalid_qty');
-    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: -1 }).reason).toBe('invalid_qty');
-    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: NaN }).reason).toBe('invalid_qty');
+    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: 0 }).reason).toBe('invalid_quantity');
+    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: -1 }).reason).toBe('invalid_quantity');
+    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: NaN }).reason).toBe('invalid_quantity');
   });
 
   it('rejects an unpriced symbol', () => {
     const state = priced();
     expect(checkOrder(state, { symbol: 'DOGE/USDT', side: 'buy', qty: 1 }).reason).toBe(
-      'unknown_symbol',
+      'invalid_price',
     );
   });
 
   it('rejects an order above the single-order cap', () => {
     const state = priced();
     const check = checkOrder(state, { symbol: BTC, side: 'buy', qty: 1 });
-    expect(check.reason).toBe('above_max_notional');
+    expect(check.reason).toBe('notional_too_large');
     expect(check.detail).toContain(String(DEFAULT_LIMITS.max_order_notional_usd));
   });
 
   it('rejects an order below the minimum notional', () => {
     const state = priced();
     expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: 0.01 }).reason).toBe(
-      'below_min_notional',
+      'notional_too_small',
     );
   });
 
-  it('rejects a buy that exceeds free cash', () => {
+  it('rejects a buy the account cannot fund', () => {
+    // The gross cap is what normally binds first: free cash is always larger
+    // than the per-order cap while the book is inside the gross cap. So the
+    // venue check only shows up once the caps are widened past it.
     const state = priced();
     state.cash = 1200;
-    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: 15 }).reason).toBe(
+    const wide: RiskContract = {
+      ...RISK_CONTRACT,
+      limits: { ...RISK_CONTRACT.limits, max_position_pct_of_equity: 200, max_gross_exposure_pct: 200 },
+    };
+    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: 15 }, wide).reason).toBe(
       'insufficient_cash',
     );
   });
 
-  it('counts locked margin as unavailable cash', () => {
+  it('rejects a buy that breaks the position cap', () => {
     const state = priced();
     executeOrder(state, { symbol: SOL, side: 'buy', qty: 19 });
     // Equity ~9999, so the 20% position cap is ~2000 and 19 SOL already uses 1900.
-    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: 2 }).reason).toBe('position_cap');
+    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: 2 }).reason).toBe(
+      'position_size_exceeds_max_pct',
+    );
+  });
+
+  it('halts trading when an order breaks the position cap', () => {
+    const state = priced();
+    executeOrder(state, { symbol: SOL, side: 'buy', qty: 19 });
+    checkOrder(state, { symbol: SOL, side: 'buy', qty: 2 });
+    expect(state.breakerState).toBe('open');
+    expect(state.breakerReason).toBe('position_size_exceeds_max_pct');
   });
 
   it('rejects a sell with no position', () => {
@@ -167,8 +185,112 @@ describe('risk limits', () => {
     }
     expect(equityOf(state)).toBe(STARTING_CASH);
     expect(checkOrder(state, { symbol: 'C0/USDT', side: 'buy', qty: 1 }).reason).toBe(
-      'gross_exposure_cap',
+      'gross_exposure_exceeded',
     );
+  });
+
+  it('refuses a symbol that is not on the allowlist', () => {
+    const state = priced();
+    const restricted: RiskContract = {
+      ...RISK_CONTRACT,
+      allowlists: { ...RISK_CONTRACT.allowlists, symbols: [SOL] },
+    };
+    expect(checkOrder(state, { symbol: BTC, side: 'buy', qty: 1 }, restricted).reason).toBe(
+      'symbol_not_allowed',
+    );
+    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: 1 }, restricted).approved).toBe(true);
+  });
+
+  it('refuses a venue that is not on the allowlist', () => {
+    const state = priced();
+    const restricted: RiskContract = {
+      ...RISK_CONTRACT,
+      allowlists: { ...RISK_CONTRACT.allowlists, venues: ['binance'] },
+    };
+    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: 1 }, restricted).reason).toBe(
+      'venue_not_allowed',
+    );
+  });
+
+  it('refuses to size an order when the equity is unknown', () => {
+    const state = priced();
+    state.cash = 0;
+    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: 1 }).reason).toBe('invalid_equity');
+  });
+
+  it('allows only a probe order while the breaker is half open', () => {
+    const state = priced();
+    state.breakerState = 'half_open';
+    // The probe cap is a quarter of the position cap: 20% / 4 of a 10k equity
+    // is $500, so 6 SOL at $100 is too big and 1 SOL is not.
+    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: 6 }).reason).toBe(
+      'half_open_probe_too_large',
+    );
+    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: 1 }).approved).toBe(true);
+  });
+});
+
+describe('the risk contract', () => {
+  it('only reports reasons the engine knows', () => {
+    const state = priced();
+    const reasons = [
+      checkOrder(state, { symbol: SOL, side: 'buy', qty: 0 }),
+      checkOrder(state, { symbol: 'DOGE/USDT', side: 'buy', qty: 1 }),
+      checkOrder(state, { symbol: BTC, side: 'buy', qty: 1 }),
+      checkOrder(state, { symbol: SOL, side: 'buy', qty: 0.01 }),
+      checkOrder(state, { symbol: SOL, side: 'sell', qty: 1 }),
+    ].map((check) => check.reason);
+
+    for (const reason of reasons) {
+      expect(RISK_CONTRACT.reasons).toContain(reason);
+    }
+  });
+
+  it('runs the checks in the order the engine runs them', () => {
+    // An open breaker wins over everything else, exactly like the engine.
+    const state = priced();
+    state.breakerState = 'open';
+    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: 0 }).reason).toBe('breaker_open');
+  });
+
+  it('keeps the engine limits but not its venue allowlists in the browser', () => {
+    const engine: RiskContract = {
+      ...RISK_CONTRACT,
+      limits: { ...RISK_CONTRACT.limits, max_order_notional_usd: 750 },
+      allowlists: { symbols: [SOL], venues: ['binance'], contracts: [] },
+    };
+    const browser = toBrowserContract(engine);
+
+    expect(browser.limits).toEqual(engine.limits);
+    expect(browser.check_order).toEqual(engine.check_order);
+    expect(browser.reasons).toEqual(engine.reasons);
+    expect(browser.allowlists).toEqual({ symbols: [], venues: [], contracts: [] });
+  });
+
+  it('trades every market the feed prices, but under the engine money limits', () => {
+    const engine: RiskContract = {
+      ...RISK_CONTRACT,
+      limits: { ...RISK_CONTRACT.limits, max_order_notional_usd: 750 },
+      allowlists: { symbols: [SOL], venues: [], contracts: [] },
+    };
+    const browser = toBrowserContract(engine);
+    const state = priced();
+    state.prices['DOGE/USDT'] = 0.5;
+
+    // A symbol outside the engine's allowlist is tradeable in the simulator.
+    expect(checkOrder(state, { symbol: 'DOGE/USDT', side: 'buy', qty: 100 }, browser).approved).toBe(
+      true,
+    );
+    // The engine's own cap still applies.
+    expect(checkOrder(state, { symbol: 'DOGE/USDT', side: 'buy', qty: 2_000 }, browser).reason).toBe(
+      'notional_too_large',
+    );
+  });
+
+  it('brings the price book back when the simulation is reset', () => {
+    const state = freshState({ [SOL]: 100 });
+    expect(state.prices[SOL]).toBe(100);
+    expect(checkOrder(state, { symbol: SOL, side: 'buy', qty: 1 }).approved).toBe(true);
   });
 });
 

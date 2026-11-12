@@ -7,7 +7,8 @@
  */
 
 import type { PortfolioSnapshot, Position, RiskState, TradeRecord } from '../api/types';
-import { DEFAULT_LIMITS, equityOf, freeCash, grossExposure, type DemoState } from './demo';
+import { equityOf, freeCash, grossExposure, type DemoState } from './demo';
+import { DEFAULT_LIMITS, type RuleLimits } from './riskRules';
 
 export function demoToPortfolio(state: DemoState): PortfolioSnapshot {
   const equity = equityOf(state);
@@ -58,7 +59,7 @@ export function demoToTrades(state: DemoState): TradeRecord[] {
   }));
 }
 
-export function demoToRisk(state: DemoState): RiskState {
+export function demoToRisk(state: DemoState, limits: RuleLimits = DEFAULT_LIMITS): RiskState {
   const equity = equityOf(state);
   const peak = state.peakEquity > 0 ? state.peakEquity : equity;
   const startEquity = state.dayStartEquity || equity;
@@ -72,12 +73,12 @@ export function demoToRisk(state: DemoState): RiskState {
     open_positions: Object.values(state.positions).filter((position) => position.qty !== 0).length,
     gross_exposure_usd: grossExposure(state),
     limits: {
-      max_position_pct_of_equity: DEFAULT_LIMITS.max_position_pct_of_equity,
-      max_gross_exposure_pct: DEFAULT_LIMITS.max_gross_exposure_pct,
-      max_daily_loss_pct: DEFAULT_LIMITS.max_daily_loss_pct,
-      max_drawdown_pct: DEFAULT_LIMITS.max_drawdown_pct,
-      max_open_positions: DEFAULT_LIMITS.max_open_positions,
-      max_order_notional_usd: DEFAULT_LIMITS.max_order_notional_usd,
+      max_position_pct_of_equity: limits.max_position_pct_of_equity,
+      max_gross_exposure_pct: limits.max_gross_exposure_pct,
+      max_daily_loss_pct: limits.max_daily_loss_pct,
+      max_drawdown_pct: limits.max_drawdown_pct,
+      max_open_positions: limits.max_open_positions,
+      max_order_notional_usd: limits.max_order_notional_usd,
     },
   };
 }

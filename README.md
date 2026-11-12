@@ -197,17 +197,61 @@ pnpm --dir ts -r build
 Every order passes the same checks, in the Rust core and in the browser
 simulation. The agent cannot skip them.
 
+### One source of truth
+
+The Rust core owns the limits, the order the checks run in and the words an
+order is refused with. The dashboard reads that contract instead of keeping a
+copy of it:
+
+```bash
+# The contract the engine is running with, as JSON.
+curl -s http://localhost:8080/api/risk/rules
+
+# The same contract, generated for the browser.
+cargo run -p openether-core --bin openether-rules
+```
+
+The second command writes the file the dashboard falls back on when no core is
+reachable (`ts/packages/ui/src/lib/risk-rules.json`). It is generated, not
+hand-written, and a Rust test fails the build when the two drift apart.
+
+The checks run in this order, and the first one that fails is the reason the
+order is refused:
+
+| # | Check | Reason code |
+| --- | --- | --- |
+| 1 | The breaker is closed | `breaker_open` |
+| 2 | The size is a positive number | `invalid_quantity` |
+| 3 | The price is known and positive | `invalid_price` |
+| 4 | The equity is known | `invalid_equity` |
+| 5 | The symbol is not empty | `invalid_symbol` |
+| 6 | The symbol is on the allowlist | `symbol_not_allowed` |
+| 7 | The venue is on the allowlist | `venue_not_allowed` |
+| 8 | The contract is on the allowlist | `contract_not_allowed` |
+| 9 | The order is large enough | `notional_too_small` |
+| 10 | The order is under the per-order cap | `notional_too_large` |
+| 11 | The sell does not flip the position | `reduce_only_violation` |
+| 12 | The position is under the size cap | `position_size_exceeds_max_pct` |
+| 13 | The book is under the gross cap | `gross_exposure_exceeded` |
+| 14 | There is room for another position | `max_open_positions` |
+| 15 | The probe order is small enough | `half_open_probe_too_large` |
+
+The venue then applies its own rules on top: `no_position` when there is
+nothing to sell, `reduce_only` when the sell would flip the position, and
+`insufficient_cash` when the free cash is short. An order that passes
+everything is `approved`.
+
 | Limit | Default | Rejection reason |
 | --- | --- | --- |
-| Single order notional | $5,000 | `above_max_notional` |
-| Minimum order notional | $10 | `below_min_notional` |
-| Position size | 20% of equity | `position_cap` |
-| Gross exposure | 60% of equity | `gross_exposure_cap` |
+| Single order notional | $5,000 | `notional_too_large` |
+| Minimum order notional | $10 | `notional_too_small` |
+| Position size | 20% of equity | `position_size_exceeds_max_pct` |
+| Gross exposure | 60% of equity | `gross_exposure_exceeded` |
 | Open positions | 5 | `max_open_positions` |
 | Free cash | margin-aware | `insufficient_cash` |
 | Daily loss | 3% | trips the breaker |
 | Drawdown from peak | 10% | trips the breaker |
-| Symbol / venue / contract | allowlist | `unknown_symbol` |
+| Symbol / venue / contract | allowlist | `symbol_not_allowed` |
 | Sells | reduce-only | `no_position`, `reduce_only` |
 
 **The circuit breaker** opens on a daily-loss or drawdown breach and refuses
@@ -216,6 +260,22 @@ always requires `{"confirm": true}` on `POST /api/breaker/reset` — there is no
 configuration switch for it, so the agent cannot reset the breaker on its own.
 Half-open states allow only a probe order. Every decision is written to an audit
 ring buffer exposed at `GET /api/risk/decisions`.
+
+An order that breaks the position cap also opens the breaker, so a single
+oversized order halts trading instead of being refused once.
+
+### The browser simulation
+
+The simulator in the dashboard is a second venue. It runs the engine's limits,
+the engine's check order and the engine's reason codes, so it refuses exactly
+what the engine refuses, for the same reason. Two things differ, both on
+purpose:
+
+- **The allowlists are cleared.** They describe the engine's own venue — which
+  symbols its connectors may trade on a live account. The simulator has no
+  exchange account, so it trades every market the free price feed offers.
+- **No keys, no orders.** Fills are computed in the browser. Nothing reaches an
+  exchange.
 
 ### Paper accounting
 
@@ -569,7 +629,7 @@ Exchange credentials are only read when live trading is armed. `.env`,
 
 `GET /healthz`, `/metrics`, `/api/config`, `/api/portfolio`, `/api/positions`,
 `/api/trades`, `/api/logs`, `/api/ticks`, `/api/risk`, `/api/risk/decisions`,
-`/api/strategy`, `/api/venues`, `/api/wallet`, `/api/live`;
+`/api/risk/rules`, `/api/strategy`, `/api/venues`, `/api/wallet`, `/api/live`;
 `POST /api/orders`, `/api/logs`, `/api/onchain`, `/api/strategy/reload`,
 `/api/breaker/reset`, `/api/wallet/sign-dry-run`;
 `GET /ws` for the live stream. Full shapes in [docs/api-contract.md](docs/api-contract.md).
@@ -580,7 +640,7 @@ Exchange credentials are only read when live trading is armed. `.env`,
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **130 passing**, including the encrypted keystore,
+- `cargo test --workspace` — **136 passing**, including the encrypted keystore,
   EVM and Solana dry-run signing, signature tampering, wrong-passphrase
   rejection, and the API refusing to sign when dry run is off.
 - The live-trading arming ceremony exercised end to end against the real
@@ -599,14 +659,24 @@ Checked locally on macOS (arm64):
   same accounts.
 - `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings`
   — clean, so the CI gate passes as written.
-- `pnpm -r test` — **92 passing** across the agent guard, the data server and
+- `pnpm -r test` — **102 passing** across the agent guard, the data server and
   the browser trading engine.
 - `pnpm -r typecheck` and `pnpm -r build` — clean.
-- Dashboard exercised in a real browser: an oversized BTC order rejected with
-  the notional cap reason, a within-limits SOL order filled, the position cap
-  enforced on adding, a closing sell settling exactly two fees, the breaker
-  blocking every order once open, both themes, and the admin gate rejecting a
-  wrong password and unlocking on the right one.
+- The risk contract proven to be shared: the Rust risk layer and the browser
+  simulator were driven side by side and refused the same orders with the same
+  reason codes — `notional_too_small`, `notional_too_large`,
+  `position_size_exceeds_max_pct`, `gross_exposure_exceeded`,
+  `max_open_positions`, `reduce_only`, `no_position` and `insufficient_cash`.
+  The drift guard was checked both ways: a stale generated file fails the Rust
+  build, a regenerated one passes.
+- Dashboard exercised in a real browser: the simulator filled a DOGE order —
+  a market outside the engine's own live allowlist, which the browser venue
+  still offers — under the engine's $5,000 cap, then an oversized order was
+  refused and halted trading with `position_size_exceeds_max_pct`; the ticket
+  showed the engine's cap; the position cap was enforced on adding, a closing
+  sell settled exactly two fees, the breaker blocked every order once open,
+  both themes worked, and the admin gate rejected a wrong password and
+  unlocked on the right one.
 - Contrast audited programmatically across every text node in both themes,
   including the breaker-open alarm state — no WCAG AA failures.
 - The core run locally in paper mode with the WASM strategy loaded: an
@@ -678,6 +748,13 @@ Bugs found and fixed during that verification:
   with, and every armed core refused its own arming as stale. The cap is now
   bound by taking the smaller of the two caps instead, and it is excluded from
   the digest.
+- The browser simulation kept its own copy of the risk limits and its own reason
+  codes, so the dashboard refused orders the engine would accept and said why in
+  words the engine never uses. Both now read the engine's contract, and a Rust
+  test fails the build when the generated copy drifts.
+- Resetting the browser simulation emptied its price book, so every order was
+  refused with "price must be a positive finite number" until the next price
+  refresh a minute later. The reset now brings the prices back with it.
 
 ---
 

@@ -2,11 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Coin } from '../lib/coins';
 import { fetchTopCoins, symbolForCoin } from '../lib/coins';
 import {
-  DEFAULT_LIMITS,
   checkOrder,
   emptyState,
   equityOf,
   executeOrder,
+  freshState,
   grossExposure,
   markToMarket,
   pricesFromCoins,
@@ -14,6 +14,7 @@ import {
   type DemoState,
   type DemoTrade,
 } from '../lib/demo';
+import { RISK_CONTRACT, type RiskContract } from '../lib/riskRules';
 
 const STORAGE_KEY = 'openether.demo.v2';
 
@@ -79,7 +80,10 @@ function cloneState(state: DemoState): DemoState {
  * visitor who reloads the page keeps their simulated book. Prices come from
  * the free CoinGecko endpoint and are refreshed on a timer.
  */
-export function useDemoEngine(enabled: boolean): DemoEngine {
+export function useDemoEngine(
+  enabled: boolean,
+  contract: RiskContract = RISK_CONTRACT,
+): DemoEngine {
   const [state, setState] = useState<DemoState>(() => loadPersisted() ?? emptyState());
   const [coins, setCoins] = useState<Coin[]>([]);
   const [loading, setLoading] = useState(false);
@@ -123,10 +127,10 @@ export function useDemoEngine(enabled: boolean): DemoEngine {
       return;
     }
     const next = cloneState(stateRef.current);
-    markToMarket(next, pricesFromCoins(coins));
+    markToMarket(next, pricesFromCoins(coins), contract);
     stateRef.current = next;
     setState(next);
-  }, [coins, enabled]);
+  }, [coins, contract, enabled]);
 
   const market = useMemo(
     () =>
@@ -138,14 +142,17 @@ export function useDemoEngine(enabled: boolean): DemoEngine {
     [coins],
   );
 
-  const preview = useCallback((symbol: string, side: 'buy' | 'sell', qty: number) => {
-    return checkOrder(stateRef.current, { symbol, side, qty }, DEFAULT_LIMITS);
-  }, []);
+  const preview = useCallback(
+    (symbol: string, side: 'buy' | 'sell', qty: number) => {
+      return checkOrder(stateRef.current, { symbol, side, qty }, contract);
+    },
+    [contract],
+  );
 
   const submit = useCallback(
     (order: { symbol: string; side: 'buy' | 'sell'; qty: number; rationale: string }) => {
       const next = cloneState(stateRef.current);
-      const result = executeOrder(next, order);
+      const result = executeOrder(next, order, contract);
       stateRef.current = next;
       setState(next);
       if (result.approved) {
@@ -153,11 +160,14 @@ export function useDemoEngine(enabled: boolean): DemoEngine {
       }
       return { approved: result.approved, reason: result.reason, detail: result.detail };
     },
-    [],
+    [contract],
   );
 
   const reset = useCallback(() => {
-    const fresh = emptyState();
+    // The price book has to come back with the reset: an empty one refuses
+    // every order until the next price refresh.
+    const fresh =
+      coins.length > 0 ? freshState(pricesFromCoins(coins), contract) : emptyState();
     stateRef.current = fresh;
     setState(fresh);
     try {
@@ -165,7 +175,7 @@ export function useDemoEngine(enabled: boolean): DemoEngine {
     } catch {
       // ignore
     }
-  }, []);
+  }, [coins, contract]);
 
   return {
     state,

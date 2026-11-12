@@ -42,7 +42,9 @@ function summarizeReload(response: StrategyReloadResponse | null): string {
 export default function App() {
   const { theme, toggle } = useTheme();
   const dash = useDashboard();
-  const demo = useDemoEngine(true);
+  // The simulator runs the engine's own money rules when a core is reachable,
+  // and the generated ones when it is not.
+  const demo = useDemoEngine(true, dash.simulatorContract);
 
   const [view, setView] = useState<View>('core');
   const [picked, setPicked] = useState(false);
@@ -66,7 +68,10 @@ export default function App() {
   const demoPortfolio = useMemo(() => demoToPortfolio(demo.state), [demo.state]);
   const demoPositions = useMemo(() => demoToPositions(demo.state), [demo.state]);
   const demoTrades = useMemo(() => demoToTrades(demo.state), [demo.state]);
-  const demoRisk = useMemo(() => demoToRisk(demo.state), [demo.state]);
+  const demoRisk = useMemo(
+    () => demoToRisk(demo.state, dash.simulatorContract.limits),
+    [demo.state, dash.simulatorContract],
+  );
 
   const simTicks = useMemo(
     () =>
@@ -232,6 +237,7 @@ export default function App() {
             <div className="dash__col">
               <TradeTicket
                 market={demo.market}
+                limits={dash.simulatorContract.limits}
                 symbol={ticketSymbol ?? undefined}
                 onSymbolChange={setTicketSymbol}
                 onSubmit={handleDemoSubmit}

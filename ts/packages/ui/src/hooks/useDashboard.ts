@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as api from '../api/client';
 import { isWsFrame } from '../api/types';
+import { RISK_CONTRACT, isRiskContract, toBrowserContract, type RiskContract } from '../lib/riskRules';
 import type {
   EngineStatus,
   LogEntry,
@@ -47,6 +48,10 @@ export interface DashboardData {
   trades: TradeRecord[];
   logs: LogEntry[];
   risk: RiskState | null;
+  /** The engine's risk contract, or the generated one when no core is running. */
+  riskContract: RiskContract;
+  /** The same limits, on the browser simulator's own venue. */
+  simulatorContract: RiskContract;
   strategy: StrategyInfo | null;
   venues: VenueHealth[];
   ticks: MarketTick[];
@@ -74,6 +79,7 @@ export function useDashboard(): DashboardData {
   const [trades, setTrades] = useState<TradeRecord[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [risk, setRisk] = useState<RiskState | null>(null);
+  const [riskContract, setRiskContract] = useState<RiskContract>(RISK_CONTRACT);
   const [strategy, setStrategy] = useState<StrategyInfo | null>(null);
   const [venues, setVenues] = useState<VenueHealth[]>([]);
   const [ticks, setTicks] = useState<MarketTick[]>([]);
@@ -103,17 +109,27 @@ export function useDashboard(): DashboardData {
 
   /** Pull every REST snapshot. Individual failures never abort the batch. */
   const refreshAll = useCallback(async () => {
-    const [portfolioResult, positionsResult, tradesResult, logsResult, riskResult, strategyResult, ticksResult, venuesResult] =
-      await Promise.all([
-        settle(api.getPortfolio()),
-        settle(api.getPositions()),
-        settle(api.getTrades(TRADE_LIMIT)),
-        settle(api.getLogs(LOG_LIMIT)),
-        settle(api.getRisk()),
-        settle(api.getStrategy()),
-        settle(api.getTicks(TICK_LIMIT)),
-        settle(api.getVenues()),
-      ]);
+    const [
+      portfolioResult,
+      positionsResult,
+      tradesResult,
+      logsResult,
+      riskResult,
+      strategyResult,
+      ticksResult,
+      venuesResult,
+      rulesResult,
+    ] = await Promise.all([
+      settle(api.getPortfolio()),
+      settle(api.getPositions()),
+      settle(api.getTrades(TRADE_LIMIT)),
+      settle(api.getLogs(LOG_LIMIT)),
+      settle(api.getRisk()),
+      settle(api.getStrategy()),
+      settle(api.getTicks(TICK_LIMIT)),
+      settle(api.getVenues()),
+      settle(api.getRiskRules()),
+    ]);
 
     const failures: string[] = [];
     let reachable = false;
@@ -166,6 +182,9 @@ export function useDashboard(): DashboardData {
       reachable = true;
     } else {
       failures.push(venuesResult.error);
+    }
+    if (rulesResult.ok && isRiskContract(rulesResult.value)) {
+      setRiskContract(rulesResult.value);
     }
 
     setCoreReachable(reachable);
@@ -246,12 +265,17 @@ export function useDashboard(): DashboardData {
   const connection: ConnectionState =
     wsState === 'connected' ? 'live' : coreReachable ? 'polling' : 'down';
 
+  // The simulator mirrors the engine's money rules, on its own venue.
+  const simulatorContract = useMemo(() => toBrowserContract(riskContract), [riskContract]);
+
   return {
     portfolio,
     positions,
     trades,
     logs,
     risk,
+    riskContract,
+    simulatorContract,
     strategy,
     venues,
     ticks,

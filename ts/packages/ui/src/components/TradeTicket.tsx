@@ -1,11 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { DemoLimits } from '../lib/demo';
-import { DEFAULT_LIMITS } from '../lib/demo';
+import { DEFAULT_LIMITS, type RuleLimits } from '../lib/riskRules';
 
 export interface TradeTicketProps {
   /** Symbols the visitor may trade, with the price to quote against. */
   market: Array<{ symbol: string; price: number; name?: string }>;
-  limits?: DemoLimits;
+  limits?: RuleLimits;
   /** Controlled symbol. When omitted the ticket keeps its own selection. */
   symbol?: string;
   onSymbolChange?: (symbol: string) => void;

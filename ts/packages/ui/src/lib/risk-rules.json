@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "limits": {
+    "max_position_pct_of_equity": 20.0,
+    "max_gross_exposure_pct": 60.0,
+    "max_daily_loss_pct": 3.0,
+    "max_drawdown_pct": 10.0,
+    "max_open_positions": 5,
+    "max_order_notional_usd": 5000.0,
+    "min_order_notional_usd": 10.0,
+    "breaker_cooldown_ms": 300000,
+    "hard_halt_on_oversized_order": true
+  },
+  "allowlists": {
+    "symbols": [],
+    "venues": [],
+    "contracts": []
+  },
+  "check_order": [
+    "breaker_open",
+    "invalid_quantity",
+    "invalid_price",
+    "invalid_equity",
+    "invalid_symbol",
+    "symbol_not_allowed",
+    "venue_not_allowed",
+    "contract_not_allowed",
+    "notional_too_small",
+    "notional_too_large",
+    "reduce_only_violation",
+    "position_size_exceeds_max_pct",
+    "gross_exposure_exceeded",
+    "max_open_positions",
+    "half_open_probe_too_large"
+  ],
+  "venue_checks": [
+    "no_position",
+    "reduce_only",
+    "insufficient_cash"
+  ],
+  "reasons": [
+    "breaker_open",
+    "invalid_quantity",
+    "invalid_price",
+    "invalid_equity",
+    "invalid_symbol",
+    "symbol_not_allowed",
+    "venue_not_allowed",
+    "contract_not_allowed",
+    "notional_too_small",
+    "notional_too_large",
+    "reduce_only_violation",
+    "position_size_exceeds_max_pct",
+    "gross_exposure_exceeded",
+    "max_open_positions",
+    "half_open_probe_too_large",
+    "no_position",
+    "reduce_only",
+    "insufficient_cash",
+    "approved"
+  ]
+}

@@ -33,6 +33,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/ticks", get(ticks))
         .route("/api/risk", get(risk))
         .route("/api/risk/decisions", get(risk_decisions))
+        .route("/api/risk/rules", get(risk_rules))
         .route("/api/onchain", post(onchain))
         .route("/api/strategy", get(strategy))
         .route("/api/strategy/reload", post(strategy_reload))
@@ -131,6 +132,14 @@ async fn portfolio(State(state): State<Arc<AppState>>) -> Json<PortfolioSnapshot
 
 async fn positions(State(state): State<Arc<AppState>>) -> Json<Vec<Position>> {
     Json(state.portfolio().positions)
+}
+
+/// The canonical risk rules this engine is running with.
+///
+/// The browser simulator reads the same contract, so the dashboard and the
+/// engine refuse the same orders for the same reasons.
+async fn risk_rules(State(state): State<Arc<AppState>>) -> Json<crate::risk_rules::RiskContract> {
+    Json(crate::risk_rules::contract(&state.config.risk))
 }
 
 #[derive(Debug, Deserialize)]

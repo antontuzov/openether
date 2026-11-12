@@ -27,6 +27,7 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 | GET | `/api/wallet` | `WalletMetadata` — public wallet metadata, never a secret |
 | POST | `/api/wallet/sign-dry-run` | Body `{ "passphrase", "envelope", "account"? }` → `DryRunSignature` |
 | GET | `/api/live` | Live-trading arming state (see below) |
+| GET | `/api/risk/rules` | `RiskContract` — the limits, check order and reason codes the engine runs with (see below) |
 
 ### `POST /api/orders`
 
@@ -144,6 +145,85 @@ trading is on it is what an oversized order is measured against
 (`notional_too_large`).
 
 `GET /api/config` carries the same object under `live_arming`.
+
+### `GET /api/risk/rules`
+
+The canonical risk contract. The Rust risk layer owns it: the limits, the
+order the checks run in and the reason codes are defined once, here. The
+dashboard reads this endpoint and runs the same checks, so the browser
+simulator refuses exactly what the engine refuses, for the same reason.
+
+Response `200`:
+```json
+{
+  "version": 1,
+  "limits": {
+    "max_position_pct_of_equity": 20.0,
+    "max_gross_exposure_pct": 60.0,
+    "max_daily_loss_pct": 3.0,
+    "max_drawdown_pct": 10.0,
+    "max_open_positions": 5,
+    "max_order_notional_usd": 5000.0,
+    "min_order_notional_usd": 10.0,
+    "breaker_cooldown_ms": 300000,
+    "hard_halt_on_oversized_order": true
+  },
+  "allowlists": {
+    "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+    "venues": ["paper"],
+    "contracts": []
+  },
+  "check_order": [
+    "breaker_open",
+    "invalid_quantity",
+    "invalid_price",
+    "invalid_equity",
+    "invalid_symbol",
+    "symbol_not_allowed",
+    "venue_not_allowed",
+    "contract_not_allowed",
+    "notional_too_small",
+    "notional_too_large",
+    "reduce_only_violation",
+    "position_size_exceeds_max_pct",
+    "gross_exposure_exceeded",
+    "max_open_positions",
+    "half_open_probe_too_large"
+  ],
+  "venue_checks": ["no_position", "reduce_only", "insufficient_cash"],
+  "reasons": [
+    "breaker_open",
+    "invalid_quantity",
+    "invalid_price",
+    "invalid_equity",
+    "invalid_symbol",
+    "symbol_not_allowed",
+    "venue_not_allowed",
+    "contract_not_allowed",
+    "notional_too_small",
+    "notional_too_large",
+    "reduce_only_violation",
+    "position_size_exceeds_max_pct",
+    "gross_exposure_exceeded",
+    "max_open_positions",
+    "half_open_probe_too_large",
+    "no_position",
+    "reduce_only",
+    "insufficient_cash",
+    "approved"
+  ]
+}
+```
+
+`check_order` is the order the checks run in: the first one that fails is the
+reason the order is refused. `venue_checks` are applied by the venue after the
+risk layer has passed the order. `reasons` is every code an order can end up
+with, `approved` included.
+
+The same contract, with empty allowlists, is generated for the browser by
+`cargo run -p openether-core --bin openether-rules` and written to
+`ts/packages/ui/src/lib/risk-rules.json`. That file is generated, not
+hand-written, and a Rust test fails the build when it drifts.
 
 ## Risk state
 

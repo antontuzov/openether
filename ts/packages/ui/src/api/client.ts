@@ -152,6 +152,15 @@ export function getRisk(): Promise<RiskState> {
   return request<RiskState>('/api/risk');
 }
 
+/**
+ * The canonical risk contract the engine is running with.
+ *
+ * The browser simulator uses it so it refuses exactly what the engine refuses.
+ */
+export function getRiskRules(): Promise<unknown> {
+  return request<unknown>('/api/risk/rules');
+}
+
 /** Metadata of the loaded WASM strategy. */
 export function getStrategy(): Promise<StrategyInfo> {
   return request<StrategyInfo>('/api/strategy');
