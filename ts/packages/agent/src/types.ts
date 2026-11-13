@@ -87,6 +87,11 @@ export interface PortfolioSnapshot {
   unrealized_pnl_usd: number;
   realized_pnl_usd: number;
   total_pnl_pct: number;
+  /**
+   * On-chain wallet value. Reported only — the agent must never treat it as
+   * spendable trading equity.
+   */
+  onchain_value_usd?: number;
   positions: PortfolioPosition[];
   ts_ms: number;
 }

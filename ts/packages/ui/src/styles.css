@@ -1528,6 +1528,79 @@ body::after {
   color: var(--tint-down);
 }
 
+/* ------------------------------------------------------------ on-chain wallet */
+
+.wallet-note {
+  margin: 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--overlay-1);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: var(--fg-2);
+}
+
+.wallet-note strong {
+  color: var(--fg-hi);
+  font-weight: 600;
+}
+
+.wallet-chain + .wallet-chain {
+  border-top: 1px solid var(--line);
+}
+
+.wallet-chain__hd {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 12px;
+  background: var(--head);
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.wallet-chain__name {
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--fg-2);
+}
+
+.wallet-chain__addr {
+  font-size: 10.5px;
+  color: var(--fg-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wallet-chain__value {
+  margin-left: auto;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--fg-hi);
+}
+
+.wallet-chain__note {
+  margin: 0;
+  padding: 6px 12px;
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--fg-3);
+}
+
+.empty__hint code {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  border: 1px solid var(--line-soft);
+  background: var(--overlay-1);
+  color: var(--fg-2);
+}
+
 /* ------------------------------------------------------------------- footer */
 
 .foot {

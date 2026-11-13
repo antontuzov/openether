@@ -3,6 +3,7 @@ pub mod config;
 pub mod engine;
 pub mod exchange;
 pub mod hd;
+pub mod holdings;
 pub mod live_arm;
 pub mod metrics;
 pub mod onchain;

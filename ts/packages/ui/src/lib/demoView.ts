@@ -25,6 +25,8 @@ export function demoToPortfolio(state: DemoState): PortfolioSnapshot {
     unrealized_pnl_usd: unrealized,
     realized_pnl_usd: realized,
     total_pnl_pct: startEquity > 0 ? ((equity - startEquity) / startEquity) * 100 : 0,
+    // The simulator has no wallet: it holds no keys and reads no chain.
+    onchain_value_usd: 0,
     positions: demoToPositions(state),
     ts_ms: Date.now(),
   };

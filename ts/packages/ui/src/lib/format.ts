@@ -117,6 +117,13 @@ export function shortHash(hash: string | null | undefined): string {
   return hash.length > 12 ? hash.slice(0, 12) : hash;
 }
 
+/** Shorten an address the way the engine does: `0xA0b8…eB48`. */
+export function shortAddress(address: string): string {
+  const trimmed = address.trim();
+  if (trimmed.length <= 10) return trimmed;
+  return `${trimmed.slice(0, 6)}…${trimmed.slice(-4)}`;
+}
+
 /** `open` → `OPEN`, `half_open` → `HALF OPEN`. */
 export function titleise(value: string): string {
   return value.replace(/_/g, ' ').toUpperCase();

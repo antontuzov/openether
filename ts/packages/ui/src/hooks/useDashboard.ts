@@ -12,6 +12,7 @@ import type {
   StrategyInfo,
   TradeRecord,
   VenueHealth,
+  WalletHoldings,
   WsFrame,
 } from '../api/types';
 
@@ -48,6 +49,8 @@ export interface DashboardData {
   trades: TradeRecord[];
   logs: LogEntry[];
   risk: RiskState | null;
+  /** The on-chain wallet, valued but never traded. `null` until the core answers. */
+  wallet: WalletHoldings | null;
   /** The engine's risk contract, or the generated one when no core is running. */
   riskContract: RiskContract;
   /** The same limits, on the browser simulator's own venue. */
@@ -79,6 +82,7 @@ export function useDashboard(): DashboardData {
   const [trades, setTrades] = useState<TradeRecord[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [risk, setRisk] = useState<RiskState | null>(null);
+  const [wallet, setWallet] = useState<WalletHoldings | null>(null);
   const [riskContract, setRiskContract] = useState<RiskContract>(RISK_CONTRACT);
   const [strategy, setStrategy] = useState<StrategyInfo | null>(null);
   const [venues, setVenues] = useState<VenueHealth[]>([]);
@@ -119,6 +123,7 @@ export function useDashboard(): DashboardData {
       ticksResult,
       venuesResult,
       rulesResult,
+      walletResult,
     ] = await Promise.all([
       settle(api.getPortfolio()),
       settle(api.getPositions()),
@@ -129,6 +134,7 @@ export function useDashboard(): DashboardData {
       settle(api.getTicks(TICK_LIMIT)),
       settle(api.getVenues()),
       settle(api.getRiskRules()),
+      settle(api.getWalletHoldings()),
     ]);
 
     const failures: string[] = [];
@@ -185,6 +191,12 @@ export function useDashboard(): DashboardData {
     }
     if (rulesResult.ok && isRiskContract(rulesResult.value)) {
       setRiskContract(rulesResult.value);
+    }
+    // A wallet read that fails is not a trading outage, so it stays out of the
+    // headline error: the wallet panel reports its own missing read.
+    if (walletResult.ok) {
+      setWallet(walletResult.value);
+      reachable = true;
     }
 
     setCoreReachable(reachable);
@@ -274,6 +286,7 @@ export function useDashboard(): DashboardData {
     trades,
     logs,
     risk,
+    wallet,
     riskContract,
     simulatorContract,
     strategy,

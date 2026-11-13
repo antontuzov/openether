@@ -1,4 +1,5 @@
 use crate::engine::AppState;
+use crate::holdings::WalletHoldings;
 use crate::types::*;
 use crate::wallet::{AccountSelector, TxEnvelope, WalletError, WalletService};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -15,11 +16,9 @@ use tower_http::cors::CorsLayer;
 use zeroize::Zeroizing;
 
 pub fn router(state: Arc<AppState>) -> Router {
-    // The wallet service owns the encrypted keystore and the unlock lease. It
-    // is created once and shared through an extension so that the lease is
-    // process wide and survives across requests.
-    let wallet = Arc::new(WalletService::new(state.config.wallet.clone()));
-    wallet.spawn_key_reaper();
+    // The wallet service lives on the engine, so the unlock lease is process
+    // wide and the holdings loop and the API share one keystore.
+    let wallet = Arc::clone(&state.wallet);
 
     Router::new()
         .route("/healthz", get(healthz))
@@ -41,6 +40,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/breaker/reset", post(reset_breaker))
         .route("/api/venues", get(venues))
         .route("/api/wallet", get(wallet_metadata))
+        .route("/api/wallet/holdings", get(wallet_holdings))
         .route("/api/wallet/sign-dry-run", post(wallet_sign_dry_run))
         .route("/api/live", get(live_status))
         .route("/ws", get(ws_handler))
@@ -372,6 +372,15 @@ async fn wallet_metadata(
     )
 }
 
+/// `GET /api/wallet/holdings`
+///
+/// What the wallet holds, valued in dollars: the native coin of every chain
+/// plus the ERC-20 and SPL tokens. Balances come from public RPC endpoints and
+/// prices from a free public feed, so no key is unlocked to answer this.
+async fn wallet_holdings(State(state): State<Arc<AppState>>) -> Json<WalletHoldings> {
+    Json(state.wallet_holdings())
+}
+
 /// `POST /api/wallet/sign-dry-run`
 ///
 /// Signs an envelope locally and returns the signature. The transaction is
@@ -541,6 +550,7 @@ mod tests {
             dry_run: true,
             unlock_timeout_ms: 1_000,
             accounts: 5,
+            ..Default::default()
         }))
     }
 
@@ -619,6 +629,7 @@ mod tests {
             dry_run: false,
             unlock_timeout_ms: 1_000,
             accounts: 5,
+            ..Default::default()
         }));
         let response = wallet_sign_dry_run(
             Extension(wallet),
@@ -666,6 +677,7 @@ mod tests {
             dry_run: true,
             unlock_timeout_ms: 5_000,
             accounts: 5,
+            ..Default::default()
         };
         let state = crate::engine::AppState::new(config).unwrap();
         let app = router(Arc::clone(&state));

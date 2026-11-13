@@ -259,6 +259,14 @@ pub struct PortfolioSnapshot {
     pub unrealized_pnl_usd: f64,
     pub realized_pnl_usd: f64,
     pub total_pnl_pct: f64,
+    /// The value of the on-chain wallet, in dollars.
+    ///
+    /// It is reported, not traded: the risk layer still measures equity on the
+    /// trading account alone, because there is no broadcast path for the
+    /// wallet yet. Mixing the two would let an unspendable balance widen the
+    /// limits of the account that can actually lose money.
+    #[serde(default)]
+    pub onchain_value_usd: f64,
     pub positions: Vec<Position>,
     pub ts_ms: i64,
 }

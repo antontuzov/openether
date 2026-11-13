@@ -1679,6 +1679,7 @@ mod tests {
             dry_run: true,
             unlock_timeout_ms: 60_000,
             accounts: 5,
+            ..Default::default()
         }
     }
 
@@ -1946,6 +1947,7 @@ mod tests {
             dry_run: true,
             unlock_timeout_ms: 1_000,
             accounts: 5,
+            ..Default::default()
         };
         let service = WalletService::new(config);
         assert!(!service.is_configured());

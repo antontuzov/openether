@@ -1,12 +1,14 @@
 use crate::bus::{Event, EventBus, StatusEvent};
 use crate::config::Config;
 use crate::exchange::{AccountRestore, ExchangeConnector, ExchangeError, OpenOrder, TickSink};
+use crate::holdings::{self, HoldingsService, WalletHoldings};
 use crate::metrics::Metrics;
 use crate::onchain::OnchainClient;
 use crate::risk::{RiskContext, RiskEngine, RiskState, RiskVerdict};
 use crate::store::{PortfolioRow, PositionRow, Store};
 use crate::strategy::{StrategyHost, StrategySignal};
 use crate::types::*;
+use crate::wallet::WalletService;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -15,6 +17,8 @@ use std::time::Duration;
 const MAX_TICKS: usize = 2_000;
 const MAX_TRADES: usize = 1_000;
 const MAX_LOGS: usize = 2_000;
+/// How often the on-chain wallet is revalued.
+const WALLET_REFRESH_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SubmitOutcome {
@@ -44,6 +48,8 @@ struct DataStore {
     equity_usd: f64,
     cash_usd: f64,
     open_orders: Vec<OpenOrder>,
+    /// The last reading of the on-chain wallet.
+    wallet_holdings: Option<WalletHoldings>,
 }
 
 /// Shared engine state. The API layer, the MCP server and the background loops
@@ -56,6 +62,12 @@ pub struct AppState {
     pub strategy: Arc<std::sync::Mutex<Option<Arc<StrategyHost>>>>,
     pub connector: Arc<dyn ExchangeConnector>,
     pub onchain: Arc<OnchainClient>,
+    /// The encrypted keystore and its unlock lease. Public metadata only until
+    /// an operator unlocks it.
+    pub wallet: Arc<WalletService>,
+    /// Values the wallet's holdings. `None` only when the price client could
+    /// not be built.
+    pub holdings: Option<Arc<HoldingsService>>,
     pub ws_clients: std::sync::atomic::AtomicUsize,
     /// Durable state. `None` when the run is configured to keep everything in
     /// memory.
@@ -74,6 +86,18 @@ impl AppState {
             OnchainClient::new(config.solana_rpc_url.clone(), config.evm_rpc_urls.clone())
                 .map_err(|e| anyhow::anyhow!("on-chain client: {e}"))?,
         );
+        let holdings = match HoldingsService::new(
+            Arc::clone(&onchain),
+            config.wallet.price_feed_url.clone(),
+        ) {
+            Ok(service) => Some(Arc::new(service)),
+            Err(e) => {
+                tracing::warn!(error = %e, "wallet valuation is disabled: no price client");
+                None
+            }
+        };
+        let wallet = Arc::new(WalletService::new(config.wallet.clone()));
+        wallet.spawn_key_reaper();
 
         let strategy = Arc::new(std::sync::Mutex::new(None));
         if let Some(path) = config.strategy_wasm.clone() {
@@ -117,6 +141,8 @@ impl AppState {
             strategy,
             connector,
             onchain,
+            wallet,
+            holdings,
             ws_clients: std::sync::atomic::AtomicUsize::new(0),
             store,
             data: std::sync::Mutex::new(DataStore::default()),
@@ -375,9 +401,83 @@ impl AppState {
             } else {
                 0.0
             },
+            onchain_value_usd: data
+                .wallet_holdings
+                .as_ref()
+                .map(|wallet| wallet.value_usd)
+                .unwrap_or(0.0),
             positions,
             ts_ms: now_ms(),
         }
+    }
+
+    /// The last reading of the on-chain wallet.
+    ///
+    /// Before the first refresh completes there is no reading yet, but the
+    /// wallet is still configured — reporting otherwise would tell the
+    /// operator their keystore vanished.
+    pub fn wallet_holdings(&self) -> WalletHoldings {
+        self.lock_data()
+            .wallet_holdings
+            .clone()
+            .unwrap_or_else(|| holdings::wallet_of(Vec::new(), self.wallet.is_configured()))
+    }
+
+    /// Reads and values the wallet.
+    ///
+    /// Balances are public data and the addresses come from the keystore's
+    /// public header, so no key is ever unlocked here.
+    pub async fn refresh_wallet_holdings(&self) {
+        let Some(service) = self.holdings.as_ref() else {
+            return;
+        };
+        let configured = self.wallet.is_configured();
+        let accounts = holdings::watched_accounts(&self.wallet.metadata());
+        if accounts.is_empty() {
+            self.lock_data().wallet_holdings = Some(holdings::wallet_of(Vec::new(), configured));
+            return;
+        }
+
+        let watchlist = &self.config.wallet.evm_token_watchlist;
+        let evm_chains: Vec<String> = self
+            .config
+            .evm_rpc_urls
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut chains = Vec::new();
+        for (chain, address) in accounts {
+            let targets: Vec<String> = if chain == "evm" {
+                // An EVM address is valid on every EVM chain the operator
+                // configured, so the wallet is valued on each of them.
+                evm_chains.clone()
+            } else {
+                vec![chain]
+            };
+            for target in targets {
+                let reading = if target == "solana" {
+                    service.solana(&address).await
+                } else {
+                    service.evm(&target, &address, watchlist).await
+                };
+                match reading {
+                    Ok(holding) => chains.push(holding),
+                    Err(e) => {
+                        self.log(
+                            "wallet",
+                            "warn",
+                            &format!("could not value {target}: {e}"),
+                            serde_json::json!({"chain": target, "error": e.to_string()}),
+                        );
+                    }
+                }
+            }
+        }
+
+        let wallet = holdings::wallet_of(chains, configured);
+        self.metrics
+            .gauge_set("openether_wallet_value_usd", &[], wallet.value_usd);
+        self.lock_data().wallet_holdings = Some(wallet);
     }
 
     pub fn risk_state(&self) -> RiskState {
@@ -848,6 +948,16 @@ pub async fn run_background_tasks(state: Arc<AppState>) {
             account_state.refresh_open_orders().await;
         }
     });
+
+    let wallet_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(WALLET_REFRESH_SECS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            wallet_state.refresh_wallet_holdings().await;
+        }
+    });
 }
 
 /// Maps a connector error into a stable machine-readable reason.
@@ -1013,6 +1123,62 @@ mod tests {
             "restarting must not close the breaker — that would make a restart \
              a way around the risk layer"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The wallet is reported, never traded. A million dollars of on-chain
+    /// tokens must not widen a single limit of the account that can actually
+    /// lose money.
+    #[tokio::test]
+    async fn the_wallet_value_is_reported_but_never_traded() {
+        let (dir, db) = temp_db();
+        let state = AppState::new(config_with_db(&db)).unwrap();
+        state.lock_data().wallet_holdings = Some(holdings::wallet_of(
+            vec![crate::holdings::ChainHoldings {
+                chain: "solana".into(),
+                address: "addr".into(),
+                native_symbol: "SOL".into(),
+                native_balance: 1.0,
+                native_price_usd: 1_000_000.0,
+                native_value_usd: 1_000_000.0,
+                tokens: vec![],
+                tokens_skipped: 0,
+                value_usd: 1_000_000.0,
+                fetched_at_ms: now_ms(),
+            }],
+            true,
+        ));
+
+        let portfolio = state.portfolio();
+        assert_eq!(portfolio.onchain_value_usd, 1_000_000.0);
+        assert_eq!(
+            portfolio.equity_usd, 10_000.0,
+            "the trading account is still the only equity the risk layer sees"
+        );
+        assert_eq!(state.risk_state().equity_usd, 10_000.0);
+
+        // Sized against the wallet this would be trivially affordable. Against
+        // the trading account it is far past every cap.
+        let outcome = state
+            .submit_order(
+                OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 100.0),
+                "test",
+            )
+            .await;
+        assert!(!outcome.approved, "{outcome:?}");
+        assert_eq!(state.equity(), 10_000.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_engine_without_a_keystore_reports_an_empty_wallet() {
+        let (dir, db) = temp_db();
+        let state = AppState::new(config_with_db(&db)).unwrap();
+        let wallet = state.wallet_holdings();
+        assert!(!wallet.configured);
+        assert!(wallet.chains.is_empty());
+        assert_eq!(wallet.value_usd, 0.0);
+        assert_eq!(state.portfolio().onchain_value_usd, 0.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

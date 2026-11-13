@@ -148,6 +148,7 @@ function emptyPortfolio() {
     unrealized_pnl_usd: 0,
     realized_pnl_usd: 0,
     total_pnl_pct: 0,
+    onchain_value_usd: 0,
     positions: [],
     ts_ms: Date.now(),
   };

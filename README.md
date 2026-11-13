@@ -496,6 +496,39 @@ Omitting it signs with the primary account. Asking for an account the keystore
 does not hold is refused — a single-key keystore answers `account_not_found`
 rather than quietly signing with the wrong key.
 
+### Reading the balances
+
+The core values the wallet every 30 seconds and serves it at
+`GET /api/wallet/holdings`; the dashboard shows it in the **On-chain wallet**
+panel of the core view.
+
+- **No passphrase, no unlock.** Balances are read from public addresses only.
+  The keystore stays locked while the wallet is being valued.
+- **Native coins and tokens.** Solana SOL plus every SPL token account the
+  address holds; EVM gas plus each contract on
+  `OPENETHER_EVM_TOKEN_WATCHLIST`. Decimals and symbols come from the chain
+  (`balanceOf`, `decimals()`, `symbol()`), not from a guess.
+- **Prices from the DEX feed.** DexScreener quotes the deepest pool where the
+  token is the *base* of the pair. A token no pool quotes is shown as
+  `unpriced` and contributes **nothing** to the total.
+- **Bounded on purpose.** A busy address can hold thousands of dust tokens, so
+  the read prices at most 300 of them, 30 per request, and reports how many it
+  left out (`tokens_skipped`) instead of silently dropping them.
+- **Only the first account per chain.** Each extra account is another full set
+  of RPC calls; the first Solana and first EVM account are the ones read.
+
+```bash
+# Value USDC and USDT on every EVM chain the core is configured for.
+OPENETHER_EVM_TOKEN_WATCHLIST=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,0xdAC17F958D2ee523a2206206994597C13D831ec7
+```
+
+**The wallet is not trading equity.** `PortfolioSnapshot.onchain_value_usd`
+reports the total, but every risk check — position caps, gross exposure,
+drawdown, the circuit breaker — still measures the trading account alone.
+There is no broadcast path, so an unspendable balance must never widen the
+limits of the account that can actually lose money. A test asserts exactly
+that: a $1,000,000 wallet leaves a $10,000 account's limits untouched.
+
 ### What it still cannot do
 
 The wallet **signs and logs, it does not broadcast**. Every response carries
@@ -515,6 +548,9 @@ operator controls.
   reason from the risk layer.
 - **Markets**: top 50 coins by market cap from the free CoinGecko endpoint,
   filterable and sortable, each with a trade button.
+- **On-chain wallet** (core view): native coins and tokens per chain, priced
+  from the DEX feed, with unpriced and skipped holdings marked rather than
+  hidden. Labelled read-only — it is not trading equity.
 - **Admin analytics** (password-gated): net/gross P&L, fees, win rate, profit
   factor, equity curve, P&L by bucket, and a pivot table across symbol, venue,
   side, day, hour and source.
@@ -617,6 +653,8 @@ Copy `.env.example` to `.env`. The important defaults:
 | `OPENETHER_VENUE` | `paper` | `paper` / `binance` / `kraken` / `hyperliquid` (read-only) |
 | `OPENETHER_WALLET_DRY_RUN` | `1` | sign and log, never broadcast |
 | `OPENETHER_WALLET_ACCOUNTS` | `5` | accounts per chain in an HD keystore |
+| `OPENETHER_EVM_TOKEN_WATCHLIST` | *(empty)* | ERC-20 contracts to value, comma-separated |
+| `OPENETHER_PRICE_FEED_URL` | `https://api.dexscreener.com` | DEX feed used to price wallet holdings |
 | `OPENETHER_SYMBOL_ALLOWLIST` | `SOL/USDT,BTC/USDT,ETH/USDT` | tradable symbols |
 | `OPENETHER_CONTRACT_ALLOWLIST` | *(empty)* | permitted on-chain contracts |
 | `LLM_PROVIDER` | `local` | `local` / `openai` / `anthropic` / `openai-compatible` |
@@ -629,7 +667,8 @@ Exchange credentials are only read when live trading is armed. `.env`,
 
 `GET /healthz`, `/metrics`, `/api/config`, `/api/portfolio`, `/api/positions`,
 `/api/trades`, `/api/logs`, `/api/ticks`, `/api/risk`, `/api/risk/decisions`,
-`/api/risk/rules`, `/api/strategy`, `/api/venues`, `/api/wallet`, `/api/live`;
+`/api/risk/rules`, `/api/strategy`, `/api/venues`, `/api/wallet`,
+`/api/wallet/holdings`, `/api/live`;
 `POST /api/orders`, `/api/logs`, `/api/onchain`, `/api/strategy/reload`,
 `/api/breaker/reset`, `/api/wallet/sign-dry-run`;
 `GET /ws` for the live stream. Full shapes in [docs/api-contract.md](docs/api-contract.md).
@@ -640,9 +679,10 @@ Exchange credentials are only read when live trading is armed. `.env`,
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **136 passing**, including the encrypted keystore,
+- `cargo test --workspace` — **149 passing**, including the encrypted keystore,
   EVM and Solana dry-run signing, signature tampering, wrong-passphrase
-  rejection, and the API refusing to sign when dry run is off.
+  rejection, and the API refusing to sign when dry run is off. Two further
+  tests are `#[ignore]`d because they need the network; both pass when run.
 - The live-trading arming ceremony exercised end to end against the real
   binaries: the env var alone arms nothing; arming without the confirmation
   phrase is refused; arming writes a record that flips `GET /api/live` to
@@ -659,7 +699,7 @@ Checked locally on macOS (arm64):
   same accounts.
 - `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings`
   — clean, so the CI gate passes as written.
-- `pnpm -r test` — **102 passing** across the agent guard, the data server and
+- `pnpm -r test` — **106 passing** across the agent guard, the data server and
   the browser trading engine.
 - `pnpm -r typecheck` and `pnpm -r build` — clean.
 - The risk contract proven to be shared: the Rust risk layer and the browser
@@ -696,6 +736,19 @@ Checked locally on macOS (arm64):
   position, the fee-charged equity, the locked margin, the trade journal, the
   client-order-id mapping and the risk anchors all came back. A second run
   against the same file refused an order that the position cap had to refuse.
+- The wallet valued from **real mainnet data**: a public Ethereum address read
+  over JSON-RPC returned 0.8083523704434918 ETH plus USDC and USDT with the
+  right 6 decimals and symbols, priced at $1,931.68 / $1.0008 / $1.0039 for a
+  total of $1,411,257.39; a public Solana address returned its SOL and SPL
+  holdings. Two bugs surfaced only against the live feed and are now covered by
+  tests: DexScreener quotes `priceUsd` as a *string* (so every price was silently
+  missing), and an ABI `string` return was decoded half a word at a time (so
+  every symbol came back as NUL bytes).
+- The safety invariant asserted in a test: a $1,000,000 on-chain wallet leaves a
+  $10,000 trading account's equity unchanged and a 100 SOL order still refused.
+- `GET /api/wallet/holdings` served by a running core with a throwaway HD
+  keystore: `configured: true`, both chains, live SOL and ETH prices, and
+  `onchain_value_usd` on `/api/portfolio` without touching equity.
 
 **Not verified:** live exchange connections (no credentials were used), real
 on-chain transactions (no broadcast path exists), and the <10µs dispatch target

@@ -64,7 +64,7 @@ export interface LogEntry {
   context: unknown;
 }
 
-/** Account-level snapshot. */
+/** Account-level snapshot of the trading venue. */
 export interface PortfolioSnapshot {
   venue: Venue;
   equity_usd: number;
@@ -72,8 +72,53 @@ export interface PortfolioSnapshot {
   unrealized_pnl_usd: number;
   realized_pnl_usd: number;
   total_pnl_pct: number;
+  /**
+   * Value of the on-chain wallet. Reported, never traded: the risk layer keeps
+   * measuring equity on the trading account alone, so this balance cannot widen
+   * the limits of the account that can actually lose money.
+   */
+  onchain_value_usd: number;
   positions: Position[];
   ts_ms: number;
+}
+
+/** One token held on-chain, priced from the DEX feed. */
+export interface TokenHolding {
+  chain: string;
+  /** Contract address (EVM) or mint (Solana). */
+  asset: string;
+  symbol: string;
+  balance: number;
+  decimals: number;
+  /** `null` when no pool quoted the token. */
+  price_usd: number | null;
+  value_usd: number;
+  /** False when the token is held but could not be priced. */
+  priced: boolean;
+}
+
+/** Everything held on one chain by one address. */
+export interface ChainHoldings {
+  chain: string;
+  address: string;
+  native_symbol: string;
+  native_balance: number;
+  native_price_usd: number | null;
+  native_value_usd: number;
+  tokens: TokenHolding[];
+  /** Dust tokens left unpriced so the free feed's rate limit survives. */
+  tokens_skipped: number;
+  value_usd: number;
+  fetched_at_ms: number;
+}
+
+/** Response of `GET /api/wallet/holdings`. */
+export interface WalletHoldings {
+  /** False when no keystore is configured, so every balance is zero. */
+  configured: boolean;
+  chains: ChainHoldings[];
+  value_usd: number;
+  fetched_at_ms: number;
 }
 
 /** Hard limits enforced by the risk layer. */

@@ -25,6 +25,7 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 | POST | `/api/breaker/reset` | Body `{ "confirm": true }` → manual breaker reset |
 | GET | `/api/venues` | `[{ "venue": "paper", "healthy": true, "live": false }]` |
 | GET | `/api/wallet` | `WalletMetadata` — public wallet metadata, never a secret |
+| GET | `/api/wallet/holdings` | `WalletHoldings` — on-chain balances, valued but never traded (see below) |
 | POST | `/api/wallet/sign-dry-run` | Body `{ "passphrase", "envelope", "account"? }` → `DryRunSignature` |
 | GET | `/api/live` | Live-trading arming state (see below) |
 | GET | `/api/risk/rules` | `RiskContract` — the limits, check order and reason codes the engine runs with (see below) |
@@ -106,6 +107,64 @@ Codes: `wallet_not_configured`, `wallet_locked`, `wallet_lease_expired`,
 `invalid_passphrase`, `keystore_decrypt_failed`, `live_broadcast_unsupported`,
 `chain_mismatch`, `account_not_found`, `invalid_key`, `invalid_envelope`,
 `signature_invalid`, `unsupported_keystore_format`, `keystore_io_error`.
+
+### `GET /api/wallet/holdings`
+
+The on-chain wallet, read from the chain and priced from the DEX feed. The
+engine refreshes it every 30 seconds and never unlocks the keystore to do it:
+only public addresses are used.
+
+**These balances are not trading equity.** There is no broadcast path, so the
+risk layer keeps measuring equity, drawdown and position caps on the trading
+account alone. `PortfolioSnapshot.onchain_value_usd` reports the same total for
+convenience and is likewise excluded from every risk check.
+
+Response `200`:
+```json
+{
+  "configured": true,
+  "chains": [
+    {
+      "chain": "ethereum",
+      "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+      "native_symbol": "ETH",
+      "native_balance": 0.8083523704434918,
+      "native_price_usd": 1931.68,
+      "native_value_usd": 1561.47,
+      "tokens": [
+        {
+          "chain": "ethereum",
+          "asset": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+          "symbol": "USDC",
+          "balance": 52363.119552,
+          "decimals": 6,
+          "price_usd": 1.0008,
+          "value_usd": 52405.01,
+          "priced": true
+        }
+      ],
+      "tokens_skipped": 0,
+      "value_usd": 53966.48,
+      "fetched_at_ms": 1731200000000
+    }
+  ],
+  "value_usd": 53966.48,
+  "fetched_at_ms": 1731200000000
+}
+```
+
+- `configured` is `false` when no keystore is set; every balance is then zero.
+- `price_usd` is `null` and `priced` is `false` when no pool quoted the token.
+  An unpriced token contributes nothing to `value_usd` — it is never guessed at.
+- `tokens_skipped` counts holdings left unpriced on purpose: a busy address can
+  hold thousands of dust tokens, and the read is bounded (300 tokens, 30 per
+  feed request) so the free feed's rate limit survives.
+- Only the first Solana and first EVM account of the keystore are read; each
+  extra account is another full set of RPC calls.
+- EVM tokens come from `OPENETHER_EVM_TOKEN_WATCHLIST` (comma-separated contract
+  addresses). Solana tokens come from the address's own token accounts.
+- `OPENETHER_PRICE_FEED_URL` overrides the feed (default
+  `https://api.dexscreener.com`).
 
 ### `GET /api/live`
 

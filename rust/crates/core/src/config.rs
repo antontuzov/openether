@@ -49,6 +49,13 @@ pub struct WalletConfig {
     pub unlock_timeout_ms: i64,
     /// How many accounts per chain an HD keystore holds.
     pub accounts: u32,
+    /// ERC-20 contracts to value on every configured EVM chain.
+    ///
+    /// ERC-20 balances cannot be enumerated over standard JSON-RPC, so the
+    /// list of contracts has to be configured.
+    pub evm_token_watchlist: Vec<String>,
+    /// The free price feed used to value the wallet's holdings.
+    pub price_feed_url: Option<String>,
 }
 
 impl Default for WalletConfig {
@@ -59,6 +66,8 @@ impl Default for WalletConfig {
             dry_run: true,
             unlock_timeout_ms: 300_000,
             accounts: 5,
+            evm_token_watchlist: Vec::new(),
+            price_feed_url: None,
         }
     }
 }
@@ -155,6 +164,13 @@ impl Config {
                 dry_run: env_flag_or("OPENETHER_WALLET_DRY_RUN", true),
                 unlock_timeout_ms: env_i64("OPENETHER_WALLET_UNLOCK_TIMEOUT_MS", 300_000),
                 accounts: env_u32("OPENETHER_WALLET_ACCOUNTS", 5),
+                evm_token_watchlist: env_list("OPENETHER_EVM_TOKEN_WATCHLIST", &[])
+                    .into_iter()
+                    .collect(),
+                price_feed_url: std::env::var("OPENETHER_PRICE_FEED_URL")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty()),
             },
         }
     }

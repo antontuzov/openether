@@ -21,6 +21,7 @@ import type {
   StrategyReloadResponse,
   TradeRecord,
   VenueHealth,
+  WalletHoldings,
   WsFrame,
 } from './types';
 
@@ -40,6 +41,7 @@ export type {
   TradeRecord,
   Venue,
   VenueHealth,
+  WalletHoldings,
   WsFrame,
   WsFrameDataMap,
   WsFrameType,
@@ -133,6 +135,16 @@ export function getPortfolio(): Promise<PortfolioSnapshot> {
 /** Open positions. */
 export function getPositions(): Promise<Position[]> {
   return request<Position[]>('/api/positions');
+}
+
+/**
+ * The on-chain wallet's holdings, valued from the chain and the DEX feed.
+ *
+ * Read-only: the engine cannot spend these balances, so they are shown next to
+ * the trading account but never added to its equity.
+ */
+export function getWalletHoldings(): Promise<WalletHoldings> {
+  return request<WalletHoldings>('/api/wallet/holdings');
 }
 
 /** Recent fills, newest first. */

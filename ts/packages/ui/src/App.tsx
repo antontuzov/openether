@@ -13,6 +13,7 @@ import { StrategyPanel } from './components/StrategyPanel';
 import { TickerStrip } from './components/TickerStrip';
 import { TradeTicket } from './components/TradeTicket';
 import { TradesTable } from './components/TradesTable';
+import { WalletPanel } from './components/WalletPanel';
 import { useDashboard } from './hooks/useDashboard';
 import { useDemoEngine } from './hooks/useDemoEngine';
 import { useTheme } from './hooks/useTheme';
@@ -203,6 +204,7 @@ export default function App() {
           <main className="dash">
             <div className="dash__col">
               <PortfolioPanel portfolio={dash.portfolio} equitySeries={dash.equitySeries} />
+              <WalletPanel wallet={dash.wallet} />
               <PositionsTable positions={dash.positions} />
               <TradesTable trades={dash.trades} />
             </div>
