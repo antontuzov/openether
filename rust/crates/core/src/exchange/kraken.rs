@@ -1,7 +1,7 @@
 //! Kraken spot connector.
 //!
 //! * REST: `POST /api/0/Private/AddOrder`, `/CancelOrder`, `/OpenOrders`,
-//!   `/Balance` and the public `/api/0/public/Ticker`.
+//!   `/TradesHistory`, `/Balance` and the public `/api/0/public/Ticker`.
 //! * Auth: `API-Sign = base64(HMAC-SHA512(path + SHA256(nonce + postdata),
 //!   base64_decoded_secret))` with the `API-Key` / `API-Sign` headers and a
 //!   `nonce=<n>` body.
@@ -512,6 +512,62 @@ fn value_as_f64(value: &Value) -> Option<f64> {
     }
 }
 
+/// Decode `POST /api/0/Private/TradesHistory` into the fills the venue confirms.
+///
+/// `ordertxid` is the id the engine tracks, and Kraken reports the fee in the
+/// quote currency, so for the pairs this connector trades it is already USD.
+pub fn parse_trades_history(json: &Value) -> Vec<OrderFill> {
+    let Some(trades) = json.get("trades").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in trades.values() {
+        let order_id = entry
+            .get("ordertxid")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let price = entry.get("price").and_then(value_as_f64).unwrap_or(0.0);
+        let qty = entry.get("vol").and_then(value_as_f64).unwrap_or(0.0);
+        if order_id.is_empty()
+            || !price.is_finite()
+            || price <= 0.0
+            || !qty.is_finite()
+            || qty <= 0.0
+        {
+            continue;
+        }
+        let pair = entry
+            .get("pair")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let side = entry
+            .get("type")
+            .and_then(Value::as_str)
+            .and_then(Side::parse)
+            .unwrap_or(Side::Buy);
+        out.push(OrderFill {
+            venue: Venue::Kraken,
+            order_id: order_id.to_string(),
+            symbol: from_kraken_pair(pair),
+            side,
+            qty,
+            price,
+            fee: entry
+                .get("fee")
+                .and_then(value_as_f64)
+                .unwrap_or(0.0)
+                .max(0.0),
+            ts_ms: entry
+                .get("time")
+                .and_then(Value::as_f64)
+                .map(|t| (t * 1000.0) as i64)
+                .unwrap_or_else(now_ms),
+        });
+    }
+    out.sort_by_key(|fill| fill.ts_ms);
+    out
+}
+
 /// Parse a v2 websocket trade message into a tick.
 pub fn parse_trade_message(payload: &str) -> Option<MarketTick> {
     let root: Value = serde_json::from_str(payload).ok()?;
@@ -747,6 +803,32 @@ impl ExchangeConnector for KrakenConnector {
         Ok(out)
     }
 
+    async fn fills_since(&self, since_ms: i64) -> ExchangeResult<Vec<OrderFill>> {
+        let mut params: Vec<(&str, String)> = vec![("trades", "true".to_string())];
+        if since_ms > 0 {
+            // Kraken's window is in whole seconds; the local filter below keeps
+            // the millisecond boundary exact.
+            params.push(("start", (since_ms / 1000).to_string()));
+        }
+        let result = self
+            .private_post("/api/0/Private/TradesHistory", &params)
+            .await?;
+        let fills = parse_trades_history(&result);
+        let count = result.get("count").and_then(Value::as_i64).unwrap_or(0);
+        if count > fills.len() as i64 {
+            tracing::warn!(
+                venue = "kraken",
+                count,
+                returned = fills.len(),
+                "TradesHistory returned a partial page; older fills in this window were not read"
+            );
+        }
+        Ok(fills
+            .into_iter()
+            .filter(|fill| fill.ts_ms >= since_ms)
+            .collect())
+    }
+
     async fn subscribe_trades(&self, symbols: &[String], sink: TickSink) -> ExchangeResult<()> {
         if symbols.is_empty() {
             return Err(ExchangeError::InvalidRequest(
@@ -889,5 +971,71 @@ mod tests {
             .await
             .expect_err("must be blocked");
         assert!(matches!(err, ExchangeError::Config(_)), "{err}");
+    }
+
+    #[test]
+    fn trades_history_is_decoded_into_fills() {
+        let json = json!({
+            "count": 2,
+            "trades": {
+                "T2": {
+                    "ordertxid": "OABC-123",
+                    "pair": "XBTUSD",
+                    "time": 1731200001.0,
+                    "type": "sell",
+                    "ordertype": "limit",
+                    "price": "90000.0",
+                    "cost": "900.0",
+                    "fee": "1.5",
+                    "vol": "0.01"
+                },
+                "T1": {
+                    "ordertxid": "OABC-123",
+                    "pair": "SOLUSD",
+                    "time": 1731200000.5,
+                    "type": "buy",
+                    "ordertype": "limit",
+                    "price": "142.31",
+                    "cost": "71.155",
+                    "fee": "0.0711",
+                    "vol": "0.5"
+                }
+            }
+        });
+        let fills = parse_trades_history(&json);
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].venue, Venue::Kraken);
+        assert_eq!(fills[0].order_id, "OABC-123");
+        assert_eq!(fills[0].symbol, from_kraken_pair("SOLUSD"));
+        assert_eq!(fills[0].side, Side::Buy);
+        assert!((fills[0].qty - 0.5).abs() < 1e-9);
+        assert!((fills[0].price - 142.31).abs() < 1e-9);
+        // Kraken reports the fee in the quote currency, so it is already USD.
+        assert!((fills[0].fee - 0.0711).abs() < 1e-9);
+        assert_eq!(fills[0].ts_ms, 1731200000500);
+        assert_eq!(fills[1].symbol, from_kraken_pair("XBTUSD"));
+        assert_eq!(fills[1].side, Side::Sell);
+        assert!(
+            fills[0].ts_ms <= fills[1].ts_ms,
+            "oldest first, whatever order the map came in"
+        );
+    }
+
+    #[test]
+    fn malformed_trades_history_is_skipped() {
+        let json = json!({
+            "count": 3,
+            "trades": {
+                "T1": {"pair": "SOLUSD", "price": "142.0", "vol": "1.0"},
+                "T2": {"ordertxid": "O1", "pair": "SOLUSD", "price": "142.0", "vol": "0"},
+                "T3": {"ordertxid": "O2", "pair": "SOLUSD", "price": "142.0", "vol": "1.0"}
+            }
+        });
+        let fills = parse_trades_history(&json);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].order_id, "O2");
+        assert_eq!(fills[0].fee, 0.0);
+        assert!(parse_trades_history(&json!({})).is_empty());
+        assert!(parse_trades_history(&json!({"trades": []})).is_empty());
     }
 }

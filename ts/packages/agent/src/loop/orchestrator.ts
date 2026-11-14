@@ -6,6 +6,7 @@ import type {
   RiskState,
   ToolCall,
   ToolSpec,
+  TrackedOrder,
 } from '../types.js';
 import { PLANNING_INSTRUCTIONS, PERSONA } from '../persona.js';
 import { AgentLogger } from '../logger.js';
@@ -37,6 +38,7 @@ export interface CycleSnapshot {
   portfolio: PortfolioSnapshot | null;
   risk: RiskState | null;
   ticks: MarketTick[];
+  orders: TrackedOrder[];
 }
 
 export interface CycleResult {
@@ -67,8 +69,9 @@ export class Orchestrator {
     const portfolio = await this.readPortfolio();
     const risk = await this.readRisk();
     const ticks = await this.readTicks();
+    const orders = await this.readOrders();
 
-    this.options.onContext?.({ portfolio, risk, ticks });
+    this.options.onContext?.({ portfolio, risk, ticks, orders });
 
     if (risk) {
       metrics.breakerState.set(
@@ -87,6 +90,9 @@ export class Orchestrator {
       portfolio,
       risk,
       recent_ticks: ticks.slice(-30),
+      // Resting orders are exposure that has not been booked yet. Without them
+      // the model would re-submit a trade it already has working.
+      working_orders: orders.filter(isWorking).map(summarizeOrder),
       relevant_memories: memories.map((record) => ({
         ts: record.ts,
         kind: record.kind,
@@ -107,6 +113,7 @@ export class Orchestrator {
     let tradeAttempted = false;
     let tradeApproved = false;
     let tradeReason = '';
+    let tradeOrderId: string | null = null;
     let plan = '';
 
     for (let step = 0; step < this.options.maxSteps; step += 1) {
@@ -147,6 +154,7 @@ export class Orchestrator {
           tradeAttempted = true;
           tradeApproved = outcome.approved;
           tradeReason = outcome.reason;
+          tradeOrderId = readOrderId(outcome.value);
         }
 
         messages.push({
@@ -159,7 +167,7 @@ export class Orchestrator {
     }
 
     if (tradeAttempted) {
-      await this.verify(tradeApproved, tradeReason);
+      await this.verify(tradeApproved, tradeReason, tradeOrderId);
     }
 
     await memory.append({
@@ -249,20 +257,39 @@ export class Orchestrator {
   }
 
   private executorFor(name: string): ToolExecutor | null {
-    const coreNames = new Set(['execute_trade', 'get_portfolio', 'get_positions', 'get_market_data', 'get_risk_state', 'get_trade_history', 'fetch_onchain_data', 'set_strategy', 'get_agent_logs']);
+    const coreNames = new Set(['execute_trade', 'get_portfolio', 'get_orders', 'cancel_order', 'get_positions', 'get_market_data', 'get_risk_state', 'get_trade_history', 'fetch_onchain_data', 'set_strategy', 'get_agent_logs']);
     if (coreNames.has(name)) {
       return this.options.coreTools;
     }
     return this.options.dataTools ?? null;
   }
 
-  private async verify(approved: boolean, reason: string): Promise<void> {
+  /**
+   * Report what actually happened, not what was asked for.
+   *
+   * An accepted order is not a fill: it may still be resting, or partly filled.
+   * The venue's fills are the only evidence of money moving, so the log carries
+   * them next to the latest trade and whatever is still working.
+   */
+  private async verify(approved: boolean, reason: string, orderId: string | null): Promise<void> {
     const { logger, metrics } = this.options;
     const trades = await this.readTrades();
     const latest = trades[0];
+    const orders = await this.readOrders();
+    const submitted = orderId ? orders.find((order) => order.order_id === orderId) ?? null : null;
     await logger.info('verified the outcome of the trade', {
       approved,
       reason,
+      order: submitted
+        ? {
+            ...summarizeOrder(submitted),
+            fills: submitted.fills.map((fill) => ({
+              qty: fill.qty,
+              price: fill.price,
+              fee: fill.fee,
+            })),
+          }
+        : null,
       latest_trade: latest
         ? {
             symbol: latest.symbol,
@@ -272,6 +299,7 @@ export class Orchestrator {
             fee: latest.fee,
           }
         : null,
+      still_working: orders.filter(isWorking).map(summarizeOrder),
     });
     metrics.trades.inc({ result: approved ? 'approved' : 'rejected' });
   }
@@ -301,6 +329,12 @@ export class Orchestrator {
     const raw = await this.safeCall('get_trade_history', { limit: 5 });
     const parsed = safeParse(raw);
     return Array.isArray(parsed) ? parsed : [];
+  }
+
+  private async readOrders(): Promise<TrackedOrder[]> {
+    const raw = await this.safeCall('get_orders');
+    const parsed = safeParse(raw);
+    return Array.isArray(parsed) ? (parsed as TrackedOrder[]) : [];
   }
 
   private async safeCall(name: string, args: Record<string, unknown> = {}): Promise<string> {
@@ -341,4 +375,30 @@ function readReason(value: unknown): string | undefined {
     return value['reason'];
   }
   return undefined;
+}
+
+function readOrderId(value: unknown): string | null {
+  if (isObject(value) && typeof value['order_id'] === 'string') {
+    return value['order_id'];
+  }
+  return null;
+}
+
+/** Still resting at the venue, so it can fill without the agent asking again. */
+function isWorking(order: TrackedOrder): boolean {
+  return order.status === 'accepted' || order.status === 'partially_filled';
+}
+
+function summarizeOrder(order: TrackedOrder) {
+  const filled = order.fills.reduce((total, fill) => total + fill.qty, 0);
+  return {
+    order_id: order.order_id,
+    symbol: order.symbol,
+    side: order.side,
+    order_type: order.order_type,
+    limit_price: order.limit_price,
+    qty: order.qty,
+    filled_qty: filled,
+    status: order.status,
+  };
 }

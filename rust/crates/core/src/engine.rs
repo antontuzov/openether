@@ -17,8 +17,18 @@ use std::time::Duration;
 const MAX_TICKS: usize = 2_000;
 const MAX_TRADES: usize = 1_000;
 const MAX_LOGS: usize = 2_000;
+const MAX_ORDERS: usize = 500;
 /// How often the on-chain wallet is revalued.
 const WALLET_REFRESH_SECS: u64 = 30;
+/// How often submitted orders are reconciled against the venue.
+const ORDER_RECONCILE_SECS: u64 = 2;
+/// Reconciliation re-reads a window that overlaps the last pass, so a fill
+/// reported late is still seen. Dedupe makes the overlap harmless.
+const FILL_WINDOW_OVERLAP_MS: i64 = 60_000;
+/// How long an order may be absent from the venue's open list before it is
+/// retired. Trade history lags the open list, so retiring on the first absence
+/// would label a real fill as a cancellation.
+const ORDER_RETIRE_GRACE_MS: i64 = 30_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SubmitOutcome {
@@ -48,6 +58,11 @@ struct DataStore {
     equity_usd: f64,
     cash_usd: f64,
     open_orders: Vec<OpenOrder>,
+    /// Orders the engine submitted, with the fills the venue has confirmed.
+    orders: VecDeque<TrackedOrder>,
+    /// How far the fill history has been read. Persisted so a restart does not
+    /// re-book fills the previous run already journaled.
+    fill_cursor_ms: i64,
     /// The last reading of the on-chain wallet.
     wallet_holdings: Option<WalletHoldings>,
 }
@@ -77,11 +92,25 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> anyhow::Result<Arc<Self>> {
+        let connector = build_connector(&config)?;
+        Self::build(config, connector)
+    }
+
+    /// Build an engine around a venue the caller supplies. Tests use this to
+    /// drive reconciliation through the answers a real exchange gives.
+    #[cfg(test)]
+    pub fn with_connector(
+        config: Config,
+        connector: Arc<dyn ExchangeConnector>,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::build(config, connector)
+    }
+
+    fn build(config: Config, connector: Arc<dyn ExchangeConnector>) -> anyhow::Result<Arc<Self>> {
         let metrics = Arc::new(Metrics::new());
         let bus = Arc::new(EventBus::new(4_096, Arc::clone(&metrics)));
         let risk = Arc::new(RiskEngine::new(config.risk.clone(), Arc::clone(&metrics)));
 
-        let connector = build_connector(&config)?;
         let onchain = Arc::new(
             OnchainClient::new(config.solana_rpc_url.clone(), config.evm_rpc_urls.clone())
                 .map_err(|e| anyhow::anyhow!("on-chain client: {e}"))?,
@@ -241,10 +270,25 @@ impl AppState {
             }
         }
 
+        // The fill ladder comes back with the order, so a restart reconciles
+        // against the venue without re-booking what the last run already
+        // journaled.
+        let tracked = store.load_tracked_orders().unwrap_or_default();
+        let order_count = tracked.len();
+        let cursor = store.load_fill_cursor().unwrap_or(0);
+        {
+            let mut data = self.lock_data();
+            for order in tracked {
+                data.orders.push_back(order);
+            }
+            data.fill_cursor_ms = cursor;
+        }
+
         if restored_positions || portfolio.is_some() {
             tracing::info!(
                 positions = positions.len(),
                 trades = trade_count,
+                orders = order_count,
                 "restored the persisted account"
             );
         }
@@ -262,7 +306,7 @@ impl AppState {
         };
 
         let account = self.connector.account_state();
-        let (portfolio, positions, orders) = {
+        let (portfolio, positions, orders, tracked, cursor) = {
             let data = self.lock_data();
             let portfolio = PortfolioRow {
                 equity_usd: data.equity_usd,
@@ -295,7 +339,9 @@ impl AppState {
                     .collect(),
             };
             let orders = data.open_orders.clone();
-            (portfolio, positions, orders)
+            let tracked: Vec<TrackedOrder> = data.orders.iter().cloned().collect();
+            let cursor = data.fill_cursor_ms;
+            (portfolio, positions, orders, tracked, cursor)
         };
 
         if let Err(e) = store.save_portfolio(portfolio) {
@@ -306,6 +352,12 @@ impl AppState {
         }
         if let Err(e) = store.save_open_orders(&orders) {
             tracing::warn!(error = %e, "could not persist the open orders");
+        }
+        if let Err(e) = store.save_tracked_orders(&tracked) {
+            tracing::warn!(error = %e, "could not persist the tracked orders");
+        }
+        if let Err(e) = store.save_fill_cursor(cursor) {
+            tracing::warn!(error = %e, "could not persist the fill cursor");
         }
         if let Err(e) = store.save_risk_state(&self.risk.export()) {
             tracing::warn!(error = %e, "could not persist the risk state");
@@ -609,48 +661,51 @@ impl AppState {
             }
         }
 
+        let mut order = TrackedOrder {
+            venue: req.venue,
+            order_id: ack.order_id.clone(),
+            client_id: req.client_id.clone(),
+            symbol: symbol.clone(),
+            side: req.side,
+            order_type: req.order_type,
+            limit_price: req.limit_price,
+            qty: req.qty,
+            status: ack.status,
+            rationale: req.rationale.clone(),
+            submitted_ts_ms: ack.accepted_ts_ms,
+            updated_ts_ms: now_ms(),
+            fills: Vec::new(),
+            missing_since_ms: None,
+        };
+
+        // Only the venue's own fills are booked, and only this order's. A
+        // resting limit order has filled nothing, so it must not become a
+        // position: the risk layer would then measure exposure that does not
+        // exist, and the journal would record a trade that never happened.
         let fills = self
             .connector
             .fills_since(before - 1)
             .await
             .unwrap_or_default();
-        let mut fill_price = None;
-        let mut fee = None;
         for fill in fills {
-            if fill.symbol != symbol {
+            if fill.order_id != ack.order_id {
                 continue;
             }
-            self.apply_fill(&fill, &req);
-            fill_price = Some(fill.price);
-            fee = Some(fill.fee);
-            self.metrics.counter_add(
-                "openether_orders_filled_total",
-                &[("venue", fill.venue.as_str())],
-                1.0,
-            );
+            self.book_fill(&mut order, &fill);
         }
-        if fill_price.is_none() {
-            // The venue did not report a fill (limit order resting, or a venue
-            // without fill reporting). Record the intent so the UI still shows it.
-            let synthetic = OrderFill {
-                venue: req.venue,
-                order_id: ack.order_id.clone(),
-                symbol: symbol.clone(),
-                side: req.side,
-                qty: req.qty,
-                price,
-                fee: 0.0,
-                ts_ms: now_ms(),
-            };
-            self.apply_fill(&synthetic, &req);
-            fill_price = Some(price);
-        }
+
+        let has_fill = !order.fills.is_empty();
+        let fill_price = has_fill.then(|| order.avg_fill_price());
+        let fee = has_fill.then(|| order.fee());
+        let status = order.status;
+        self.remember_order(order);
 
         self.log(
             source,
             "info",
             &format!(
-                "order filled: {} {} {} @ {}",
+                "order {}: {} {} {} @ {}",
+                status.as_str(),
                 req.side,
                 req.qty,
                 symbol,
@@ -660,6 +715,7 @@ impl AppState {
                 "symbol": symbol,
                 "side": req.side,
                 "qty": req.qty,
+                "status": status,
                 "price": fill_price,
                 "rationale": req.rationale,
                 "order_id": ack.order_id,
@@ -671,14 +727,115 @@ impl AppState {
             reason: verdict.reason.clone(),
             detail: verdict.detail.clone(),
             order_id: Some(ack.order_id),
-            status: Some(ack.status),
+            status: Some(status),
             fill_price,
             fee,
             risk: verdict,
         }
     }
 
-    fn apply_fill(&self, fill: &OrderFill, req: &OrderRequest) {
+    /// Book one venue-confirmed fill against an order and the account.
+    ///
+    /// Idempotent: reconciliation re-reads an overlapping window, so the same
+    /// fill arrives more than once and must only ever be booked once.
+    fn book_fill(&self, order: &mut TrackedOrder, fill: &OrderFill) {
+        if order.knows_fill(fill) {
+            return;
+        }
+        order.fills.push(fill.clone());
+        order.updated_ts_ms = now_ms();
+        order.status = if order.remaining_qty() <= 1e-9 {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::PartiallyFilled
+        };
+        self.apply_fill(fill, &order.rationale);
+        self.metrics.counter_add(
+            "openether_orders_filled_total",
+            &[("venue", fill.venue.as_str())],
+            1.0,
+        );
+    }
+
+    /// Keep a submitted order, bounded, and write it to disk.
+    fn remember_order(&self, order: TrackedOrder) {
+        {
+            let mut data = self.lock_data();
+            if let Some(existing) = data
+                .orders
+                .iter_mut()
+                .find(|known| known.order_id == order.order_id)
+            {
+                *existing = order;
+            } else {
+                if data.orders.len() >= MAX_ORDERS {
+                    data.orders.pop_front();
+                }
+                data.orders.push_back(order);
+            }
+        }
+        self.persist();
+    }
+
+    /// The orders the engine has submitted, newest first.
+    pub fn orders(&self) -> Vec<TrackedOrder> {
+        self.lock_data().orders.iter().rev().cloned().collect()
+    }
+
+    /// Cancel a resting order at the venue.
+    ///
+    /// Cancelling only ever reduces exposure, so it does not go through the
+    /// risk layer. The venue has to confirm: an order it will not cancel stays
+    /// active and keeps being reconciled. A fill that landed just before the
+    /// cancel is still booked, because reconciliation books whatever the venue
+    /// reports regardless of the label the engine last gave the order.
+    pub async fn cancel_order(&self, order_id: &str) -> Result<(), String> {
+        let known = self
+            .lock_data()
+            .orders
+            .iter()
+            .find(|order| order.order_id == order_id)
+            .cloned();
+        let Some(order) = known else {
+            return Err(format!("unknown order {order_id}"));
+        };
+        if !order.is_active() {
+            return Err(format!(
+                "order {order_id} is {}: only a resting order can be cancelled",
+                order.status.as_str()
+            ));
+        }
+        self.connector
+            .cancel_order(order_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        {
+            let mut data = self.lock_data();
+            if let Some(slot) = data
+                .orders
+                .iter_mut()
+                .find(|known| known.order_id == order_id)
+            {
+                slot.status = OrderStatus::Cancelled;
+                slot.updated_ts_ms = now_ms();
+            }
+            data.open_orders.retain(|open| open.order_id != order_id);
+        }
+        self.log(
+            "engine",
+            "info",
+            &format!("order {order_id} cancelled at the venue"),
+            serde_json::json!({
+                "order_id": order_id,
+                "filled_qty": order.filled_qty(),
+            }),
+        );
+        self.persist();
+        Ok(())
+    }
+
+    fn apply_fill(&self, fill: &OrderFill, rationale: &str) {
         let signed_qty = fill.side.sign() * fill.qty;
         let mut data = self.lock_data();
         let symbol = fill.symbol.clone();
@@ -720,8 +877,8 @@ impl AppState {
             fee: fill.fee,
             realized_pnl: realized,
             ts_ms: fill.ts_ms,
-            rationale: req.rationale.clone(),
-            source: if req.rationale.is_empty() {
+            rationale: rationale.to_string(),
+            source: if rationale.is_empty() {
                 "engine".into()
             } else {
                 "agent".into()
@@ -790,9 +947,137 @@ impl AppState {
         }
     }
 
-    pub async fn refresh_open_orders(&self) {
-        if let Ok(orders) = self.connector.open_orders().await {
-            self.lock_data().open_orders = orders;
+    /// Join the venue's two truths: the fills it reports and the orders it
+    /// still holds open.
+    ///
+    /// A fill books part of an order. An order that has left the open list
+    /// without filling the rest is gone — cancelled, expired or rejected — and
+    /// leaving it "accepted" forever would have the engine wait on a trade that
+    /// can no longer happen.
+    pub async fn reconcile_orders(&self) {
+        // Keep reading fills for as long as one could still land: an order that
+        // was just cancelled or retired can still have a fill the venue has not
+        // reported yet, and missing it would under-report a real position.
+        let watching = {
+            let data = self.lock_data();
+            let now = now_ms();
+            data.orders.iter().any(|order| {
+                order.is_active() || now - order.updated_ts_ms < FILL_WINDOW_OVERLAP_MS
+            })
+        };
+        let since = {
+            let data = self.lock_data();
+            (data.fill_cursor_ms - FILL_WINDOW_OVERLAP_MS).max(0)
+        };
+
+        // A venue that cannot list its open orders must not retire anything:
+        // "no answer" is not "no orders".
+        let open = self.connector.open_orders().await.ok();
+        let fills = if watching {
+            self.connector.fills_since(since).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // A fill the venue confirms is booked even when the order was already
+        // labelled retired. The label is the engine's inference; the fill is
+        // the venue's fact, and dropping a real fill would under-report the
+        // exposure the risk layer measures.
+        let pending: Vec<OrderFill> = {
+            let data = self.lock_data();
+            fills
+                .iter()
+                .filter(|fill| {
+                    data.orders
+                        .iter()
+                        .find(|order| order.order_id == fill.order_id)
+                        .is_some_and(|order| !order.knows_fill(fill))
+                })
+                .cloned()
+                .collect()
+        };
+
+        let mut booked = false;
+        for fill in pending {
+            let Some(mut order) = self
+                .lock_data()
+                .orders
+                .iter()
+                .find(|order| order.order_id == fill.order_id)
+                .cloned()
+            else {
+                continue;
+            };
+            self.book_fill(&mut order, &fill);
+            let mut data = self.lock_data();
+            if let Some(slot) = data
+                .orders
+                .iter_mut()
+                .find(|known| known.order_id == order.order_id)
+            {
+                *slot = order;
+            }
+            booked = true;
+        }
+
+        let retired: Vec<(String, OrderStatus, f64)> = match open.as_ref() {
+            None => Vec::new(),
+            Some(open) => {
+                let mut data = self.lock_data();
+                let mut out = Vec::new();
+                let now = now_ms();
+                for order in data.orders.iter_mut() {
+                    if !order.is_active() {
+                        continue;
+                    }
+                    if open.iter().any(|o| o.order_id == order.order_id) {
+                        order.missing_since_ms = None;
+                        continue;
+                    }
+                    let missing_since = *order.missing_since_ms.get_or_insert(now);
+                    if now - missing_since < ORDER_RETIRE_GRACE_MS {
+                        continue;
+                    }
+                    // An active order is by definition not fully filled, so an
+                    // order the venue stopped resting was cancelled.
+                    order.status = OrderStatus::Cancelled;
+                    order.updated_ts_ms = now;
+                    out.push((order.order_id.clone(), order.status, order.filled_qty()));
+                }
+                out
+            }
+        };
+
+        {
+            let mut data = self.lock_data();
+            for fill in &fills {
+                data.fill_cursor_ms = data.fill_cursor_ms.max(fill.ts_ms);
+            }
+            if let Some(open) = open {
+                data.open_orders = open;
+            }
+        }
+
+        for (order_id, status, filled_qty) in &retired {
+            self.log(
+                "engine",
+                "info",
+                &format!(
+                    "order {order_id} {}: {filled_qty} filled, the rest is no longer resting",
+                    status.as_str()
+                ),
+                serde_json::json!({
+                    "order_id": order_id,
+                    "status": status,
+                    "filled_qty": filled_qty,
+                }),
+            );
+        }
+
+        if booked || !retired.is_empty() {
+            self.persist();
+            let portfolio = self.portfolio();
+            self.bus.publish(Event::Portfolio(portfolio));
         }
     }
 
@@ -940,12 +1225,12 @@ pub async fn run_background_tasks(state: Arc<AppState>) {
 
     let account_state = Arc::clone(&state);
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        let mut ticker = tokio::time::interval(Duration::from_secs(ORDER_RECONCILE_SECS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             account_state.refresh_account().await;
-            account_state.refresh_open_orders().await;
+            account_state.reconcile_orders().await;
         }
     });
 
@@ -979,6 +1264,7 @@ pub fn error_reason(error: &ExchangeError) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::exchange::ExchangeResult;
     use crate::risk::BreakerState;
     use std::path::{Path, PathBuf};
 
@@ -1208,6 +1494,414 @@ mod tests {
         assert!(
             !outcome.approved,
             "the position cap must still apply to a restored position"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A venue whose answers the test controls.
+    ///
+    /// Reconciliation has to survive what a real exchange does: an order that
+    /// rests, a fill that arrives in pieces, a fill reported only after the
+    /// order left the open list, and an open-orders call that fails.
+    struct ScriptedVenue {
+        open: std::sync::Mutex<Vec<OpenOrder>>,
+        fills: std::sync::Mutex<Vec<OrderFill>>,
+        open_orders_fail: std::sync::atomic::AtomicBool,
+        next_id: std::sync::atomic::AtomicU64,
+    }
+
+    impl ScriptedVenue {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                open: std::sync::Mutex::new(Vec::new()),
+                fills: std::sync::Mutex::new(Vec::new()),
+                open_orders_fail: std::sync::atomic::AtomicBool::new(false),
+                next_id: std::sync::atomic::AtomicU64::new(1),
+            })
+        }
+
+        fn report_fill(&self, order_id: &str, qty: f64, price: f64, ts_ms: i64) {
+            self.fills.lock().unwrap().push(OrderFill {
+                venue: Venue::Paper,
+                order_id: order_id.to_string(),
+                symbol: "SOL/USDT".to_string(),
+                side: Side::Buy,
+                qty,
+                price,
+                fee: 0.0,
+                ts_ms,
+            });
+        }
+
+        fn stop_resting(&self) {
+            self.open.lock().unwrap().clear();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExchangeConnector for ScriptedVenue {
+        fn venue(&self) -> Venue {
+            Venue::Paper
+        }
+
+        async fn health(&self) -> ExchangeResult<()> {
+            Ok(())
+        }
+
+        async fn account(&self) -> ExchangeResult<AccountSnapshot> {
+            Ok(AccountSnapshot {
+                venue: Venue::Paper,
+                equity_usd: 10_000.0,
+                free_usd: 10_000.0,
+                balances: Vec::new(),
+                ts_ms: now_ms(),
+            })
+        }
+
+        async fn place_order(&self, req: &OrderRequest) -> ExchangeResult<OrderAck> {
+            let id = format!(
+                "scripted-{}",
+                self.next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            );
+            self.open.lock().unwrap().push(OpenOrder {
+                venue: Venue::Paper,
+                order_id: id.clone(),
+                symbol: req.symbol.clone(),
+                side: req.side,
+                qty: req.qty,
+                price: req.limit_price.unwrap_or(100.0),
+                ts_ms: now_ms(),
+            });
+            Ok(OrderAck {
+                venue: Venue::Paper,
+                order_id: id,
+                client_id: req.client_id.clone(),
+                status: OrderStatus::Accepted,
+                accepted_ts_ms: now_ms(),
+                message: "resting".into(),
+            })
+        }
+
+        async fn cancel_order(&self, order_id: &str) -> ExchangeResult<()> {
+            self.open
+                .lock()
+                .unwrap()
+                .retain(|order| order.order_id != order_id);
+            Ok(())
+        }
+
+        async fn open_orders(&self) -> ExchangeResult<Vec<OpenOrder>> {
+            if self
+                .open_orders_fail
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(ExchangeError::Network("the venue did not answer".into()));
+            }
+            Ok(self.open.lock().unwrap().clone())
+        }
+
+        async fn fills_since(&self, since_ms: i64) -> ExchangeResult<Vec<OrderFill>> {
+            Ok(self
+                .fills
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|fill| fill.ts_ms >= since_ms)
+                .cloned()
+                .collect())
+        }
+
+        async fn subscribe_trades(
+            &self,
+            _symbols: &[String],
+            _sink: TickSink,
+        ) -> ExchangeResult<()> {
+            Ok(())
+        }
+
+        async fn last_price(&self, _symbol: &str) -> ExchangeResult<f64> {
+            Ok(100.0)
+        }
+    }
+
+    fn limit_order(qty: f64, price: f64) -> OrderRequest {
+        let mut req = OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, qty);
+        req.order_type = OrderType::Limit;
+        req.limit_price = Some(price);
+        req
+    }
+
+    /// The bug this whole task exists to fix: the engine used to invent a full
+    /// fill whenever the venue reported none, so a resting limit order became a
+    /// position that did not exist and a trade that never happened.
+    #[tokio::test]
+    async fn a_resting_order_books_nothing() {
+        let (dir, db) = temp_db();
+        let venue = ScriptedVenue::new();
+        let state = AppState::with_connector(config_with_db(&db), venue.clone()).unwrap();
+        let outcome = state.submit_order(limit_order(2.0, 100.0), "test").await;
+        assert!(outcome.approved, "{outcome:?}");
+
+        state.reconcile_orders().await;
+
+        let orders = state.orders();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].status, OrderStatus::Accepted);
+        assert!(orders[0].fills.is_empty());
+        assert_eq!(orders[0].filled_qty(), 0.0);
+        assert!(
+            state.portfolio().positions.is_empty(),
+            "a resting order is not a position"
+        );
+        assert!(
+            state.trades(10).is_empty(),
+            "a resting order is not a trade"
+        );
+        assert_eq!(state.equity(), 10_000.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same fix on the venue people actually run: a resting limit order in
+    /// the simulator books nothing until the price crosses it.
+    #[tokio::test]
+    async fn a_paper_limit_order_books_only_when_the_price_crosses() {
+        let (dir, db) = temp_db();
+        let paper = Arc::new(crate::exchange::paper::PaperConnector::new());
+        paper.set_price("SOL/USDT", 142.0);
+        let state = AppState::with_connector(config_with_db(&db), paper.clone()).unwrap();
+
+        let outcome = state.submit_order(limit_order(2.0, 130.0), "test").await;
+        assert!(outcome.approved, "{outcome:?}");
+        assert_eq!(outcome.status, Some(OrderStatus::Accepted));
+        assert_eq!(outcome.fill_price, None, "nothing has filled yet");
+        state.reconcile_orders().await;
+        assert!(state.trades(10).is_empty());
+        assert!(state.portfolio().positions.is_empty());
+
+        paper.set_price("SOL/USDT", 129.0);
+        state.reconcile_orders().await;
+
+        let orders = state.orders();
+        assert_eq!(orders[0].status, OrderStatus::Filled);
+        assert!((orders[0].filled_qty() - 2.0).abs() < 1e-9);
+        assert!(
+            (orders[0].avg_fill_price() - 130.0).abs() < 1e-9,
+            "a crossed limit fills at its limit price"
+        );
+        assert_eq!(state.trades(10).len(), 1);
+        assert!((state.portfolio().positions[0].qty - 2.0).abs() < 1e-9);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_partial_fill_books_only_the_filled_part() {
+        let (dir, db) = temp_db();
+        let venue = ScriptedVenue::new();
+        let state = AppState::with_connector(config_with_db(&db), venue.clone()).unwrap();
+        let order_id = state
+            .submit_order(limit_order(2.0, 100.0), "test")
+            .await
+            .order_id
+            .unwrap();
+
+        venue.report_fill(&order_id, 1.0, 100.0, now_ms());
+        state.reconcile_orders().await;
+
+        let orders = state.orders();
+        assert_eq!(orders[0].status, OrderStatus::PartiallyFilled);
+        assert!((orders[0].filled_qty() - 1.0).abs() < 1e-9);
+        assert!((orders[0].remaining_qty() - 1.0).abs() < 1e-9);
+        let positions = state.portfolio().positions;
+        assert_eq!(positions.len(), 1);
+        assert!(
+            (positions[0].qty - 1.0).abs() < 1e-9,
+            "only the filled half is a position"
+        );
+        assert_eq!(state.trades(10).len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn reconciling_the_same_window_again_does_not_double_book() {
+        let (dir, db) = temp_db();
+        let venue = ScriptedVenue::new();
+        let state = AppState::with_connector(config_with_db(&db), venue.clone()).unwrap();
+        let order_id = state
+            .submit_order(limit_order(2.0, 100.0), "test")
+            .await
+            .order_id
+            .unwrap();
+        venue.report_fill(&order_id, 1.0, 100.0, now_ms());
+
+        for _ in 0..4 {
+            state.reconcile_orders().await;
+        }
+
+        assert_eq!(state.trades(10).len(), 1, "the fill is booked once");
+        assert!((state.orders()[0].filled_qty() - 1.0).abs() < 1e-9);
+        assert!((state.portfolio().positions[0].qty - 1.0).abs() < 1e-9);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_remaining_half_fills_at_its_own_price() {
+        let (dir, db) = temp_db();
+        let venue = ScriptedVenue::new();
+        let state = AppState::with_connector(config_with_db(&db), venue.clone()).unwrap();
+        let order_id = state
+            .submit_order(limit_order(2.0, 100.0), "test")
+            .await
+            .order_id
+            .unwrap();
+        let ts = now_ms();
+        venue.report_fill(&order_id, 1.0, 100.0, ts);
+        state.reconcile_orders().await;
+        venue.report_fill(&order_id, 1.0, 102.0, ts + 1);
+        state.reconcile_orders().await;
+
+        let orders = state.orders();
+        assert_eq!(orders[0].status, OrderStatus::Filled);
+        assert!((orders[0].filled_qty() - 2.0).abs() < 1e-9);
+        assert_eq!(orders[0].remaining_qty(), 0.0);
+        assert!(
+            (orders[0].avg_fill_price() - 101.0).abs() < 1e-9,
+            "the average is weighted by quantity, not the last price"
+        );
+        assert_eq!(state.trades(10).len(), 2);
+        assert!((state.portfolio().positions[0].qty - 2.0).abs() < 1e-9);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Trade history lags the open list, so an order that vanishes from the
+    /// open list has not necessarily been cancelled.
+    #[tokio::test]
+    async fn an_order_is_not_retired_the_moment_it_leaves_the_open_list() {
+        let (dir, db) = temp_db();
+        let venue = ScriptedVenue::new();
+        let state = AppState::with_connector(config_with_db(&db), venue.clone()).unwrap();
+        state.submit_order(limit_order(2.0, 100.0), "test").await;
+
+        venue.stop_resting();
+        state.reconcile_orders().await;
+        assert!(
+            state.orders()[0].is_active(),
+            "the fill may still be on its way"
+        );
+        assert!(state.orders()[0].missing_since_ms.is_some());
+
+        state.lock_data().orders[0].missing_since_ms = Some(now_ms() - ORDER_RETIRE_GRACE_MS - 1);
+        state.reconcile_orders().await;
+        assert_eq!(state.orders()[0].status, OrderStatus::Cancelled);
+        assert!(state.trades(10).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The dangerous direction is under-reporting a position: the risk layer
+    /// would then measure limits against exposure that is really there.
+    #[tokio::test]
+    async fn a_fill_reported_after_retirement_is_still_booked() {
+        let (dir, db) = temp_db();
+        let venue = ScriptedVenue::new();
+        let state = AppState::with_connector(config_with_db(&db), venue.clone()).unwrap();
+        let order_id = state
+            .submit_order(limit_order(2.0, 100.0), "test")
+            .await
+            .order_id
+            .unwrap();
+        venue.stop_resting();
+        state.reconcile_orders().await;
+        state.lock_data().orders[0].missing_since_ms = Some(now_ms() - ORDER_RETIRE_GRACE_MS - 1);
+        state.reconcile_orders().await;
+        assert_eq!(state.orders()[0].status, OrderStatus::Cancelled);
+
+        venue.report_fill(&order_id, 2.0, 100.0, now_ms());
+        state.reconcile_orders().await;
+
+        assert_eq!(state.trades(10).len(), 1, "the venue's fill wins");
+        assert_eq!(state.orders()[0].status, OrderStatus::Filled);
+        assert!((state.portfolio().positions[0].qty - 2.0).abs() < 1e-9);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_venue_that_cannot_list_open_orders_retires_nothing() {
+        let (dir, db) = temp_db();
+        let venue = ScriptedVenue::new();
+        let state = AppState::with_connector(config_with_db(&db), venue.clone()).unwrap();
+        state.submit_order(limit_order(2.0, 100.0), "test").await;
+        state.lock_data().orders[0].missing_since_ms = Some(now_ms() - ORDER_RETIRE_GRACE_MS - 1);
+        venue.stop_resting();
+        venue
+            .open_orders_fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        state.reconcile_orders().await;
+
+        assert!(state.orders()[0].is_active(), "no answer is not no orders");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn cancelling_still_books_the_fill_that_landed_first() {
+        let (dir, db) = temp_db();
+        let venue = ScriptedVenue::new();
+        let state = AppState::with_connector(config_with_db(&db), venue.clone()).unwrap();
+        let order_id = state
+            .submit_order(limit_order(2.0, 100.0), "test")
+            .await
+            .order_id
+            .unwrap();
+        // Filled at the venue just before the cancel, reported just after it.
+        venue.report_fill(&order_id, 1.0, 100.0, now_ms());
+
+        state.cancel_order(&order_id).await.unwrap();
+        assert_eq!(state.orders()[0].status, OrderStatus::Cancelled);
+        assert!(state.cancel_order("no-such-order").await.is_err());
+        assert!(
+            state.cancel_order(&order_id).await.is_err(),
+            "a retired order cannot be cancelled again"
+        );
+
+        state.reconcile_orders().await;
+        assert_eq!(state.trades(10).len(), 1);
+        assert!((state.portfolio().positions[0].qty - 1.0).abs() < 1e-9);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tracked_orders_and_the_fill_cursor_survive_a_restart() {
+        let (dir, db) = temp_db();
+        let venue = ScriptedVenue::new();
+        let ts = now_ms();
+        let order_id;
+        {
+            let state = AppState::with_connector(config_with_db(&db), venue.clone()).unwrap();
+            order_id = state
+                .submit_order(limit_order(2.0, 100.0), "test")
+                .await
+                .order_id
+                .unwrap();
+            venue.report_fill(&order_id, 1.0, 100.0, ts);
+            state.reconcile_orders().await;
+        }
+
+        let state = AppState::with_connector(config_with_db(&db), venue.clone()).unwrap();
+        let orders = state.orders();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_id, order_id);
+        assert_eq!(orders[0].status, OrderStatus::PartiallyFilled);
+        assert!(
+            (orders[0].filled_qty() - 1.0).abs() < 1e-9,
+            "the fill ladder comes back with the order"
+        );
+        assert_eq!(state.lock_data().fill_cursor_ms, ts);
+
+        state.reconcile_orders().await;
+        assert_eq!(
+            state.trades(10).len(),
+            1,
+            "a restart must not re-book what the last run journaled"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

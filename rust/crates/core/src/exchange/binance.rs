@@ -1,7 +1,8 @@
 //! Binance spot connector.
 //!
 //! * REST: `GET /api/v3/account`, `POST /api/v3/order`, `DELETE /api/v3/order`,
-//!   `GET /api/v3/openOrders`, `GET /api/v3/ticker/price`, `GET /api/v3/ping`.
+//!   `GET /api/v3/openOrders`, `GET /api/v3/myTrades`, `GET /api/v3/ticker/price`,
+//!   `GET /api/v3/ping`.
 //! * Signing: HMAC-SHA256 over the query string, hex encoded, sent in the
 //!   `X-MBX-APIKEY` header together with the signed query string.
 //! * WebSocket: combined `aggTrade` streams, reconnected with exponential
@@ -26,7 +27,7 @@ use hmac::{Hmac, Mac};
 use reqwest::Method;
 use serde_json::Value;
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
@@ -80,6 +81,10 @@ pub struct BinanceConnector {
     /// Binance needs the symbol to cancel an order, but the trait only hands
     /// over the order id: remember the mapping for every order we placed.
     order_symbols: Arc<Mutex<HashMap<String, String>>>,
+    /// `myTrades` is per-symbol, so reporting fills means knowing which symbols
+    /// to ask about. Seeded from the stream subscription and from every order
+    /// placed or seen, which is what lets a restart still find its fills.
+    trade_symbols: Arc<Mutex<HashSet<String>>>,
 }
 
 impl std::fmt::Debug for BinanceConnector {
@@ -131,6 +136,7 @@ impl BinanceConnector {
             cfg,
             live_enabled,
             order_symbols: Arc::new(Mutex::new(HashMap::new())),
+            trade_symbols: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -175,6 +181,30 @@ impl BinanceConnector {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         map.insert(order_id.to_string(), symbol.to_string());
+        drop(map);
+        self.watch_symbol(symbol);
+    }
+
+    fn watch_symbol(&self, symbol: &str) {
+        if symbol.is_empty() {
+            return;
+        }
+        let mut set = self
+            .trade_symbols
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        set.insert(symbol.to_string());
+    }
+
+    /// Sorted so a reconcile pass asks about symbols in a stable order.
+    fn trade_symbols(&self) -> Vec<String> {
+        let set = self
+            .trade_symbols
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut out: Vec<String> = set.iter().cloned().collect();
+        out.sort();
+        out
     }
 
     fn symbol_of_order(&self, order_id: &str) -> Option<String> {
@@ -489,6 +519,98 @@ pub fn parse_agg_trade(payload: &str) -> Option<MarketTick> {
     })
 }
 
+/// Binance sends most numbers as JSON strings.
+fn num(value: Option<&Value>) -> f64 {
+    match value {
+        Some(Value::String(s)) => s.parse().unwrap_or(0.0),
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// Decode `GET /api/v3/myTrades` into the fills the venue confirms.
+///
+/// The commission is reported in its own asset, which is not always the quote:
+/// a base-asset commission is converted at the fill price. Anything else — a
+/// BNB fee discount, say — cannot be priced from this payload, so it is booked
+/// as zero and named in a warning rather than guessed at.
+pub fn parse_my_trades(json: &Value) -> Vec<OrderFill> {
+    let Some(list) = json.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in list {
+        let order_id = entry
+            .get("orderId")
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default();
+        let price = num(entry.get("price"));
+        let qty = num(entry.get("qty"));
+        if order_id.is_empty()
+            || !price.is_finite()
+            || price <= 0.0
+            || !qty.is_finite()
+            || qty <= 0.0
+        {
+            continue;
+        }
+        let symbol = from_binance_symbol(
+            entry
+                .get("symbol")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        let side = if entry
+            .get("isBuyer")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            Side::Buy
+        } else {
+            Side::Sell
+        };
+        let commission = num(entry.get("commission")).max(0.0);
+        let asset = entry
+            .get("commissionAsset")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let base = symbol.split('/').next().unwrap_or_default();
+        let fee = if is_quote_asset(asset) {
+            commission
+        } else if asset == base {
+            commission * price
+        } else {
+            if commission > 0.0 {
+                tracing::warn!(
+                    venue = "binance",
+                    symbol = %symbol,
+                    asset,
+                    commission,
+                    "fill commission is in an asset this connector cannot price; booked as zero"
+                );
+            }
+            0.0
+        };
+        out.push(OrderFill {
+            venue: Venue::Binance,
+            order_id,
+            symbol,
+            side,
+            qty,
+            price,
+            fee,
+            ts_ms: entry
+                .get("time")
+                .and_then(Value::as_i64)
+                .unwrap_or_else(now_ms),
+        });
+    }
+    out
+}
+
 #[async_trait]
 impl ExchangeConnector for BinanceConnector {
     fn venue(&self) -> Venue {
@@ -720,11 +842,47 @@ impl ExchangeConnector for BinanceConnector {
         Ok(out)
     }
 
+    async fn fills_since(&self, since_ms: i64) -> ExchangeResult<Vec<OrderFill>> {
+        let mut out = Vec::new();
+        for symbol in self.trade_symbols() {
+            let mut params = vec![
+                ("symbol", to_binance_symbol(&symbol)),
+                ("limit", "1000".to_string()),
+            ];
+            // Without startTime Binance returns the most recent trades, which
+            // is what a cold cursor wants; with it, the window is explicit.
+            if since_ms > 0 {
+                params.push(("startTime", since_ms.to_string()));
+            }
+            // A failed symbol fails the whole pass on purpose: returning a
+            // partial list would let the engine advance its fill cursor past
+            // fills it never saw.
+            let json = self
+                .signed_request(Method::GET, "/api/v3/myTrades", &params)
+                .await?;
+            let fills = parse_my_trades(&json);
+            if fills.len() >= 1000 {
+                tracing::warn!(
+                    venue = "binance",
+                    symbol = %symbol,
+                    "myTrades filled its 1000 row page; older fills in this window were not read"
+                );
+            }
+            out.extend(fills);
+        }
+        out.retain(|fill| fill.ts_ms >= since_ms);
+        out.sort_by_key(|fill| fill.ts_ms);
+        Ok(out)
+    }
+
     async fn subscribe_trades(&self, symbols: &[String], sink: TickSink) -> ExchangeResult<()> {
         if symbols.is_empty() {
             return Err(ExchangeError::InvalidRequest(
                 "at least one symbol is required for the trade stream".into(),
             ));
+        }
+        for symbol in symbols {
+            self.watch_symbol(symbol);
         }
         let symbols = symbols.to_vec();
         let connector = self.clone();
@@ -877,5 +1035,96 @@ mod tests {
         );
         assert_eq!(map_order_status("CANCELED"), OrderStatus::Cancelled);
         assert_eq!(map_order_status("REJECTED"), OrderStatus::Rejected);
+    }
+
+    #[test]
+    fn my_trades_are_decoded_into_fills() {
+        let json = serde_json::json!([
+            {
+                "symbol": "SOLUSDT",
+                "id": 1,
+                "orderId": 4242,
+                "price": "142.31",
+                "qty": "0.5",
+                "quoteQty": "71.155",
+                "commission": "0.071155",
+                "commissionAsset": "USDT",
+                "time": 1731200000000i64,
+                "isBuyer": true,
+                "isMaker": false
+            },
+            {
+                "symbol": "SOLUSDT",
+                "id": 2,
+                "orderId": "4242",
+                "price": "142.00",
+                "qty": "1.5",
+                "commission": "0.001",
+                "commissionAsset": "SOL",
+                "time": 1731200000001i64,
+                "isBuyer": false
+            }
+        ]);
+        let fills = parse_my_trades(&json);
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].venue, Venue::Binance);
+        // A numeric and a string orderId are the same order to the engine.
+        assert_eq!(fills[0].order_id, "4242");
+        assert_eq!(fills[1].order_id, "4242");
+        assert_eq!(fills[0].symbol, "SOL/USDT");
+        assert_eq!(fills[0].side, Side::Buy);
+        assert!((fills[0].qty - 0.5).abs() < 1e-9);
+        assert!((fills[0].price - 142.31).abs() < 1e-9);
+        assert!((fills[0].fee - 0.071155).abs() < 1e-9);
+        assert_eq!(fills[0].ts_ms, 1731200000000);
+        assert_eq!(fills[1].side, Side::Sell);
+        // A commission taken in the base asset is worth its fill price in USD.
+        assert!((fills[1].fee - 0.001 * 142.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_unpriceable_commission_is_not_guessed_at() {
+        let json = serde_json::json!([{
+            "symbol": "SOLUSDT",
+            "orderId": 7,
+            "price": "142.0",
+            "qty": "1.0",
+            "commission": "0.0005",
+            "commissionAsset": "BNB",
+            "time": 1,
+            "isBuyer": true
+        }]);
+        let fills = parse_my_trades(&json);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(
+            fills[0].fee, 0.0,
+            "a BNB fee cannot be priced from this payload, so it is not invented"
+        );
+    }
+
+    #[test]
+    fn malformed_my_trades_are_skipped() {
+        let json = serde_json::json!([
+            {"symbol": "SOLUSDT", "price": "142.0", "qty": "1.0"},
+            {"symbol": "SOLUSDT", "orderId": 1, "price": "142.0", "qty": "0"},
+            {"symbol": "SOLUSDT", "orderId": 2, "price": "abc", "qty": "1.0"},
+            {"symbol": "SOLUSDT", "orderId": 3, "price": "0", "qty": "1.0"},
+            "not an object"
+        ]);
+        assert!(parse_my_trades(&json).is_empty());
+        assert!(parse_my_trades(&serde_json::json!({})).is_empty());
+    }
+
+    /// `myTrades` is per-symbol, so the connector has to remember which symbols
+    /// to ask about — including across a restart, when no order is resting yet.
+    #[test]
+    fn the_symbols_to_ask_about_are_remembered() {
+        let connector = BinanceConnector::new(ConnectorConfig::default(), false).unwrap();
+        assert!(connector.trade_symbols().is_empty());
+        connector.remember_order("1", "SOL/USDT");
+        connector.remember_order("2", "BTC/USDT");
+        connector.watch_symbol("SOL/USDT");
+        assert_eq!(connector.trade_symbols(), vec!["BTC/USDT", "SOL/USDT"]);
+        assert_eq!(connector.symbol_of_order("1").as_deref(), Some("SOL/USDT"));
     }
 }

@@ -10,6 +10,7 @@ import type {
   Position,
   RiskState,
   StrategyInfo,
+  TrackedOrder,
   TradeRecord,
   VenueHealth,
   WalletHoldings,
@@ -47,6 +48,8 @@ export interface DashboardData {
   portfolio: PortfolioSnapshot | null;
   positions: Position[];
   trades: TradeRecord[];
+  /** Orders the engine submitted, with only the fills the venue confirmed. */
+  orders: TrackedOrder[];
   logs: LogEntry[];
   risk: RiskState | null;
   /** The on-chain wallet, valued but never traded. `null` until the core answers. */
@@ -67,6 +70,7 @@ export interface DashboardData {
   lastError: string | null;
   refreshStrategy: () => Promise<void>;
   refreshRisk: () => Promise<void>;
+  refreshOrders: () => Promise<void>;
 }
 
 /**
@@ -80,6 +84,7 @@ export function useDashboard(): DashboardData {
   const [portfolio, setPortfolio] = useState<PortfolioSnapshot | null>(null);
   const [positions, setPositions] = useState<Position[]>([]);
   const [trades, setTrades] = useState<TradeRecord[]>([]);
+  const [orders, setOrders] = useState<TrackedOrder[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [risk, setRisk] = useState<RiskState | null>(null);
   const [wallet, setWallet] = useState<WalletHoldings | null>(null);
@@ -124,6 +129,7 @@ export function useDashboard(): DashboardData {
       venuesResult,
       rulesResult,
       walletResult,
+      ordersResult,
     ] = await Promise.all([
       settle(api.getPortfolio()),
       settle(api.getPositions()),
@@ -135,6 +141,7 @@ export function useDashboard(): DashboardData {
       settle(api.getVenues()),
       settle(api.getRiskRules()),
       settle(api.getWalletHoldings()),
+      settle(api.getOrders()),
     ]);
 
     const failures: string[] = [];
@@ -198,6 +205,12 @@ export function useDashboard(): DashboardData {
       setWallet(walletResult.value);
       reachable = true;
     }
+    if (ordersResult.ok) {
+      setOrders(ordersResult.value);
+      reachable = true;
+    } else {
+      failures.push(ordersResult.error);
+    }
 
     setCoreReachable(reachable);
     setLastError(failures.length > 0 ? failures[0] : null);
@@ -213,6 +226,11 @@ export function useDashboard(): DashboardData {
   const refreshRisk = useCallback(async () => {
     const result = await settle(api.getRisk());
     if (result.ok) setRisk(result.value);
+  }, []);
+
+  const refreshOrders = useCallback(async () => {
+    const result = await settle(api.getOrders());
+    if (result.ok) setOrders(result.value);
   }, []);
 
   /** Apply one live frame. */
@@ -284,6 +302,7 @@ export function useDashboard(): DashboardData {
     portfolio,
     positions,
     trades,
+    orders,
     logs,
     risk,
     wallet,
@@ -301,5 +320,6 @@ export function useDashboard(): DashboardData {
     lastError,
     refreshStrategy,
     refreshRisk,
+    refreshOrders,
   };
 }

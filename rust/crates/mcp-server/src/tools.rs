@@ -9,7 +9,7 @@ pub fn definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "execute_trade",
-            "description": "Submit a buy or sell order to the configured venue. The order passes through a non-bypassable risk layer; a rejection is final and must not be retried without a new plan. In paper mode the trade is simulated.",
+            "description": "Submit a buy or sell order to the configured venue. The order passes through a non-bypassable risk layer; a rejection is final and must not be retried without a new plan. In paper mode the trade is simulated. An accepted order is not a fill: a limit order rests until the price crosses it, so verify the outcome with get_orders.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -28,6 +28,20 @@ pub fn definitions() -> Vec<Value> {
             "name": "get_portfolio",
             "description": "Current equity, cash, realized and unrealized PnL, and open positions.",
             "inputSchema": {"type": "object", "properties": {}}
+        }),
+        json!({
+            "name": "get_orders",
+            "description": "Orders the engine is tracking, newest first, with venue-confirmed fills. An accepted or partially_filled order is still resting and is not yet a position; only the fills in this list are real. Check here to verify an execution instead of assuming it filled.",
+            "inputSchema": {"type": "object", "properties": {}}
+        }),
+        json!({
+            "name": "cancel_order",
+            "description": "Cancel a resting order by its order_id from get_orders. Only a resting order can be cancelled, and the venue must confirm. Cancelling reduces exposure so it is never rejected by the risk layer; a fill that landed just before the cancel is still booked.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"order_id": {"type": "string"}},
+                "required": ["order_id"]
+            }
         }),
         json!({
             "name": "get_positions",
@@ -98,6 +112,8 @@ pub async fn call(ctx: &Context, name: &str, args: Value) -> Result<String, Stri
     let result = match name {
         "execute_trade" => execute_trade(ctx, args).await,
         "get_portfolio" => get(ctx, "/api/portfolio").await,
+        "get_orders" => get(ctx, "/api/orders").await,
+        "cancel_order" => cancel_order(ctx, args).await,
         "get_positions" => get(ctx, "/api/positions").await,
         "get_market_data" => market_data(ctx, args).await,
         "get_risk_state" => get(ctx, "/api/risk").await,
@@ -162,6 +178,54 @@ async fn execute_trade(ctx: &Context, args: Value) -> Result<String, String> {
         // the verdict so the agent can reason about it.
         Ok(json!({"approved": false, "status": status.as_u16(), "response": text}).to_string())
     }
+}
+
+async fn cancel_order(ctx: &Context, args: Value) -> Result<String, String> {
+    let order_id = args
+        .get("order_id")
+        .and_then(|v| v.as_str())
+        .ok_or("cancel_order requires an order_id")?;
+    if order_id.trim().is_empty() {
+        return Err("cancel_order requires a non-empty order_id".into());
+    }
+    let response = ctx
+        .http
+        .delete(format!(
+            "{}/api/orders/{}",
+            ctx.core_url,
+            urlencode(order_id)
+        ))
+        .send()
+        .await
+        .map_err(|e| format!("core unreachable: {e}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("could not read the core response: {e}"))?;
+    if status.is_success() {
+        Ok(text)
+    } else {
+        // A refused cancel leaves the order live. That is an outcome the agent
+        // has to reason about, not a transport failure.
+        Ok(json!({"ok": false, "status": status.as_u16(), "response": text}).to_string())
+    }
+}
+
+/// Percent-encode an order id for a path segment. Venue ids are alphanumeric in
+/// practice, but a client id may not be, and a raw `/` or `?` would change which
+/// order the request addresses.
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 async fn get(ctx: &Context, path: &str) -> Result<String, String> {
@@ -287,5 +351,99 @@ async fn set_strategy(ctx: &Context, args: Value) -> Result<String, String> {
         Ok(text)
     } else {
         Err(format!("core returned {status}: {text}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Nothing listens here, so a call that reaches the transport fails fast.
+    fn unreachable() -> Context {
+        Context {
+            core_url: "http://127.0.0.1:1".into(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    fn minimal_args(name: &str) -> Value {
+        match name {
+            "execute_trade" => json!({"symbol": "SOL/USDT", "side": "buy", "qty": 1.0}),
+            "cancel_order" => json!({"order_id": "o-1"}),
+            "fetch_onchain_data" => {
+                json!({"chain": "solana", "address": "11111111111111111111111111111111"})
+            }
+            "set_strategy" => json!({"path": "/tmp/strategy.wasm"}),
+            _ => json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_advertised_tool_is_dispatchable() {
+        let ctx = unreachable();
+        for definition in definitions() {
+            let name = definition["name"].as_str().expect("a tool has a name");
+            let error = call(&ctx, name, minimal_args(name))
+                .await
+                .expect_err("an unreachable core cannot answer");
+            assert!(
+                error.contains("core unreachable"),
+                "{name} is advertised but not wired up: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_tool_is_refused() {
+        let error = call(&unreachable(), "transfer_everything", json!({}))
+            .await
+            .expect_err("an unknown tool must not run");
+        assert!(error.contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn arguments_are_validated_before_the_core_is_called() {
+        let ctx = unreachable();
+        let error = call(
+            &ctx,
+            "execute_trade",
+            json!({"symbol": "SOL/USDT", "side": "buy"}),
+        )
+        .await
+        .expect_err("a trade without a size must not be sent");
+        assert!(error.contains("numeric qty"), "{error}");
+
+        let error = call(&ctx, "cancel_order", json!({"order_id": "  "}))
+            .await
+            .expect_err("a cancel without an order must not be sent");
+        assert!(error.contains("non-empty order_id"), "{error}");
+
+        let error = call(
+            &ctx,
+            "execute_trade",
+            json!({"symbol": "SOL/USDT", "side": "buy", "qty": 0.0}),
+        )
+        .await
+        .expect_err("a zero-sized trade must not be sent");
+        assert!(error.contains("positive finite"), "{error}");
+    }
+
+    #[test]
+    fn an_order_id_cannot_change_the_path_it_addresses() {
+        assert_eq!(urlencode("o-1"), "o-1");
+        assert_eq!(urlencode("abc_123.~"), "abc_123.~");
+        assert_eq!(urlencode("../../orders"), "..%2F..%2Forders");
+        assert_eq!(urlencode("o 1?x=1"), "o%201%3Fx%3D1");
+        assert_eq!(urlencode("o%2F1"), "o%252F1");
+    }
+
+    #[test]
+    fn cancelling_requires_an_order_id() {
+        let definitions = definitions();
+        let cancel = definitions
+            .iter()
+            .find(|tool| tool["name"] == "cancel_order")
+            .expect("cancel_order is advertised");
+        assert_eq!(cancel["inputSchema"]["required"], json!(["order_id"]));
     }
 }

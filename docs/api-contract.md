@@ -22,6 +22,8 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 | GET | `/api/strategy` | `{ "name", "loaded_at_ms", "wasm_sha256", "ticks_processed", "fuel_used" }` |
 | POST | `/api/strategy/reload` | Body `{ "path": "/abs/path/strategy.wasm" }` → reloads the sandboxed strategy |
 | POST | `/api/orders` | Body `OrderRequest` → runs the risk layer, then submits |
+| GET | `/api/orders` | `TrackedOrder[]`, newest first — order state and venue-confirmed fills |
+| DELETE | `/api/orders/{order_id}` | Cancel a resting order; the venue must confirm |
 | POST | `/api/breaker/reset` | Body `{ "confirm": true }` → manual breaker reset |
 | GET | `/api/venues` | `[{ "venue": "paper", "healthy": true, "live": false }]` |
 | GET | `/api/wallet` | `WalletMetadata` — public wallet metadata, never a secret |
@@ -54,6 +56,66 @@ Response `403` (rejected by the risk layer — never overridable):
 ```json
 { "approved": false, "reason": "position_size_exceeds_max_pct", "detail": "…", "breaker_state": "closed" }
 ```
+
+### `GET /api/orders` and `DELETE /api/orders/{order_id}`
+
+An order is not a trade. `POST /api/orders` answers with the risk verdict and the
+venue's initial acknowledgement; what actually filled is only known later, from
+the venue's own trade history. `GET /api/orders` is where that truth is reported.
+
+```json
+[
+  {
+    "venue": "binance",
+    "order_id": "1234567890",
+    "client_id": "oe-…",
+    "symbol": "SOL/USDT",
+    "side": "buy",
+    "order_type": "limit",
+    "limit_price": 130.0,
+    "qty": 2.0,
+    "status": "partially_filled",
+    "rationale": "momentum breakout on 5m",
+    "submitted_ts_ms": 1700000000000,
+    "updated_ts_ms": 1700000004000,
+    "fills": [
+      { "venue": "binance", "order_id": "1234567890", "symbol": "SOL/USDT",
+        "side": "buy", "qty": 0.8, "price": 130.0, "fee": 0.0104,
+        "ts_ms": 1700000003000 }
+    ],
+    "missing_since_ms": null
+  }
+]
+```
+
+Rules the engine holds itself to:
+
+- **Only venue-reported fills are booked.** A fill is matched by `order_id` and
+  deduped by `(ts_ms, qty, price)`, so reconciliation can re-read an overlapping
+  window without double-counting. There is no synthetic-fill fallback: an empty
+  answer means nothing filled.
+- **`status` is an inference, `fills` is a fact.** A fill the venue confirms is
+  booked even if the engine had already labelled the order cancelled or filled.
+  Dropping it would under-report the exposure the risk layer measures.
+- **Leaving the open list is not proof of cancellation.** Trade history lags the
+  open list, so an absent order gets a 30 s grace window (`missing_since_ms`)
+  before it is retired, and fills are still read during that window.
+- **A venue that cannot report fills keeps its orders unreconciled** rather than
+  invented. Hyperliquid refuses order placement outright, so this never arises
+  there.
+- Commission is converted honestly: quote asset → USD directly, base asset →
+  `commission × price`, anything else (e.g. BNB) → `0` **with a warning**. It is
+  never guessed.
+
+`DELETE` cancels a resting order. The venue must confirm before the engine marks
+it cancelled, so a failed cancel leaves the order live and still reconciling.
+Cancelling only reduces exposure, so it does not pass through the risk layer; a
+fill that landed just before the cancel is still booked.
+
+Response `200`: `{ "ok": true }`
+
+Response `400` (plain text): `unknown order`, or
+`order … is filled: only a resting order can be cancelled`.
 
 ### `POST /api/wallet/sign-dry-run`
 
@@ -333,8 +395,10 @@ Tools:
 
 | Tool | Args | Result |
 | --- | --- | --- |
-| `execute_trade` | `{venue, symbol, side, qty, order_type?, limit_price?, rationale?}` | risk verdict + fill |
+| `execute_trade` | `{venue, symbol, side, qty, order_type?, limit_price?, rationale?}` | risk verdict + venue acknowledgement (not proof of a fill) |
 | `get_portfolio` | `{}` | portfolio snapshot with positions and PnL |
+| `get_orders` | `{}` | tracked orders with venue-confirmed fills; the Verify step reads this |
+| `cancel_order` | `{order_id}` | cancel a resting order; a refusal leaves it live |
 | `get_positions` | `{}` | open positions |
 | `get_market_data` | `{symbol, venue?, lookback?}` | recent ticks + last price |
 | `get_risk_state` | `{}` | breaker state and utilisation |

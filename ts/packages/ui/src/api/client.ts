@@ -19,6 +19,7 @@ import type {
   RiskState,
   StrategyInfo,
   StrategyReloadResponse,
+  TrackedOrder,
   TradeRecord,
   VenueHealth,
   WalletHoldings,
@@ -31,6 +32,9 @@ export type {
   EngineStatus,
   LogEntry,
   MarketTick,
+  OrderFill,
+  OrderStatus,
+  OrderType,
   PortfolioSnapshot,
   Position,
   RiskLimits,
@@ -38,6 +42,7 @@ export type {
   Side,
   StrategyInfo,
   StrategyReloadResponse,
+  TrackedOrder,
   TradeRecord,
   Venue,
   VenueHealth,
@@ -150,6 +155,26 @@ export function getWalletHoldings(): Promise<WalletHoldings> {
 /** Recent fills, newest first. */
 export function getTrades(limit = 200): Promise<TradeRecord[]> {
   return request<TradeRecord[]>(`/api/trades?limit=${encodeURIComponent(String(limit))}`);
+}
+
+/**
+ * Every order the engine submitted, newest first, with the fills the venue has
+ * actually confirmed. A resting order carries an empty `fills` list.
+ */
+export function getOrders(): Promise<TrackedOrder[]> {
+  return request<TrackedOrder[]>('/api/orders');
+}
+
+/**
+ * Cancel a resting order at the venue.
+ *
+ * The venue has to confirm before the engine marks it cancelled, so a rejected
+ * cancel leaves the order live rather than silently dropping it.
+ */
+export function cancelOrder(orderId: string): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>(`/api/orders/${encodeURIComponent(orderId)}`, {
+    method: 'DELETE',
+  });
 }
 
 /** Recent log lines, newest first. Optionally narrowed to a single source. */

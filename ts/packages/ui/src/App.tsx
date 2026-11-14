@@ -5,6 +5,7 @@ import { AdminPanel } from './components/AdminPanel';
 import { CoinTable } from './components/CoinTable';
 import { Header } from './components/Header';
 import { LogPanel } from './components/LogPanel';
+import { OrdersPanel } from './components/OrdersPanel';
 import { PortfolioPanel } from './components/PortfolioPanel';
 import { PositionsTable } from './components/PositionsTable';
 import { RiskPanel } from './components/RiskPanel';
@@ -117,6 +118,27 @@ export default function App() {
     }
   }, [dash]);
 
+  const handleCancelOrder = useCallback(
+    async (orderId: string): Promise<ActionOutcome> => {
+      try {
+        await api.cancelOrder(orderId);
+        await dash.refreshOrders();
+        return { ok: true, message: `order ${orderId} cancelled at the venue` };
+      } catch (error) {
+        // A failed cancel leaves the order resting, so say so rather than
+        // letting the row look like it went away.
+        await dash.refreshOrders();
+        return {
+          ok: false,
+          message: `cancel refused, the order is still resting: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        };
+      }
+    },
+    [dash],
+  );
+
   const handleDemoSubmit = useCallback(
     (order: { symbol: string; side: 'buy' | 'sell'; qty: number; rationale: string }) => {
       setOutcome(demo.submit(order));
@@ -206,6 +228,7 @@ export default function App() {
               <PortfolioPanel portfolio={dash.portfolio} equitySeries={dash.equitySeries} />
               <WalletPanel wallet={dash.wallet} />
               <PositionsTable positions={dash.positions} />
+              <OrdersPanel orders={dash.orders} onCancel={handleCancelOrder} />
               <TradesTable trades={dash.trades} />
             </div>
 

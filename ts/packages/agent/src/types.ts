@@ -117,6 +117,39 @@ export interface MarketTick {
   ts_ms: number;
 }
 
+export interface OrderFill {
+  venue: string;
+  order_id: string;
+  symbol: string;
+  side: 'buy' | 'sell';
+  qty: number;
+  price: number;
+  fee: number;
+  ts_ms: number;
+}
+
+/**
+ * An order the engine is tracking.
+ *
+ * `status` is the engine's inference from the venue's open list; `fills` is what
+ * the venue actually confirmed. Only the fills are money, so verification reads
+ * them rather than trusting the label.
+ */
+export interface TrackedOrder {
+  venue: string;
+  order_id: string;
+  symbol: string;
+  side: 'buy' | 'sell';
+  order_type: 'market' | 'limit';
+  limit_price: number | null;
+  qty: number;
+  status: 'accepted' | 'filled' | 'rejected' | 'cancelled' | 'partially_filled';
+  rationale: string;
+  submitted_ts_ms: number;
+  updated_ts_ms: number;
+  fills: OrderFill[];
+}
+
 export interface TradeRecord {
   id: string;
   venue: string;

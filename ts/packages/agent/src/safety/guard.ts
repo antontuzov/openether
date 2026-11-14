@@ -115,5 +115,11 @@ export function validateToolArguments(
       return { ok: false, error: 'execute_trade needs a symbol' };
     }
   }
+  if (name === 'cancel_order') {
+    const orderId = args['order_id'];
+    if (typeof orderId !== 'string' || orderId.trim() === '') {
+      return { ok: false, error: 'cancel_order needs the order_id of a resting order' };
+    }
+  }
   return { ok: true };
 }

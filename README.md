@@ -184,8 +184,8 @@ and memory limits and can be hot-swapped at runtime via
 ### Tests
 
 ```bash
-cargo test --workspace --manifest-path rust/Cargo.toml   # 116 tests
-pnpm --dir ts -r test                                    # 92 tests
+cargo test --workspace --manifest-path rust/Cargo.toml   # 171 tests
+pnpm --dir ts -r test                                    # 124 tests
 pnpm --dir ts -r typecheck
 pnpm --dir ts -r build
 ```
@@ -666,11 +666,12 @@ Exchange credentials are only read when live trading is armed. `.env`,
 ### HTTP API
 
 `GET /healthz`, `/metrics`, `/api/config`, `/api/portfolio`, `/api/positions`,
-`/api/trades`, `/api/logs`, `/api/ticks`, `/api/risk`, `/api/risk/decisions`,
-`/api/risk/rules`, `/api/strategy`, `/api/venues`, `/api/wallet`,
-`/api/wallet/holdings`, `/api/live`;
+`/api/orders`, `/api/trades`, `/api/logs`, `/api/ticks`, `/api/risk`,
+`/api/risk/decisions`, `/api/risk/rules`, `/api/strategy`, `/api/venues`,
+`/api/wallet`, `/api/wallet/holdings`, `/api/live`;
 `POST /api/orders`, `/api/logs`, `/api/onchain`, `/api/strategy/reload`,
 `/api/breaker/reset`, `/api/wallet/sign-dry-run`;
+`DELETE /api/orders/{order_id}` to cancel a resting order;
 `GET /ws` for the live stream. Full shapes in [docs/api-contract.md](docs/api-contract.md).
 
 ---
@@ -679,7 +680,7 @@ Exchange credentials are only read when live trading is armed. `.env`,
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **149 passing**, including the encrypted keystore,
+- `cargo test --workspace` — **171 passing**, including the encrypted keystore,
   EVM and Solana dry-run signing, signature tampering, wrong-passphrase
   rejection, and the API refusing to sign when dry run is off. Two further
   tests are `#[ignore]`d because they need the network; both pass when run.
@@ -699,8 +700,8 @@ Checked locally on macOS (arm64):
   same accounts.
 - `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings`
   — clean, so the CI gate passes as written.
-- `pnpm -r test` — **106 passing** across the agent guard, the data server and
-  the browser trading engine.
+- `pnpm -r test` — **124 passing** across the agent guard and verify loop, the
+  data server, the browser trading engine and the order accounting.
 - `pnpm -r typecheck` and `pnpm -r build` — clean.
 - The risk contract proven to be shared: the Rust risk layer and the browser
   simulator were driven side by side and refused the same orders with the same
@@ -736,6 +737,37 @@ Checked locally on macOS (arm64):
   position, the fee-charged equity, the locked margin, the trade journal, the
   client-order-id mapping and the risk anchors all came back. A second run
   against the same file refused an order that the position cap had to refuse.
+- The order lifecycle driven through a scripted venue that answers the way a
+  real exchange does: a resting limit order books **nothing**; a paper limit
+  order fills only when the price crosses it, at the limit price; a partial
+  fill books only the confirmed part and carries its fee; re-reading the same
+  window does not double-book; the remaining half fills at its own price and
+  the average is quantity-weighted; an order that leaves the open list is not
+  retired for 30 s; a fill reported *after* retirement is still booked; a venue
+  that cannot list open orders retires nothing; cancelling still books the fill
+  that landed first; and tracked orders plus the fill cursor survive a restart.
+  Binance `myTrades` and Kraken `TradesHistory` decoding are covered by their own
+  parser tests, including a commission in an asset that cannot be priced.
+- The agent's Verify step proven to report the venue's fills rather than the
+  trade it asked for: a partly filled order logs `filled_qty` and the fills
+  themselves, a still-resting order logs zero filled with no trade, working
+  orders are shown to the model before it plans, and `cancel_order` reaches the
+  core with its refusal reported as an outcome.
+- The order lifecycle verified against a **running core**, through all three
+  entry points: `POST /api/orders` with no `venue` (accepted on the engine's
+  venue), a limit below market (`accepted`, no fills, equity and cash unchanged,
+  no position), a limit above market (filled at its limit price, 5 bps fee
+  charged, position and trade booked), `DELETE /api/orders/{id}` (cancelled, the
+  engine logged "cancelled at the venue"), a repeat cancel (refused: "only a
+  resting order can be cancelled"), an unknown id (refused), and an order id
+  shaped like `../../api/breaker/reset` (escaped, reported as an unknown order,
+  breaker untouched). The same sequence through the real MCP server: a trade, a
+  `get_orders`, and a cancel with its refusal. In the dashboard, the Orders panel
+  showed the resting, filled and cancelled rows with fill progress, fee and
+  status colour, and its two-step cancel flipped the core's order to cancelled.
+  A 1 ETH order at $3,285 (32.9% of equity) tripped the breaker with
+  `position_size_exceeds_max_pct` and every later order was refused until the
+  breaker was reset.
 - The wallet valued from **real mainnet data**: a public Ethereum address read
   over JSON-RPC returned 0.8083523704434918 ETH plus USDC and USDT with the
   right 6 decimals and symbols, priced at $1,931.68 / $1.0008 / $1.0039 for a
@@ -808,6 +840,28 @@ Bugs found and fixed during that verification:
 - Resetting the browser simulation emptied its price book, so every order was
   refused with "price must be a positive finite number" until the next price
   refresh a minute later. The reset now brings the prices back with it.
+- Only the paper venue implemented `fills_since`, so removing the synthetic-fill
+  fallback would have left every live order accepted but never booked. Binance
+  and Kraken now report their own fills. `myTrades` is per-symbol, so the
+  connector remembers which symbols to ask about — seeded from the stream
+  subscription and from every order placed, which is what lets a restart still
+  find its fills.
+- An order that left the venue's open list was immediately labelled cancelled,
+  and its fills were then ignored because the engine only booked fills for
+  orders it still considered active. Trade history lags the open list, so a real
+  fill could be dropped and the risk layer would measure **less exposure than
+  existed**. Now a fill is booked whatever the label says, and retirement waits
+  out a grace window.
+- There was no way to cancel a resting order at all — not in the engine, not in
+  the API, not in the dashboard. Added, with the venue's confirmation required
+  before the engine calls it cancelled.
+- **The agent could not trade at all.** `POST /api/orders` required a `venue`
+  field, but the MCP `execute_trade` tool only sends one when the caller
+  explicitly overrides it — so every agent order came back `422 missing field
+  venue`, and the tool reported it as a rejection rather than a wiring bug. The
+  engine already overrides the requested venue with its own, so an omitted venue
+  now means "the engine's". Found by calling the real MCP server against a
+  running core; covered by a router test.
 
 ---
 

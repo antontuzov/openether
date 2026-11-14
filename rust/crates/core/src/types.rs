@@ -121,6 +121,19 @@ pub enum OrderStatus {
     PartiallyFilled,
 }
 
+impl OrderStatus {
+    /// The name the API serialises, so logs and wire payloads agree.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Filled => "filled",
+            Self::Rejected => "rejected",
+            Self::Cancelled => "cancelled",
+            Self::PartiallyFilled => "partially_filled",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Chain {
@@ -204,6 +217,91 @@ pub struct OrderFill {
     pub price: f64,
     pub fee: f64,
     pub ts_ms: i64,
+}
+
+/// An order the engine submitted and is still reconciling with the venue.
+///
+/// The venue owns the truth about what filled. The engine books only fills the
+/// venue reports, so a resting limit order is never mistaken for a position and
+/// a partial fill never books the whole quantity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrackedOrder {
+    pub venue: Venue,
+    pub order_id: String,
+    pub client_id: String,
+    pub symbol: String,
+    pub side: Side,
+    pub order_type: OrderType,
+    #[serde(default)]
+    pub limit_price: Option<f64>,
+    /// The quantity asked for.
+    pub qty: f64,
+    pub status: OrderStatus,
+    #[serde(default)]
+    pub rationale: String,
+    pub submitted_ts_ms: i64,
+    pub updated_ts_ms: i64,
+    /// Every fill booked for this order, oldest first.
+    ///
+    /// This is also the dedupe key: reconciliation runs repeatedly over an
+    /// overlapping window, and a fill must be booked exactly once.
+    pub fills: Vec<OrderFill>,
+    /// When the venue's open list first stopped containing this order.
+    ///
+    /// An order disappears from the open list before its fills show up in the
+    /// trade history, so absence alone is not proof of cancellation. The engine
+    /// waits out a grace window before retiring it, and books any fill the
+    /// venue confirms in the meantime.
+    #[serde(default)]
+    pub missing_since_ms: Option<i64>,
+}
+
+impl TrackedOrder {
+    /// Cumulative quantity the venue has confirmed.
+    pub fn filled_qty(&self) -> f64 {
+        self.fills.iter().fold(0.0, |total, fill| total + fill.qty)
+    }
+
+    /// Quantity still resting at the venue.
+    pub fn remaining_qty(&self) -> f64 {
+        (self.qty - self.filled_qty()).max(0.0)
+    }
+
+    /// Volume-weighted average of the confirmed fills, or 0 when none.
+    pub fn avg_fill_price(&self) -> f64 {
+        let notional = self
+            .fills
+            .iter()
+            .fold(0.0, |total, fill| total + fill.qty * fill.price);
+        let qty = self.filled_qty();
+        if qty > 0.0 {
+            notional / qty
+        } else {
+            0.0
+        }
+    }
+
+    pub fn fee(&self) -> f64 {
+        self.fills.iter().fold(0.0, |total, fill| total + fill.fee)
+    }
+
+    /// Still waiting on the venue: neither fully filled nor retired.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self.status,
+            OrderStatus::Accepted | OrderStatus::PartiallyFilled
+        )
+    }
+
+    /// Whether this exact fill has already been booked.
+    ///
+    /// Venues give fills no stable id of their own, so identity is the
+    /// timestamp, quantity and price together.
+    pub fn knows_fill(&self, fill: &OrderFill) -> bool {
+        self.fills.iter().any(|known| {
+            known.ts_ms == fill.ts_ms && known.qty == fill.qty && known.price == fill.price
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

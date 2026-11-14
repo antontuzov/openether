@@ -96,10 +96,13 @@ pub trait ExchangeConnector: Send + Sync {
         ))
     }
 
-    /// Fills produced since the given timestamp.
+    /// Fills the venue has confirmed since the given timestamp.
     ///
-    /// Venues that stream fills should override this; the engine falls back to
-    /// the last observed price when a venue reports no fills.
+    /// The engine books only what this returns. An empty answer means nothing
+    /// filled — it is never turned into a synthetic fill, because a resting
+    /// limit order would then become a position that does not exist. A venue
+    /// that cannot report fills keeps the default and its orders stay
+    /// unreconciled rather than invented.
     async fn fills_since(&self, _since_ms: i64) -> ExchangeResult<Vec<OrderFill>> {
         Ok(Vec::new())
     }

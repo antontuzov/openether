@@ -118,5 +118,14 @@ describe('validateToolArguments', () => {
 
   it('does not constrain other tools', () => {
     expect(validateToolArguments('get_portfolio', {})).toEqual({ ok: true });
+    expect(validateToolArguments('get_orders', {})).toEqual({ ok: true });
+  });
+
+  it('accepts a cancel that names an order', () => {
+    expect(validateToolArguments('cancel_order', { order_id: 'o-1' })).toEqual({ ok: true });
+  });
+
+  it.each(['', '   ', 42, null, undefined])('rejects cancel_order with order_id %s', (orderId) => {
+    expect(validateToolArguments('cancel_order', { order_id: orderId }).ok).toBe(false);
   });
 });

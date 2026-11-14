@@ -52,6 +52,50 @@ export interface TradeRecord {
   source: string;
 }
 
+/** Order type as serialised by the engine. */
+export type OrderType = 'market' | 'limit';
+
+/** Lifecycle state of a submitted order. */
+export type OrderStatus = 'accepted' | 'filled' | 'rejected' | 'cancelled' | 'partially_filled';
+
+/** A fill the venue confirmed. */
+export interface OrderFill {
+  venue: Venue;
+  order_id: string;
+  symbol: string;
+  side: Side;
+  qty: number;
+  price: number;
+  fee: number;
+  ts_ms: number;
+}
+
+/**
+ * An order the engine submitted, carrying only the fills the venue confirmed.
+ *
+ * A resting order has an empty `fills` list: it is neither a position nor a
+ * trade until the venue says it filled. `missing_since_ms` is when the venue's
+ * open list last stopped containing it — absence alone is not cancellation,
+ * because trade history lags the open list.
+ */
+export interface TrackedOrder {
+  venue: Venue;
+  order_id: string;
+  client_id: string;
+  symbol: string;
+  side: Side;
+  order_type: OrderType;
+  limit_price: number | null;
+  /** The quantity asked for, not the quantity filled. */
+  qty: number;
+  status: OrderStatus;
+  rationale: string;
+  submitted_ts_ms: number;
+  updated_ts_ms: number;
+  fills: OrderFill[];
+  missing_since_ms: number | null;
+}
+
 /** A log line pushed by the engine or the AI agent. */
 export interface LogEntry {
   id: string;

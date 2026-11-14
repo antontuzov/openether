@@ -13,7 +13,7 @@
 
 use crate::exchange::OpenOrder;
 use crate::risk::{BreakerState, RiskState};
-use crate::types::{Side, TradeRecord, Venue};
+use crate::types::{Side, TrackedOrder, TradeRecord, Venue};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
@@ -126,6 +126,19 @@ CREATE TABLE IF NOT EXISTS risk_state (
     day_start_equity   REAL    NOT NULL,
     day_start_ms       INTEGER NOT NULL,
     daily_realized_pnl REAL    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tracked_orders (
+    order_id TEXT PRIMARY KEY,
+    ts_ms    INTEGER NOT NULL,
+    payload  TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS tracked_orders_ts_idx ON tracked_orders (ts_ms DESC);
+
+CREATE TABLE IF NOT EXISTS fill_cursor (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    fill_cursor_ms INTEGER NOT NULL
 );
 "#;
 
@@ -343,6 +356,72 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /* --------------------------------------------------------- tracked orders */
+
+    /// Replace the tracked-order table with `orders`.
+    ///
+    /// The whole order is stored as JSON because its fill ladder is what makes
+    /// reconciliation idempotent: losing it would let a restart book the same
+    /// fill twice.
+    pub fn save_tracked_orders(&self, orders: &[TrackedOrder]) -> anyhow::Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM tracked_orders", [])?;
+        for order in orders {
+            tx.execute(
+                "INSERT OR REPLACE INTO tracked_orders (order_id, ts_ms, payload)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    order.order_id,
+                    order.submitted_ts_ms,
+                    serde_json::to_string(order)?,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read every tracked order, oldest first.
+    pub fn load_tracked_orders(&self) -> anyhow::Result<Vec<TrackedOrder>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT payload FROM tracked_orders ORDER BY ts_ms ASC")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut orders = Vec::with_capacity(rows.len());
+        for payload in rows {
+            match serde_json::from_str::<TrackedOrder>(&payload) {
+                Ok(order) => orders.push(order),
+                Err(e) => tracing::warn!(error = %e, "skipping an unreadable tracked order"),
+            }
+        }
+        Ok(orders)
+    }
+
+    /// How far the venue's fill history has been read.
+    pub fn save_fill_cursor(&self, since_ms: i64) -> anyhow::Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO fill_cursor (id, fill_cursor_ms) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET fill_cursor_ms = excluded.fill_cursor_ms",
+            params![since_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_fill_cursor(&self) -> anyhow::Result<i64> {
+        let conn = self.lock()?;
+        let value = conn
+            .query_row(
+                "SELECT fill_cursor_ms FROM fill_cursor WHERE id = 1",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(value.unwrap_or(0))
     }
 
     /// Remember which venue order a client order id refers to.

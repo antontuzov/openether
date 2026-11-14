@@ -3,10 +3,10 @@ use crate::holdings::WalletHoldings;
 use crate::types::*;
 use crate::wallet::{AccountSelector, TxEnvelope, WalletError, WalletService};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Extension, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -37,6 +37,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/strategy", get(strategy))
         .route("/api/strategy/reload", post(strategy_reload))
         .route("/api/orders", post(place_order))
+        .route("/api/orders", get(orders))
+        .route("/api/orders/{order_id}", delete(cancel_order))
         .route("/api/breaker/reset", post(reset_breaker))
         .route("/api/venues", get(venues))
         .route("/api/wallet", get(wallet_metadata))
@@ -132,6 +134,25 @@ async fn portfolio(State(state): State<Arc<AppState>>) -> Json<PortfolioSnapshot
 
 async fn positions(State(state): State<Arc<AppState>>) -> Json<Vec<Position>> {
     Json(state.portfolio().positions)
+}
+
+/// Every order the engine submitted, newest first, with the fills the venue
+/// has actually confirmed. A resting order carries an empty `fills` list — it
+/// is not a position until the venue says it filled.
+async fn orders(State(state): State<Arc<AppState>>) -> Json<Vec<TrackedOrder>> {
+    Json(state.orders())
+}
+
+/// Cancel a resting order. The venue must confirm before the engine marks it
+/// cancelled, so a failed cancel leaves the order live and reconciling.
+async fn cancel_order(
+    State(state): State<Arc<AppState>>,
+    Path(order_id): Path<String>,
+) -> Response {
+    match state.cancel_order(&order_id).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
 }
 
 /// The canonical risk rules this engine is running with.
@@ -305,8 +326,22 @@ async fn strategy_reload(
 
 async fn place_order(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<OrderRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> Response {
+    // The engine trades on the venue it was configured with and overrides
+    // whatever the caller names, so an omitted venue means "the engine's".
+    // Requiring it would refuse every agent order: the MCP tool only sends a
+    // venue when the caller explicitly overrides it.
+    let mut body = body;
+    if let Some(object) = body.as_object_mut() {
+        object
+            .entry("venue")
+            .or_insert_with(|| serde_json::json!(state.venue()));
+    }
+    let request: OrderRequest = match serde_json::from_value(body) {
+        Ok(request) => request,
+        Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
+    };
     let outcome = state.submit_order(request, "api").await;
     let status = if outcome.approved {
         StatusCode::OK
@@ -765,6 +800,129 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes).to_string();
         assert!(!text.contains("wrong-passphrase"));
         assert!(text.contains("invalid_passphrase"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The order surface end to end through the real router.
+    ///
+    /// The agent's MCP tool sends no venue unless the caller overrides it, so an
+    /// omitted venue must mean "the engine's" rather than a 422 — otherwise the
+    /// agent can never trade at all.
+    #[tokio::test]
+    async fn an_order_without_a_venue_rests_and_can_be_cancelled() {
+        let dir = temp_dir("orders");
+        let paper = Arc::new(crate::exchange::paper::PaperConnector::new());
+        paper.set_price("SOL/USDT", 142.0);
+        let mut config = Config::from_env();
+        config.venue = Venue::Paper;
+        config.live_trading = false;
+        config.paper_start_equity = 10_000.0;
+        config.state_db_path = Some(dir.join("state.db"));
+        config.strategy_wasm = None;
+        let state = crate::engine::AppState::with_connector(config, paper).unwrap();
+        let app = router(Arc::clone(&state));
+
+        let post = |body: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/orders")
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8_lossy(&bytes).to_string())
+            }
+        };
+
+        let (status, text) = post(json!({
+            "symbol": "SOL/USDT", "side": "buy", "qty": 1.0,
+            "order_type": "limit", "limit_price": 130.0,
+        }))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let outcome: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(outcome["approved"], json!(true));
+        assert_eq!(outcome["status"], json!("accepted"));
+        let order_id = outcome["order_id"].as_str().unwrap().to_string();
+
+        // Resting is not a position: nothing is booked and no cash moved.
+        let orders = state.orders();
+        assert_eq!(orders.len(), 1);
+        assert!(orders[0].fills.is_empty());
+        assert!(state.portfolio().positions.is_empty());
+        assert_eq!(state.equity(), 10_000.0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/orders")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(listed[0]["order_id"], json!(order_id));
+        assert_eq!(listed[0]["venue"], json!("paper"));
+        assert_eq!(listed[0]["fills"], json!([]));
+
+        let cancel = |id: &str| {
+            let app = app.clone();
+            let uri = format!("/api/orders/{id}");
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("DELETE")
+                            .uri(uri)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8_lossy(&bytes).to_string())
+            }
+        };
+
+        let (status, text) = cancel(&order_id).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(state.orders()[0].status, OrderStatus::Cancelled);
+
+        // A second cancel is refused: the order is no longer resting.
+        let (status, text) = cancel(&order_id).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            text.contains("only a resting order can be cancelled"),
+            "{text}"
+        );
+
+        let (status, text) = cancel("does-not-exist").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("unknown order"), "{text}");
+
+        // A body that is not an object is a 422, not a panic.
+        let (status, _) = post(json!(5)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
         std::fs::remove_dir_all(&dir).ok();
     }

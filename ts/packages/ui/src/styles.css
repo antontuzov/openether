@@ -1601,6 +1601,54 @@ body::after {
   color: var(--fg-2);
 }
 
+/* ------------------------------------------------------------------- orders */
+
+.orders__rest {
+  color: var(--fg-3);
+  font-size: 10px;
+}
+
+.order-state {
+  display: inline-block;
+  min-width: 62px;
+  text-align: center;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--line-2);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  color: var(--fg-3);
+}
+
+.order-state--accepted {
+  color: var(--tint-acc);
+  border-color: color-mix(in srgb, var(--acc) 40%, transparent);
+  background: var(--acc-dim);
+}
+
+.order-state--partially_filled {
+  color: var(--tint-warn);
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+  background: var(--warn-dim);
+}
+
+.order-state--filled {
+  color: var(--tint-up);
+  border-color: color-mix(in srgb, var(--up) 40%, transparent);
+  background: var(--up-dim);
+}
+
+.order-state--rejected {
+  color: var(--tint-down);
+  border-color: color-mix(in srgb, var(--down) 40%, transparent);
+  background: var(--down-dim);
+}
+
+.orders__msg {
+  margin: 8px 12px 10px;
+}
+
 /* ------------------------------------------------------------------- footer */
 
 .foot {
