@@ -24,9 +24,12 @@ Read this before running anything.
   asks for live trading. The core also needs a valid, expiring arming record
   that the operator wrote from the CLI. See
   [Live trading](#live-trading).
-- **No broadcast path exists.** The wallet signs and logs; it never sends a
-  transaction. `dry_run` is `true` and `broadcast` is `false` in every response,
-  and the API refuses to sign at all if dry run is switched off.
+- **The wallet broadcasts only behind three gates.** A live transfer needs its
+  own on-chain arming record (separate from a venue's), a wallet that is not in
+  dry-run mode, and a transfer worth less than the armed cap at the current
+  gas-token price. Dry run is the default; `POST /api/wallet/broadcast` refuses
+  everything until an operator has done the ceremony in
+  [Sending coins](#sending-coins).
 - **The risk layer is absolute.** The agent has no tool, flag or prompt that
   reaches around it. See [Risk layer](#risk-layer).
 - **Protective exits live at the venue, not in the agent's head.** A stop or
@@ -70,7 +73,7 @@ flowchart TB
     BUS["Event bus"]
     RISK["Risk layer<br/>non-bypassable"]
     WASM["WASM strategy sandbox<br/>wasmtime, hot-swap"]
-    WAL["Encrypted keystore<br/>dry-run signing"]
+    WAL["Encrypted keystore<br/>dry-run or live signing"]
     EX["Connectors<br/>paper / Binance / Kraken / Hyperliquid"]
     BUS --> RISK --> EX
     WASM --> BUS
@@ -396,7 +399,7 @@ arm, then start the core. Re-order those and the arming is stale on purpose.
 | `arming_file_missing` | The path is set but there is no record. |
 | `arming_file_unreadable` | The record cannot be read or parsed. |
 | `arming_version_unsupported` | The record was written by a different build. |
-| `arming_venue_mismatch` | The record is for another venue. |
+| `arming_target_mismatch` | The record is for another venue, or the wallet's record is being used for a venue. |
 | `arming_confirmation_invalid` | The record was never confirmed. |
 | `arming_expired` | The record ran out. |
 | `arming_config_changed` | A risk limit changed after the arming was written. |
@@ -420,8 +423,10 @@ is not an advisory number. An order above it is refused with
 - **One-cancels-the-other is enforced by the paper venue only.** Binance and
   Kraken refuse a request that carries an `oco_group` rather than leave two
   exits live while claiming they are linked.
-- **On-chain transactions are still dry-run only.** The wallet signs and logs;
-  there is no broadcast path.
+- **The wallet's live path is separate from a venue's.** Arming `binance` says
+  nothing about the wallet: it needs `openether-live arm --target onchain`
+  *and* a keystore that is not in dry-run mode. See
+  [Sending coins](#sending-coins).
 
 ---
 
@@ -538,16 +543,53 @@ OPENETHER_EVM_TOKEN_WATCHLIST=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,0xdAC17
 **The wallet is not trading equity.** `PortfolioSnapshot.onchain_value_usd`
 reports the total, but every risk check — position caps, gross exposure,
 drawdown, the circuit breaker — still measures the trading account alone.
-There is no broadcast path, so an unspendable balance must never widen the
-limits of the account that can actually lose money. A test asserts exactly
-that: a $1,000,000 wallet leaves a $10,000 account's limits untouched.
+The wallet can move its own coins, but its balance must never widen the
+limits of the account that can lose money on an exchange. A test asserts
+exactly that: a $1,000,000 wallet leaves a $10,000 account's limits untouched.
 
-### What it still cannot do
+### Sending coins
 
-The wallet **signs and logs, it does not broadcast**. Every response carries
-`"dry_run": true` and `"broadcast": false`, and `wallet.rs` contains no HTTP
-client, no RPC client and no socket. On-chain transactions need a signer the
-operator controls.
+`wallet.rs` still contains no HTTP client, no RPC client and no socket: it
+signs the exact bytes it is handed. `broadcast.rs` assembles the EIP-1559
+transaction or the Solana system transfer, asks for a signature, verifies
+that the signature recovers to the wallet's own `from` address, and only then
+sends it. Three gates must all be open:
+
+1. **On-chain arming.** A separate record, written only by the CLI:
+   ```bash
+   printf 'I UNDERSTAND THIS MOVES REAL COINS\n' | \
+     ./rust/target/release/openether-live arm --target onchain \
+       --max-notional 100 --hours 4 --note "monthly transfer"
+   ```
+   Arming a venue does not arm the wallet, and vice versa. The record binds the
+   same risk-config digest, expires, and may only tighten the transfer cap.
+2. **No dry run.** `OPENETHER_WALLET_DRY_RUN=0` at start-up.
+3. **Under the cap.** The transfer is priced at the gas token's current DEX
+   price before anything is signed; an unpriced coin is refused rather than
+   treated as zero.
+
+```bash
+curl -s localhost:8080/api/wallet/broadcast -H 'content-type: application/json' -d '{
+  "network": "solana",
+  "to": "7xK…",
+  "amount_raw": 10000000,
+  "passphrase": "…"
+}'
+```
+
+`amount_raw` is wei or lamports. `max_fee_per_gas_wei` may tighten the core's
+own ceiling (`OPENETHER_BROADCAST_MAX_FEE_PER_GAS_WEI`, default 200 gwei).
+`GET /api/wallet/broadcasts` lists every transfer with its current state.
+
+A transfer moves `signed → submitted → confirmed` (EVM: 12 confirmations;
+Solana: `finalized` only). The reconciler re-reads it every 5 seconds and can
+take it through `reorged`, `dropped` or `failed`; a revert still pays its fee.
+The fee of a final transfer is booked as `wallet_gas_usd` on the portfolio and
+per chain in the holdings. Gas is a cost the wallet paid, never a change to the
+trading account's equity.
+
+**What it cannot do:** swap tokens or call a contract. This path only moves
+the chain's native coin to an address; DEX execution is a separate subsystem.
 
 ---
 
@@ -664,7 +706,9 @@ Copy `.env.example` to `.env`. The important defaults:
 | `OPENETHER_LIVE_TRADING` | `0` | asks for real orders; needs an arming record too |
 | `OPENETHER_LIVE_ARMING_FILE` | *(empty)* | path to the arming record written by `openether-live arm` |
 | `OPENETHER_VENUE` | `paper` | `paper` / `binance` / `kraken` / `hyperliquid` (read-only) |
-| `OPENETHER_WALLET_DRY_RUN` | `1` | sign and log, never broadcast |
+| `OPENETHER_WALLET_DRY_RUN` | `1` | `0` allows live signing; still needs the on-chain arming |
+| `OPENETHER_BROADCAST_MAX_FEE_PER_GAS_WEI` | `200000000000` | most wei per gas the core will ever pay |
+| `SOLANA_RPC_URL` / `ETHEREUM_RPC_URL` / `BASE_RPC_URL` | public nodes | the networks a live transfer can reach |
 | `OPENETHER_WALLET_ACCOUNTS` | `5` | accounts per chain in an HD keystore |
 | `OPENETHER_EVM_TOKEN_WATCHLIST` | *(empty)* | ERC-20 contracts to value, comma-separated |
 | `OPENETHER_PRICE_FEED_URL` | `https://api.dexscreener.com` | DEX feed used to price wallet holdings |
@@ -681,9 +725,9 @@ Exchange credentials are only read when live trading is armed. `.env`,
 `GET /healthz`, `/metrics`, `/api/config`, `/api/portfolio`, `/api/positions`,
 `/api/orders`, `/api/trades`, `/api/logs`, `/api/ticks`, `/api/risk`,
 `/api/risk/decisions`, `/api/risk/rules`, `/api/strategy`, `/api/venues`,
-`/api/wallet`, `/api/wallet/holdings`, `/api/live`;
+`/api/wallet`, `/api/wallet/holdings`, `/api/wallet/broadcasts`, `/api/live`;
 `POST /api/orders`, `/api/logs`, `/api/onchain`, `/api/strategy/reload`,
-`/api/breaker/reset`, `/api/wallet/sign-dry-run`;
+`/api/breaker/reset`, `/api/wallet/sign-dry-run`, `/api/wallet/broadcast`;
 `DELETE /api/orders/{order_id}` to cancel a resting order;
 `GET /ws` for the live stream. Full shapes in [docs/api-contract.md](docs/api-contract.md).
 
@@ -693,10 +737,13 @@ Exchange credentials are only read when live trading is armed. `.env`,
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **185 passing**, including the encrypted keystore,
-  EVM and Solana dry-run signing, signature tampering, wrong-passphrase
-  rejection, and the API refusing to sign when dry run is off. Two further
-  tests are `#[ignore]`d because they need the network; both pass when run.
+- `cargo test --workspace` — **214 passing**, including the encrypted keystore,
+  EVM and Solana dry-run signing, live signing recovered against the wallet
+  address, signature tampering, wrong-passphrase rejection, and the API
+  refusing to sign when dry run is off. The broadcaster suite covers EIP-1559
+  encoding and hashing, fee ceilings, consecutive nonces, reorgs, replacement,
+  revert fees and Solana finality. Two further tests are `#[ignore]`d because
+  they need the network; both pass when run.
 - The live-trading arming ceremony exercised end to end against the real
   binaries: the env var alone arms nothing; arming without the confirmation
   phrase is refused; arming writes a record that flips `GET /api/live` to
@@ -808,10 +855,11 @@ Checked locally on macOS (arm64):
   keystore: `configured: true`, both chains, live SOL and ETH prices, and
   `onchain_value_usd` on `/api/portfolio` without touching equity.
 
-**Not verified:** live exchange connections (no credentials were used), real
-on-chain transactions (no broadcast path exists), and the <10µs dispatch target
-on your hardware. Grafana and Prometheus configs are provided but were not run
-against a live scrape here.
+**Not verified:** live exchange connections (no credentials were used), a
+transfer broadcast to a public chain (the broadcast path was exercised against
+a mock JSON-RPC node with a real keystore, an on-chain arming record and real
+signatures), and the <10µs dispatch target on your hardware. Grafana and
+Prometheus configs are provided but were not run against a live scrape here.
 
 Bugs found and fixed during that verification:
 

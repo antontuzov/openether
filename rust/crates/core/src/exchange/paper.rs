@@ -582,6 +582,7 @@ impl PaperConnector {
                 0.0
             },
             onchain_value_usd: 0.0,
+            wallet_gas_usd: 0.0,
             positions,
             ts_ms: ts,
         }

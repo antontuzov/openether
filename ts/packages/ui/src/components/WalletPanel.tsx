@@ -103,9 +103,10 @@ function ChainBlock({ chain }: { chain: ChainHoldings }) {
  * The on-chain wallet, valued but not traded.
  *
  * The engine reads these balances from the chain and prices them from the DEX
- * feed without ever unlocking the keystore. There is no broadcast path, so the
- * risk layer keeps measuring equity on the trading account alone — this panel
- * says so rather than letting the two numbers look like one pot of money.
+ * feed without ever unlocking the keystore. The wallet's own transfers are not
+ * trading equity, so the risk layer keeps measuring equity on the trading
+ * account alone — this panel says so rather than letting the two numbers look
+ * like one pot of money.
  */
 export function WalletPanel({ wallet }: WalletPanelProps) {
   const hint = !wallet

@@ -39,13 +39,20 @@ pub const LIVE_ENV: &str = "OPENETHER_LIVE_TRADING";
 pub const CONFIRMATION_PHRASE: &str = "I UNDERSTAND THIS SENDS REAL ORDERS";
 /// The longest an arming may stay valid.
 pub const MAX_ARMING_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+/// The target that arms the on-chain wallet.
+///
+/// A transfer is not an order, so it cannot ride on a venue's arming record:
+/// moving coins out of the wallet is armed separately, with its own record,
+/// its own expiry and its own cap.
+pub const ONCHAIN_TARGET: &str = "onchain";
 
 /// The record that arms live trading.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveArming {
     /// The record format version.
     pub version: u16,
-    /// The venue the operator armed, e.g. `binance`.
+    /// The target the operator armed: a venue (`binance`), or `onchain` for
+    /// the wallet.
     pub venue: String,
     /// When the record was written.
     pub armed_at_ms: i64,
@@ -209,6 +216,51 @@ pub fn arm(
     if !venue.trades_live() {
         return Err(LiveArmError::UnsupportedVenue(venue.as_str().to_string()));
     }
+    write_record(
+        path,
+        venue.as_str(),
+        risk,
+        max_order_notional_usd,
+        window_ms,
+        confirmation,
+        operator_note,
+    )
+}
+
+/// Arms the on-chain wallet.
+///
+/// This is the same ceremony as [`arm`], with the same cap and the same
+/// expiry, but it writes a record whose target is [`ONCHAIN_TARGET`]. A record
+/// that arms a venue does not arm the wallet, because placing an order and
+/// moving coins out of the wallet are different acts.
+pub fn arm_onchain(
+    path: &Path,
+    risk: &RiskConfig,
+    max_transfer_notional_usd: f64,
+    window_ms: i64,
+    confirmation: &str,
+    operator_note: &str,
+) -> Result<LiveArming, LiveArmError> {
+    write_record(
+        path,
+        ONCHAIN_TARGET,
+        risk,
+        max_transfer_notional_usd,
+        window_ms,
+        confirmation,
+        operator_note,
+    )
+}
+
+fn write_record(
+    path: &Path,
+    target: &str,
+    risk: &RiskConfig,
+    max_order_notional_usd: f64,
+    window_ms: i64,
+    confirmation: &str,
+    operator_note: &str,
+) -> Result<LiveArming, LiveArmError> {
     if confirmation.trim() != CONFIRMATION_PHRASE {
         return Err(LiveArmError::BadConfirmation);
     }
@@ -228,10 +280,10 @@ pub fn arm(
     let now = now_ms();
     let record = LiveArming {
         version: ARMING_VERSION,
-        venue: venue.as_str().to_string(),
+        venue: target.to_string(),
         armed_at_ms: now,
         expires_at_ms: now + window_ms,
-        config_digest: config_digest(venue.as_str(), risk),
+        config_digest: config_digest(target, risk),
         max_order_notional_usd,
         confirmation: confirmation.trim().to_string(),
         operator_note: operator_note.trim().to_string(),
@@ -295,7 +347,7 @@ pub fn evaluate(venue: Venue, risk: &RiskConfig) -> LiveArmingState {
     evaluate_at(arming_path().as_deref(), venue, risk, live_requested())
 }
 
-/// The decision, with every input spelled out.
+/// The decision for a venue, with every input spelled out.
 ///
 /// Splitting this out keeps the rule testable without touching the
 /// environment, which would otherwise make the tests race each other.
@@ -305,12 +357,41 @@ pub fn evaluate_at(
     risk: &RiskConfig,
     requested: bool,
 ) -> LiveArmingState {
+    evaluate_target_at(path, venue.as_str(), risk, requested)
+}
+
+/// The decision for the on-chain wallet.
+pub fn evaluate_onchain(risk: &RiskConfig) -> LiveArmingState {
+    evaluate_onchain_at(arming_path().as_deref(), risk, live_requested())
+}
+
+/// The on-chain decision, with the path and the request supplied.
+pub fn evaluate_onchain_at(
+    path: Option<&Path>,
+    risk: &RiskConfig,
+    requested: bool,
+) -> LiveArmingState {
+    evaluate_target_at(path, ONCHAIN_TARGET, risk, requested)
+}
+
+/// The decision for whatever a record names: a venue, or `onchain`.
+fn evaluate_target_at(
+    path: Option<&Path>,
+    target: &str,
+    risk: &RiskConfig,
+    requested: bool,
+) -> LiveArmingState {
     let effective_cap = risk.max_order_notional_usd;
+    let noun = if target == ONCHAIN_TARGET {
+        "transfers"
+    } else {
+        "trading"
+    };
     let Some(path) = path else {
         let mut state = LiveArmingState::not_armed(
             "arming_file_unset",
             format!(
-                "live trading is off: {ARMING_ENV} is not set. Run `openether-live arm` to arm it."
+                "live {noun} is off: {ARMING_ENV} is not set. Run `openether-live arm` to arm it."
             ),
         );
         state.effective_max_order_notional_usd = effective_cap;
@@ -323,7 +404,7 @@ pub fn evaluate_at(
             let mut state = LiveArmingState::not_armed(
                 "arming_file_missing",
                 format!(
-                    "live trading is off: the arming record {} does not exist. Run `openether-live arm` to arm it.",
+                    "live {noun} is off: the arming record {} does not exist. Run `openether-live arm` to arm it.",
                     path.display()
                 ),
             );
@@ -333,7 +414,7 @@ pub fn evaluate_at(
         Err(error) => {
             let mut state = LiveArmingState::not_armed(
                 "arming_file_unreadable",
-                format!("live trading is off: the arming record cannot be read: {error}"),
+                format!("live {noun} is off: the arming record cannot be read: {error}"),
             );
             state.effective_max_order_notional_usd = effective_cap;
             return state;
@@ -344,7 +425,7 @@ pub fn evaluate_at(
         let mut state = LiveArmingState::not_armed(
             "arming_version_unsupported",
             format!(
-                "live trading is off: the arming record is version {}, this build understands {ARMING_VERSION}",
+                "live {noun} is off: the arming record is version {}, this build understands {ARMING_VERSION}",
                 record.version
             ),
         );
@@ -353,13 +434,12 @@ pub fn evaluate_at(
         return state;
     }
 
-    if record.venue != venue.as_str() {
+    if record.venue != target {
         let mut state = LiveArmingState::not_armed(
-            "arming_venue_mismatch",
+            "arming_target_mismatch",
             format!(
-                "live trading is off: the arming record is for the venue {}, the core runs {}",
-                record.venue,
-                venue.as_str()
+                "live {noun} is off: the arming record is for {}, not {target}",
+                record.venue
             ),
         );
         state.record = Some(record);
@@ -370,7 +450,7 @@ pub fn evaluate_at(
     if record.confirmation != CONFIRMATION_PHRASE {
         let mut state = LiveArmingState::not_armed(
             "arming_confirmation_invalid",
-            "live trading is off: the arming record was not confirmed by the operator".to_string(),
+            format!("live {noun} is off: the arming record was not confirmed by the operator"),
         );
         state.record = Some(record);
         state.effective_max_order_notional_usd = effective_cap;
@@ -382,7 +462,7 @@ pub fn evaluate_at(
         let mut state = LiveArmingState::not_armed(
             "arming_expired",
             format!(
-                "live trading is off: the arming record expired at {}. Run `openether-live arm` again.",
+                "live {noun} is off: the arming record expired at {}. Run `openether-live arm` again.",
                 record.expires_at_ms
             ),
         );
@@ -391,11 +471,11 @@ pub fn evaluate_at(
         return state;
     }
 
-    let digest = config_digest(venue.as_str(), risk);
+    let digest = config_digest(target, risk);
     if digest != record.config_digest {
         let mut state = LiveArmingState::not_armed(
             "arming_config_changed",
-            "live trading is off: the risk configuration changed after the arming was written. Arm it again.".to_string(),
+            format!("live {noun} is off: the risk configuration changed after the arming was written. Arm it again."),
         );
         state.record = Some(record);
         state.effective_max_order_notional_usd = effective_cap;
@@ -406,7 +486,7 @@ pub fn evaluate_at(
         let mut state = LiveArmingState::not_armed(
             "live_not_requested",
             format!(
-                "live trading is off: {LIVE_ENV} is not set. The arming record is valid, but live trading was not requested."
+                "live {noun} is off: {LIVE_ENV} is not set. The arming record is valid, but live {noun} was not requested."
             ),
         );
         state.record = Some(record);
@@ -656,7 +736,51 @@ mod tests {
         .unwrap();
         let state = evaluate_at(Some(&path), Venue::Kraken, &risk(), true);
         assert!(!state.live_enabled);
-        assert_eq!(state.reason, Some("arming_venue_mismatch"));
+        assert_eq!(state.reason, Some("arming_target_mismatch"));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn an_onchain_arming_is_separate_from_a_venue_arming() {
+        let path = temp_path("onchain-separate");
+        arm_onchain(&path, &risk(), 100.0, 60_000, CONFIRMATION_PHRASE, "wallet").unwrap();
+
+        // The record arms the wallet, not Binance.
+        let venue = evaluate_at(Some(&path), Venue::Binance, &risk(), true);
+        assert!(!venue.live_enabled);
+        assert_eq!(venue.reason, Some("arming_target_mismatch"));
+
+        let wallet = evaluate_onchain_at(Some(&path), &risk(), true);
+        assert!(wallet.live_enabled);
+        assert_eq!(wallet.effective_max_order_notional_usd, 100.0);
+
+        // A venue record does not arm the wallet either.
+        let venue_path = temp_path("onchain-venue");
+        arm(
+            &venue_path,
+            Venue::Binance,
+            &risk(),
+            100.0,
+            60_000,
+            CONFIRMATION_PHRASE,
+            "",
+        )
+        .unwrap();
+        let wallet = evaluate_onchain_at(Some(&venue_path), &risk(), true);
+        assert!(!wallet.live_enabled);
+        assert_eq!(wallet.reason, Some("arming_target_mismatch"));
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        std::fs::remove_dir_all(venue_path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn an_onchain_arming_may_only_tighten_the_notional_cap() {
+        let path = temp_path("onchain-tighten");
+        let error =
+            arm_onchain(&path, &risk(), 9_999_999.0, 60_000, CONFIRMATION_PHRASE, "").unwrap_err();
+        assert!(matches!(error, LiveArmError::LoosensLimit(_, _)));
+        assert!(!path.exists());
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

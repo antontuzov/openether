@@ -1,4 +1,5 @@
-use crate::engine::AppState;
+use crate::broadcast::BroadcastError;
+use crate::engine::{AppState, TransferError};
 use crate::holdings::WalletHoldings;
 use crate::types::*;
 use crate::wallet::{AccountSelector, TxEnvelope, WalletError, WalletService};
@@ -44,6 +45,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/wallet", get(wallet_metadata))
         .route("/api/wallet/holdings", get(wallet_holdings))
         .route("/api/wallet/sign-dry-run", post(wallet_sign_dry_run))
+        .route("/api/wallet/broadcast", post(wallet_broadcast))
+        .route("/api/wallet/broadcasts", get(wallet_broadcasts))
         .route("/api/live", get(live_status))
         .route("/ws", get(ws_handler))
         .layer(Extension(wallet))
@@ -77,6 +80,8 @@ async fn config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "venue": cfg.venue.as_str(),
         "live_trading": cfg.live_trading,
         "live_arming": live_arming_json(&cfg.live_arming),
+        "onchain_live": cfg.onchain_live,
+        "onchain_arming": live_arming_json(&cfg.onchain_arming),
         "symbols": cfg.symbols,
         "risk": {
             "max_position_pct_of_equity": cfg.risk.max_position_pct_of_equity,
@@ -106,6 +111,18 @@ async fn live_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
         "live_trading": cfg.live_trading,
         "venue": cfg.venue.as_str(),
         "arming": live_arming_json(&cfg.live_arming),
+        // The wallet is armed separately: a venue record does not move coins.
+        "onchain": {
+            "live_enabled": cfg.onchain_live,
+            "arming": live_arming_json(&cfg.onchain_arming),
+            "dry_run": cfg.wallet.dry_run,
+            "networks": state
+                .broadcaster
+                .as_ref()
+                .map(|b| b.networks())
+                .unwrap_or_default(),
+            "gas_ceiling_wei": cfg.broadcast_max_fee_per_gas_wei.to_string(),
+        },
     }))
 }
 
@@ -460,6 +477,152 @@ async fn wallet_sign_dry_run(
     }
 }
 
+/// `POST /api/wallet/broadcast`
+///
+/// Moves coins out of the wallet on a real chain. This is the only path that
+/// broadcasts, and it is gated on three things the caller cannot override:
+/// a valid on-chain arming record, a wallet that is not in dry-run mode, and a
+/// transfer worth less than the armed cap at the current gas-token price.
+///
+/// The passphrase arrives in the body, is used for one signature and is wiped
+/// before the response is sent.
+#[derive(Deserialize)]
+struct WalletBroadcastRequest {
+    /// `ethereum`, `base` or `solana`.
+    network: String,
+    /// The destination address (EVM hex or Solana base58).
+    to: String,
+    /// The amount in the chain's smallest unit: wei or lamports.
+    amount_raw: u64,
+    /// A per-gas ceiling in wei. It may only tighten the core's own ceiling.
+    #[serde(default)]
+    max_fee_per_gas_wei: Option<u64>,
+    passphrase: String,
+    /// Which account signs. Omitted means the primary account.
+    #[serde(default)]
+    account: AccountSelector,
+}
+
+async fn wallet_broadcast(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<WalletBroadcastRequest>,
+) -> Response {
+    let passphrase = Zeroizing::new(request.passphrase);
+    match state
+        .broadcast_transfer(
+            &request.network,
+            &request.to,
+            request.amount_raw,
+            request.max_fee_per_gas_wei.map(u128::from),
+            &passphrase,
+            request.account,
+        )
+        .await
+    {
+        Ok(receipt) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "broadcast": receipt.broadcast,
+                "notional_usd": receipt.notional_usd,
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            let status = transfer_error_status(&error);
+            (
+                status,
+                Json(json!({
+                    "ok": false,
+                    "error": error.to_string(),
+                    "code": transfer_error_code(&error),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /api/wallet/broadcasts`
+///
+/// Every transfer this core signed, newest first, plus the state of the
+/// broadcast path: whether it is armed, whether the wallet is dry-run, which
+/// networks have an RPC url and the cap the next transfer is measured against.
+#[derive(Deserialize)]
+struct BroadcastsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn wallet_broadcasts(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BroadcastsQuery>,
+) -> Json<serde_json::Value> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let cfg = &state.config;
+    Json(json!({
+        "broadcasts": state.broadcasts(limit),
+        "onchain_live": cfg.onchain_live,
+        "dry_run": cfg.wallet.dry_run,
+        "networks": state
+            .broadcaster
+            .as_ref()
+            .map(|b| b.networks())
+            .unwrap_or_default(),
+        "effective_max_transfer_notional_usd": cfg.onchain_arming.effective_max_order_notional_usd,
+        "gas_ceiling_wei": cfg.broadcast_max_fee_per_gas_wei.to_string(),
+    }))
+}
+
+fn transfer_error_status(error: &TransferError) -> StatusCode {
+    match error {
+        TransferError::NotArmed(_) => StatusCode::FORBIDDEN,
+        TransferError::DryRun => StatusCode::CONFLICT,
+        TransferError::NotConfigured
+        | TransferError::NetworkNotConfigured(_)
+        | TransferError::UnsupportedNetwork(_) => StatusCode::BAD_REQUEST,
+        TransferError::Unpriced(_) | TransferError::AboveCap(..) => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        TransferError::Wallet(error) => wallet_error_status(error),
+        TransferError::Broadcast(error) => broadcast_error_status(error),
+    }
+}
+
+fn transfer_error_code(error: &TransferError) -> &'static str {
+    match error {
+        TransferError::NotArmed(_) => "onchain_not_armed",
+        TransferError::DryRun => "wallet_dry_run",
+        TransferError::NotConfigured => "broadcast_not_configured",
+        TransferError::NetworkNotConfigured(_) => "network_not_configured",
+        TransferError::UnsupportedNetwork(_) => "unsupported_network",
+        TransferError::Unpriced(_) => "transfer_unpriced",
+        TransferError::AboveCap(..) => "transfer_above_cap",
+        TransferError::Wallet(error) => wallet_error_code(error),
+        TransferError::Broadcast(error) => broadcast_error_code(error),
+    }
+}
+
+fn broadcast_error_status(error: &BroadcastError) -> StatusCode {
+    match error {
+        BroadcastError::Rpc(_) => StatusCode::BAD_GATEWAY,
+        BroadcastError::Signer(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+fn broadcast_error_code(error: &BroadcastError) -> &'static str {
+    match error {
+        BroadcastError::NetworkNotConfigured(_) => "network_not_configured",
+        BroadcastError::Rpc(_) => "rpc_error",
+        BroadcastError::InvalidRequest(_) => "invalid_transfer",
+        BroadcastError::FeeCeilingTooLow(..) => "fee_ceiling_too_low",
+        BroadcastError::SignerMismatch(..) => "signer_mismatch",
+        BroadcastError::HashMismatch(..) => "hash_mismatch",
+        BroadcastError::Signer(_) => "wallet_signing_failed",
+    }
+}
+
 fn wallet_error_status(error: &WalletError) -> StatusCode {
     match error {
         WalletError::InvalidPassphrase => StatusCode::UNAUTHORIZED,
@@ -467,7 +630,8 @@ fn wallet_error_status(error: &WalletError) -> StatusCode {
         WalletError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         WalletError::DecryptFailed | WalletError::SignatureInvalid => StatusCode::BAD_REQUEST,
         WalletError::NotConfigured
-        | WalletError::LiveBroadcastUnsupported
+        | WalletError::DryRunDisabled
+        | WalletError::LiveSigningDisabled
         | WalletError::ChainMismatch { .. }
         | WalletError::AccountNotFound(_)
         | WalletError::InvalidKey
@@ -483,7 +647,8 @@ fn wallet_error_code(error: &WalletError) -> &'static str {
         WalletError::LeaseExpired => "wallet_lease_expired",
         WalletError::InvalidPassphrase => "invalid_passphrase",
         WalletError::DecryptFailed => "keystore_decrypt_failed",
-        WalletError::LiveBroadcastUnsupported => "live_broadcast_unsupported",
+        WalletError::DryRunDisabled => "wallet_dry_run_disabled",
+        WalletError::LiveSigningDisabled => "wallet_live_signing_disabled",
         WalletError::ChainMismatch { .. } => "chain_mismatch",
         WalletError::AccountNotFound(_) => "account_not_found",
         WalletError::InvalidKey => "invalid_key",

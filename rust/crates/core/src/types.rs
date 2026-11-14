@@ -412,11 +412,16 @@ pub struct PortfolioSnapshot {
     /// The value of the on-chain wallet, in dollars.
     ///
     /// It is reported, not traded: the risk layer still measures equity on the
-    /// trading account alone, because there is no broadcast path for the
-    /// wallet yet. Mixing the two would let an unspendable balance widen the
-    /// limits of the account that can actually lose money.
+    /// trading account alone. Mixing the two would let a balance the trading
+    /// account cannot lose widen the limits of the account that can.
     #[serde(default)]
     pub onchain_value_usd: f64,
+    /// What the wallet has spent on gas, in dollars.
+    ///
+    /// Gas is a cost the on-chain wallet paid, so it is reported next to the
+    /// wallet value rather than folded into the trading account's equity.
+    #[serde(default)]
+    pub wallet_gas_usd: f64,
     pub positions: Vec<Position>,
     pub ts_ms: i64,
 }

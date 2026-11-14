@@ -7,11 +7,20 @@
 //! * the unlocked key is wrapped in [`zeroize::Zeroizing`] so it is wiped from
 //!   memory as soon as it is dropped,
 //! * an *unlock lease* bounds how long an unlocked key may stay resident, and
-//! * the only signing path in this module is a dry run. **There is no
-//!   broadcast function and no networking code in this file at all** — the
-//!   module has no HTTP client, no RPC client and no socket. A signed
-//!   transaction is a local artefact that the operator can inspect and hand
-//!   to a signer themselves.
+//! * signing is the only thing this module does with a key. **There is no
+//!   networking code in this file at all** — no HTTP client, no RPC client and
+//!   no socket. The broadcaster in [`crate::broadcast`] assembles a
+//!   transaction and asks this module for a signature; the key itself never
+//!   leaves.
+//!
+//! Two signing paths exist and they do not mix:
+//!
+//! * [`WalletService::sign_dry_run`] signs a canonical envelope that no chain
+//!   accepts. It is the inspection path, and it only works while the wallet is
+//!   in dry-run mode.
+//! * [`WalletService::sign_live`] signs the exact bytes a chain will verify
+//!   (an EIP-1559 signing hash, or a serialised Solana message). It requires
+//!   `dry_run == false`, a live arming record and the on-chain broadcast path.
 //!
 //! # Keystore file format
 //!
@@ -94,8 +103,15 @@
 //!
 //! The canonical bytes are *not* RLP and *not* a Solana transaction message.
 //! The signature therefore proves that the operator signed exactly the
-//! envelope that is returned, but it is not directly broadcastable — this
-//! build has no broadcast path at all.
+//! envelope that is returned, and it is never broadcast: the dry-run path is
+//! a provenance record, not a transaction.
+//!
+//! Live broadcasting uses a second path. `sign_live` takes the exact bytes the
+//! chain will hash — the EIP-1559 signing hash or the Solana message — and
+//! returns a signature over them. That signature is handed to
+//! [`crate::broadcast`], which assembles the envelope, verifies the signature
+//! recovers to the wallet's own address and sends it. The two paths never
+//! mix, and this module still holds no socket.
 
 use crate::config::WalletConfig;
 use crate::hd::{DerivationPath, HdWallet};
@@ -159,8 +175,10 @@ pub enum WalletError {
     InvalidPassphrase,
     #[error("the keystore could not be decrypted: it is corrupt or was tampered with")]
     DecryptFailed,
-    #[error("live broadcast is not supported in this build; only dry-run signing is available")]
-    LiveBroadcastUnsupported,
+    #[error("this wallet signs live transactions; the dry-run path is disabled")]
+    DryRunDisabled,
+    #[error("this wallet is in dry-run mode; live signing is disabled")]
+    LiveSigningDisabled,
     #[error("chain mismatch: the keystore holds a {keystore} key but the envelope is {envelope}")]
     ChainMismatch {
         keystore: &'static str,
@@ -493,8 +511,9 @@ impl TxEnvelope {
 
 /// The result of a dry-run signature.
 ///
-/// `broadcast` is always `false` and `dry_run` is always `true`: this build
-/// has no code path that could send a transaction anywhere.
+/// `broadcast` is always `false` and `dry_run` is always `true`: this is the
+/// provenance artefact. Live signing returns a [`LiveSignature`] over exact
+/// chain bytes instead, and the transaction is sent by [`crate::broadcast`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DryRunSignature {
     /// Always `true`.
@@ -519,6 +538,23 @@ pub struct DryRunSignature {
     pub signed_at_ms: i64,
     /// Human readable reminder that nothing was sent.
     pub note: String,
+}
+
+/// A signature over a transaction the broadcaster assembled.
+///
+/// Only public material leaves the wallet: the signature, the address that
+/// produced it and its public key. The key itself never leaves.
+#[derive(Debug, Clone)]
+pub struct LiveSignature {
+    pub chain: Chain,
+    pub address: String,
+    pub public_key: String,
+    /// EVM: `r || s || y_parity` (65 bytes). Solana: the 64 byte Ed25519
+    /// signature over the message.
+    pub signature: Vec<u8>,
+    /// The account that signed.
+    pub account: AccountEntry,
+    pub signed_at_ms: i64,
 }
 
 /// An unlocked key with a hard expiry.
@@ -627,6 +663,43 @@ impl WalletService {
         }
     }
 
+    /// `true` when the wallet refuses to sign live transactions.
+    pub fn dry_run(&self) -> bool {
+        self.config.dry_run
+    }
+
+    /// The address of an account, read from the keystore header.
+    ///
+    /// Public data: the header is stored in clear text precisely so that the
+    /// engine can look at its own wallet without unlocking anything. No key
+    /// material is touched.
+    pub fn address_for(&self, chain: Chain, index: u32) -> Result<AccountEntry, WalletError> {
+        let keystore = self.keystore.as_ref().ok_or(WalletError::NotConfigured)?;
+        let label = chain_label(chain);
+        if let Some(account) = keystore
+            .accounts
+            .iter()
+            .find(|a| a.chain == label && a.index == index)
+        {
+            return Ok(account.clone());
+        }
+        // A single-key keystore still describes its one account in the
+        // header, even if an older file has an empty account list.
+        if index == 0 && keystore.chain == label {
+            return Ok(AccountEntry {
+                chain: keystore.chain.clone(),
+                index: 0,
+                path: String::new(),
+                address: keystore.address.clone(),
+                public_key: keystore.public_key.clone(),
+            });
+        }
+        Err(WalletError::AccountNotFound(format!(
+            "no {} account at index {index}",
+            label
+        )))
+    }
+
     /// Unlocks the keystore and starts an unlock lease.
     ///
     /// The lease expires after `unlock_timeout_ms`; the key is then wiped from
@@ -710,7 +783,7 @@ impl WalletService {
         selector: &AccountSelector,
     ) -> Result<DryRunSignature, WalletError> {
         if !self.config.dry_run {
-            return Err(WalletError::LiveBroadcastUnsupported);
+            return Err(WalletError::DryRunDisabled);
         }
         let now = now_ms();
         let mut state = self.lock_lease();
@@ -748,12 +821,67 @@ impl WalletService {
         selector: &AccountSelector,
     ) -> Result<DryRunSignature, WalletError> {
         if !self.config.dry_run {
-            return Err(WalletError::LiveBroadcastUnsupported);
+            return Err(WalletError::DryRunDisabled);
         }
         let keystore = self.keystore.as_ref().ok_or(WalletError::NotConfigured)?;
         let material = open_keystore(keystore, passphrase)?;
         let material = lease_material(material)?;
         sign_with_material(keystore, &material, selector, envelope)
+    }
+
+    /// Signs a transaction the broadcaster built.
+    ///
+    /// The wallet never hands out the key: the caller passes the bytes that
+    /// need signing and receives a signature and the address that produced it.
+    /// Refused unless the wallet is configured for live use, and refused by the
+    /// lease unless a key is unlocked.
+    pub fn sign_live(
+        &self,
+        chain: Chain,
+        selector: &AccountSelector,
+        preimage: &[u8],
+    ) -> Result<LiveSignature, WalletError> {
+        if self.config.dry_run {
+            return Err(WalletError::LiveSigningDisabled);
+        }
+        let now = now_ms();
+        let mut state = self.lock_lease();
+        let expired = state
+            .lease
+            .as_ref()
+            .map(|lease| now >= lease.expires_at_ms)
+            .unwrap_or(false);
+        if expired {
+            state.lease = None;
+            state.expired = true;
+            return Err(WalletError::LeaseExpired);
+        }
+        let Some(lease) = state.lease.as_ref() else {
+            return Err(if state.expired {
+                WalletError::LeaseExpired
+            } else {
+                WalletError::NotUnlocked
+            });
+        };
+        let keystore = self.keystore.as_ref().ok_or(WalletError::NotConfigured)?;
+        sign_live_with_material(keystore, &lease.material, chain, selector, preimage)
+    }
+
+    /// Signs a live transaction with a passphrase, wiping the key immediately.
+    pub fn sign_live_with_passphrase(
+        &self,
+        passphrase: &str,
+        chain: Chain,
+        selector: &AccountSelector,
+        preimage: &[u8],
+    ) -> Result<LiveSignature, WalletError> {
+        if self.config.dry_run {
+            return Err(WalletError::LiveSigningDisabled);
+        }
+        let keystore = self.keystore.as_ref().ok_or(WalletError::NotConfigured)?;
+        let material = open_keystore(keystore, passphrase)?;
+        let material = lease_material(material)?;
+        sign_live_with_material(keystore, &material, chain, selector, preimage)
     }
 
     fn lock_lease(&self) -> std::sync::MutexGuard<'_, LeaseState> {
@@ -1062,6 +1190,136 @@ fn sign_with_material(
             )
         }
     }
+}
+
+/// Picks the account that signs a live transaction and signs the preimage.
+fn sign_live_with_material(
+    file: &KeystoreFile,
+    material: &LeaseMaterial,
+    chain: Chain,
+    selector: &AccountSelector,
+    preimage: &[u8],
+) -> Result<LiveSignature, WalletError> {
+    if let Some(label) = &selector.chain {
+        let selected = parse_chain_label(label)
+            .ok_or_else(|| WalletError::UnsupportedFormat(format!("unknown chain: {label}")))?;
+        if selected != chain {
+            return Err(WalletError::ChainMismatch {
+                keystore: chain_label(selected),
+                envelope: chain_label(chain),
+            });
+        }
+    }
+    let index = selector.index.unwrap_or(0);
+    if file.wallet_type.as_str() != WALLET_TYPE_HD {
+        let held = parse_chain_label(&file.chain).ok_or_else(|| {
+            WalletError::UnsupportedFormat(format!("unknown chain: {}", file.chain))
+        })?;
+        if held != chain {
+            return Err(WalletError::ChainMismatch {
+                keystore: chain_label(held),
+                envelope: chain_label(chain),
+            });
+        }
+        if index != 0 {
+            return Err(WalletError::AccountNotFound(format!(
+                "the keystore holds a single {} account",
+                chain_label(chain)
+            )));
+        }
+    } else if !file
+        .accounts
+        .iter()
+        .any(|a| a.chain == chain_label(chain) && a.index == index)
+    {
+        return Err(WalletError::AccountNotFound(format!(
+            "no {} account at index {index}",
+            chain_label(chain)
+        )));
+    }
+
+    match material {
+        LeaseMaterial::Single(secret) => {
+            sign_live_with_secret(chain, &secret.bytes[..], preimage, index, String::new())
+        }
+        LeaseMaterial::Hd(wallet) => {
+            let key = derive_hd_key(wallet, chain, index)?;
+            let (_, address) = derive_public(chain, &key[..])?;
+            check_against_header(file, chain, index, &address)?;
+            sign_live_with_secret(
+                chain,
+                &key[..],
+                preimage,
+                index,
+                path_for(chain, index).to_string(),
+            )
+        }
+    }
+}
+
+/// Signs the bytes a live transaction needs signed.
+fn sign_live_with_secret(
+    chain: Chain,
+    secret: &[u8],
+    preimage: &[u8],
+    index: u32,
+    path: String,
+) -> Result<LiveSignature, WalletError> {
+    let (public_key, address, signature) = match chain {
+        Chain::Evm => {
+            // The preimage is the EIP-1559 signing hash. It is signed as-is:
+            // hashing it again would produce a signature no EVM can recover.
+            let digest: [u8; 32] = preimage.try_into().map_err(|_| {
+                WalletError::InvalidEnvelope(
+                    "an evm preimage must be the 32 byte signing hash".into(),
+                )
+            })?;
+            let signing = evm_signing_key(secret)?;
+            let (sig, recovery) = signing
+                .sign_prehash_recoverable(&digest)
+                .map_err(|_| WalletError::InvalidKey)?;
+            let mut bytes = [0u8; 65];
+            bytes[..32].copy_from_slice(&sig.r().to_bytes());
+            bytes[32..64].copy_from_slice(&sig.s().to_bytes());
+            bytes[64] = recovery.to_byte();
+            let point = signing.verifying_key().to_encoded_point(false);
+            (
+                format!("0x{}", hex::encode(point.as_bytes())),
+                evm_address(point.as_bytes()),
+                bytes.to_vec(),
+            )
+        }
+        Chain::Solana => {
+            if preimage.is_empty() {
+                return Err(WalletError::InvalidEnvelope(
+                    "a solana preimage must be the serialised message".into(),
+                ));
+            }
+            let signing = solana_signing_key(secret)?;
+            let signature = signing.sign(preimage);
+            let public_bytes = signing.verifying_key().to_bytes();
+            (
+                hex::encode(public_bytes),
+                bs58::encode(public_bytes).into_string(),
+                signature.to_bytes().to_vec(),
+            )
+        }
+    };
+
+    Ok(LiveSignature {
+        chain,
+        address: address.clone(),
+        public_key: public_key.clone(),
+        signature,
+        account: AccountEntry {
+            chain: chain_label(chain).to_string(),
+            index,
+            path,
+            address,
+            public_key,
+        },
+        signed_at_ms: now_ms(),
+    })
 }
 
 /// Resolves the account a request refers to.
@@ -1915,8 +2173,120 @@ mod tests {
                 &AccountSelector::default(),
             )
             .unwrap_err();
-        assert!(matches!(error, WalletError::LiveBroadcastUnsupported));
+        assert!(matches!(error, WalletError::DryRunDisabled));
         assert!(!service.metadata().dry_run);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn live_signing_produces_a_signature_a_chain_would_accept() {
+        let dir = temp_dir("live-sign");
+        let path = dir.join("wallet.json");
+        let secret = fake_evm_secret();
+        create_keystore(&path, Chain::Evm, &secret, "test-passphrase", test_params()).unwrap();
+
+        let mut config = wallet_config(&path, Chain::Evm);
+        config.dry_run = false;
+        let service = WalletService::new(config);
+
+        // The EIP-1559 signing hash of a transaction is signed as-is.
+        let digest = [7u8; 32];
+        let signed = service
+            .sign_live_with_passphrase(
+                "test-passphrase",
+                Chain::Evm,
+                &AccountSelector::default(),
+                &digest,
+            )
+            .unwrap();
+        assert_eq!(signed.signature.len(), 65);
+        assert!(matches!(signed.signature[64], 0 | 1));
+
+        let mut r = [0u8; 32];
+        r.copy_from_slice(&signed.signature[..32]);
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&signed.signature[32..64]);
+        let signature = k256::ecdsa::Signature::from_scalars(r, s).unwrap();
+        let recovery = k256::ecdsa::RecoveryId::from_byte(signed.signature[64]).unwrap();
+        let key = k256::ecdsa::VerifyingKey::recover_from_prehash(&digest, &signature, recovery)
+            .expect("the signature must recover to a key");
+        let point = key.to_encoded_point(false);
+        // The recovered key is the signer, so it derives the signer's address.
+        assert_eq!(evm_address(point.as_bytes()), signed.address);
+
+        // A local dry run is still refused: the two paths do not mix.
+        let error = service
+            .sign_dry_run_with_passphrase(
+                "test-passphrase",
+                &envelope(Chain::Evm),
+                &AccountSelector::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, WalletError::DryRunDisabled));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn live_signing_is_refused_by_a_dry_run_wallet() {
+        let dir = temp_dir("live-sign-dry");
+        let path = dir.join("wallet.json");
+        create_keystore(
+            &path,
+            Chain::Evm,
+            &fake_evm_secret(),
+            "test-passphrase",
+            test_params(),
+        )
+        .unwrap();
+        let service = WalletService::new(wallet_config(&path, Chain::Evm));
+        let error = service
+            .sign_live_with_passphrase(
+                "test-passphrase",
+                Chain::Evm,
+                &AccountSelector::default(),
+                &[7u8; 32],
+            )
+            .unwrap_err();
+        assert!(matches!(error, WalletError::LiveSigningDisabled));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn live_solana_signing_verifies_against_the_wallet_public_key() {
+        let dir = temp_dir("live-sign-sol");
+        let path = dir.join("wallet.json");
+        let secret = fake_solana_secret();
+        create_keystore(
+            &path,
+            Chain::Solana,
+            &secret,
+            "test-passphrase",
+            test_params(),
+        )
+        .unwrap();
+
+        let mut config = wallet_config(&path, Chain::Solana);
+        config.dry_run = false;
+        let service = WalletService::new(config);
+
+        let message = b"a serialised solana message";
+        let signed = service
+            .sign_live_with_passphrase(
+                "test-passphrase",
+                Chain::Solana,
+                &AccountSelector::default(),
+                message,
+            )
+            .unwrap();
+        assert_eq!(signed.signature.len(), 64);
+
+        let key = solana_signing_key(&secret).unwrap();
+        assert_eq!(
+            signed.address,
+            bs58::encode(key.verifying_key().to_bytes()).into_string()
+        );
+        let signature = ed25519_dalek::Signature::from_slice(&signed.signature).unwrap();
+        key.verifying_key().verify(message, &signature).unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 

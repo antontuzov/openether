@@ -14,6 +14,12 @@ pub struct Config {
     /// Why live trading is on or off. The core refuses to trade live unless
     /// the arming ceremony succeeded.
     pub live_arming: LiveArmingState,
+    /// Why on-chain transfers are on or off. The wallet has its own arming
+    /// record: arming a venue does not arm the wallet.
+    pub onchain_arming: LiveArmingState,
+    /// `true` only when the on-chain arming record is valid *and* live
+    /// operation was requested.
+    pub onchain_live: bool,
     pub risk: RiskConfig,
     /// Starting equity of the paper venue, used as the PnL baseline.
     pub paper_start_equity: f64,
@@ -23,6 +29,12 @@ pub struct Config {
     pub contract_allowlist: HashSet<String>,
     pub solana_rpc_url: Option<String>,
     pub evm_rpc_urls: Vec<(String, String)>,
+    /// The most this process will ever pay per EVM gas unit, in wei.
+    ///
+    /// A fee spike is a reason to refuse a transfer, not to overpay it. The
+    /// broadcaster compares this ceiling against both the network's fee and
+    /// any smaller per-request ceiling.
+    pub broadcast_max_fee_per_gas_wei: u128,
     /// Where the engine keeps its durable state. `None` keeps everything in
     /// memory, which is only sensible for a throwaway run: a restart would
     /// reset equity to zero and silently re-open every risk limit.
@@ -33,8 +45,8 @@ pub struct Config {
 /// Wallet configuration.
 ///
 /// The core never stores a private key in clear text. The keystore is an
-/// encrypted file; it is only unlocked for the duration of a dry-run
-/// signature and the unlocked key is wiped again when the lease expires.
+/// encrypted file; it is only unlocked for the duration of a signature and the
+/// unlocked key is wiped again when the lease expires.
 #[derive(Debug, Clone)]
 pub struct WalletConfig {
     /// Path to the encrypted keystore. `None` disables the wallet entirely.
@@ -117,6 +129,10 @@ impl Config {
             risk.max_order_notional_usd = live_arming.effective_max_order_notional_usd;
         }
         let live_trading = live_arming.live_enabled;
+        // Separate record, separate decision. The wallet's cap is measured in
+        // dollars of the coin being moved, priced at broadcast time.
+        let onchain_arming = crate::live_arm::evaluate_onchain(&risk);
+        let onchain_live = onchain_arming.live_enabled;
 
         Self {
             host: std::env::var("CORE_HOST").unwrap_or_else(|_| "0.0.0.0".into()),
@@ -125,6 +141,8 @@ impl Config {
             symbols,
             live_trading,
             live_arming,
+            onchain_arming,
+            onchain_live,
             risk,
             paper_start_equity: env_f64("OPENETHER_PAPER_CASH", 10_000.0),
             strategy_wasm: std::env::var("OPENETHER_STRATEGY_WASM")
@@ -138,6 +156,10 @@ impl Config {
             solana_rpc_url: std::env::var("SOLANA_RPC_URL")
                 .ok()
                 .filter(|v| !v.is_empty()),
+            broadcast_max_fee_per_gas_wei: env_u128(
+                "OPENETHER_BROADCAST_MAX_FEE_PER_GAS_WEI",
+                200_000_000_000, // 200 gwei
+            ),
             evm_rpc_urls: [("ethereum", "ETHEREUM_RPC_URL"), ("base", "BASE_RPC_URL")]
                 .iter()
                 .filter_map(|(name, key)| {
@@ -209,6 +231,13 @@ fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u128(key: &str, default: u128) -> u128 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u128>().ok())
         .unwrap_or(default)
 }
 

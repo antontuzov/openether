@@ -84,6 +84,11 @@ pub struct ChainHoldings {
     pub tokens_skipped: usize,
     /// The total value of everything on this chain.
     pub value_usd: f64,
+    /// What this address has spent on gas, in dollars, at the current price
+    /// of the chain's gas token. Reported separately: gas is a cost the
+    /// wallet paid, not part of the balance being valued.
+    #[serde(default)]
+    pub gas_spent_usd: f64,
     pub fetched_at_ms: i64,
 }
 
@@ -261,6 +266,18 @@ impl HoldingsService {
         })
     }
 
+    /// The price of a chain's gas token, or `None` when no feed has it.
+    ///
+    /// A transfer is sized in dollars of the coin being moved, so the price
+    /// is a precondition, not a nicety: without one the core refuses.
+    pub async fn native_price_usd(&self, chain: &str) -> Option<f64> {
+        self.prices
+            .native(chain)
+            .await
+            .map(|price| price.price_usd)
+            .filter(|price| price.is_finite() && *price > 0.0)
+    }
+
     /// Everything a Solana address holds, valued.
     ///
     /// The SPL token list comes from the chain itself, so every token the
@@ -389,6 +406,7 @@ fn chain_holdings(
         tokens,
         tokens_skipped,
         value_usd,
+        gas_spent_usd: 0.0,
         fetched_at_ms,
     }
 }
@@ -485,6 +503,7 @@ mod tests {
                     tokens: vec![],
                     tokens_skipped: 0,
                     value_usd: 100.0,
+                    gas_spent_usd: 0.0,
                     fetched_at_ms: 0,
                 },
                 ChainHoldings {
@@ -497,6 +516,7 @@ mod tests {
                     tokens: vec![],
                     tokens_skipped: 0,
                     value_usd: 1_000.0,
+                    gas_spent_usd: 0.0,
                     fetched_at_ms: 0,
                 },
             ],

@@ -11,6 +11,7 @@
 //! Ticks and log lines are deliberately *not* persisted: they are high-volume
 //! and reconstructible, and they are not inputs to any risk decision.
 
+use crate::broadcast::Broadcast;
 use crate::exchange::OpenOrder;
 use crate::risk::{BreakerState, RiskState};
 use crate::types::{Side, TrackedOrder, TradeRecord, Venue};
@@ -140,6 +141,15 @@ CREATE TABLE IF NOT EXISTS fill_cursor (
     id             INTEGER PRIMARY KEY CHECK (id = 1),
     fill_cursor_ms INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS broadcasts (
+    id      TEXT PRIMARY KEY,
+    ts_ms   INTEGER NOT NULL,
+    state   TEXT    NOT NULL,
+    payload TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS broadcasts_ts_idx ON broadcasts (ts_ms DESC);
 "#;
 
 impl Store {
@@ -422,6 +432,45 @@ impl Store {
             )
             .optional()?;
         Ok(value.unwrap_or(0))
+    }
+
+    /* ----------------------------------------------------------- broadcasts */
+
+    /// Write one broadcast, replacing the previous state of the same transfer.
+    ///
+    /// The whole record is one JSON payload: a broadcast changes as the chain
+    /// advances it, and a partially written row would leave the reconciler
+    /// with a transaction it can neither resubmit nor forget.
+    pub fn save_broadcast(&self, broadcast: &Broadcast) -> anyhow::Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO broadcasts (id, ts_ms, state, payload)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                broadcast.id,
+                broadcast.created_at_ms,
+                broadcast.state.as_str(),
+                serde_json::to_string(broadcast)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every broadcast, oldest first.
+    pub fn load_broadcasts(&self) -> anyhow::Result<Vec<Broadcast>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT payload FROM broadcasts ORDER BY ts_ms ASC")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut broadcasts = Vec::with_capacity(rows.len());
+        for payload in rows {
+            match serde_json::from_str::<Broadcast>(&payload) {
+                Ok(broadcast) => broadcasts.push(broadcast),
+                Err(e) => tracing::warn!(error = %e, "skipping an unreadable broadcast"),
+            }
+        }
+        Ok(broadcasts)
     }
 
     /// Remember which venue order a client order id refers to.

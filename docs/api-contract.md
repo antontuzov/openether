@@ -27,8 +27,10 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 | POST | `/api/breaker/reset` | Body `{ "confirm": true }` → manual breaker reset |
 | GET | `/api/venues` | `[{ "venue": "paper", "healthy": true, "live": false }]` |
 | GET | `/api/wallet` | `WalletMetadata` — public wallet metadata, never a secret |
-| GET | `/api/wallet/holdings` | `WalletHoldings` — on-chain balances, valued but never traded (see below) |
+| GET | `/api/wallet/holdings` | `WalletHoldings` — on-chain balances, valued and never counted as trading equity |
 | POST | `/api/wallet/sign-dry-run` | Body `{ "passphrase", "envelope", "account"? }` → `DryRunSignature` |
+| POST | `/api/wallet/broadcast` | Body `{ "network", "to", "amount_raw", "passphrase", "account"?, "max_fee_per_gas_wei"? }` → a signed, sent transfer |
+| GET | `/api/wallet/broadcasts?limit=50` | Transfers this core signed, newest first, plus the broadcast gates |
 | GET | `/api/live` | Live-trading arming state (see below) |
 | GET | `/api/risk/rules` | `RiskContract` — the limits, check order and reason codes the engine runs with (see below) |
 
@@ -193,9 +195,10 @@ Error `4xx`:
 ```
 
 Codes: `wallet_not_configured`, `wallet_locked`, `wallet_lease_expired`,
-`invalid_passphrase`, `keystore_decrypt_failed`, `live_broadcast_unsupported`,
-`chain_mismatch`, `account_not_found`, `invalid_key`, `invalid_envelope`,
-`signature_invalid`, `unsupported_keystore_format`, `keystore_io_error`.
+`invalid_passphrase`, `keystore_decrypt_failed`, `wallet_dry_run_disabled`,
+`wallet_live_signing_disabled`, `chain_mismatch`, `account_not_found`,
+`invalid_key`, `invalid_envelope`, `signature_invalid`,
+`unsupported_keystore_format`, `keystore_io_error`.
 
 ### `GET /api/wallet/holdings`
 
@@ -203,10 +206,11 @@ The on-chain wallet, read from the chain and priced from the DEX feed. The
 engine refreshes it every 30 seconds and never unlocks the keystore to do it:
 only public addresses are used.
 
-**These balances are not trading equity.** There is no broadcast path, so the
-risk layer keeps measuring equity, drawdown and position caps on the trading
-account alone. `PortfolioSnapshot.onchain_value_usd` reports the same total for
-convenience and is likewise excluded from every risk check.
+**These balances are not trading equity.** The wallet can move its own coins
+through `POST /api/wallet/broadcast`, but the risk layer keeps measuring
+equity, drawdown and position caps on the trading account alone.
+`PortfolioSnapshot.onchain_value_usd` reports the same total for convenience
+and is likewise excluded from every risk check.
 
 Response `200`:
 ```json
@@ -234,6 +238,7 @@ Response `200`:
       ],
       "tokens_skipped": 0,
       "value_usd": 53966.48,
+      "gas_spent_usd": 0.42,
       "fetched_at_ms": 1731200000000
     }
   ],
@@ -254,6 +259,103 @@ Response `200`:
   addresses). Solana tokens come from the address's own token accounts.
 - `OPENETHER_PRICE_FEED_URL` overrides the feed (default
   `https://api.dexscreener.com`).
+- `gas_spent_usd` is the sum of the fees this core paid on that chain for
+  **final** transfers, priced at the chain's current gas-token price. It is
+  derived from the broadcast records, so it cannot be double-booked. The same
+  figure is on `PortfolioSnapshot.wallet_gas_usd`; it never enters equity.
+
+### `POST /api/wallet/broadcast`
+
+Moves the chain's native coin out of the wallet on a real chain. This is the
+only path that broadcasts, and every gate is checked before a signature is
+asked for:
+
+1. a valid **on-chain** arming record (`openether-live arm --target onchain`,
+   separate from any venue's record);
+2. `OPENETHER_WALLET_DRY_RUN=0`;
+3. the network has an RPC url, the gas coin is priced, and
+   `amount_raw / 10^decimals × price` is at or below the armed per-transfer cap.
+
+Request:
+```json
+{
+  "network": "solana",
+  "to": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+  "amount_raw": 10000000,
+  "max_fee_per_gas_wei": 30000000000,
+  "passphrase": "…",
+  "account": { "index": 0 }
+}
+```
+
+- `network` is `ethereum`, `base` or `solana`.
+- `amount_raw` is wei (EVM) or lamports (Solana).
+- `max_fee_per_gas_wei` is optional and may only tighten
+  `OPENETHER_BROADCAST_MAX_FEE_PER_GAS_WEI` (default 200 gwei). A network fee
+  above the ceiling is refused before signing.
+- `account` is optional; omitted means the primary account.
+
+Response `200`:
+```json
+{
+  "ok": true,
+  "notional_usd": 24.18,
+  "broadcast": {
+    "id": "…",
+    "chain": "solana",
+    "from": "…",
+    "to": "7xKX…AsU",
+    "nonce": 0,
+    "amount_raw": 10000000,
+    "fee_limit_raw": 5000,
+    "fee_paid_raw": 0,
+    "tx_hash": "5J…",
+    "raw_tx": "AQ…",
+    "block_number": 0,
+    "block_hash": "",
+    "last_valid_block_height": 289000000,
+    "confirmations": 0,
+    "state": "submitted",
+    "note": "sent; waiting for inclusion",
+    "created_at_ms": 1731200000000,
+    "updated_at_ms": 1731200000000
+  }
+}
+```
+
+`state` is `signed`, `submitted`, `reorged`, `confirmed`, `dropped` or
+`failed`. EVM finality is 12 confirmations; a Solana transfer is final only at
+`finalized`. A receipt that disappears or moves to another block puts the
+transfer back to `reorged`; a consumed nonce or an expired Solana blockhash
+makes it `dropped`; a revert or instruction error makes it `failed` and the
+fee is still paid.
+
+Error `4xx`/`5xx`:
+```json
+{ "ok": false, "error": "the transfer is worth $240.00 of solana, above the armed cap of $100.00", "code": "transfer_above_cap" }
+```
+
+Codes: `onchain_not_armed` (403), `wallet_dry_run` (409),
+`broadcast_not_configured`, `network_not_configured`, `unsupported_network`,
+`transfer_above_cap` (422), `transfer_unpriced` (422),
+`invalid_transfer`, `fee_ceiling_too_low`, `signer_mismatch`, `hash_mismatch`,
+`wallet_signing_failed`, `rpc_error` (502), plus every wallet code above.
+
+### `GET /api/wallet/broadcasts`
+
+```json
+{
+  "broadcasts": [ { "id": "…", "state": "confirmed", "fee_paid_raw": 21000 }, … ],
+  "onchain_live": true,
+  "dry_run": false,
+  "networks": ["base", "ethereum", "solana"],
+  "effective_max_transfer_notional_usd": 100.0,
+  "gas_ceiling_wei": "200000000000"
+}
+```
+
+Newest first. `networks` lists the chains that have an RPC url; an empty list
+means no transfer can be sent at all.
 
 ### `GET /api/live`
 
@@ -277,13 +379,35 @@ Response `200`:
     "expires_at_ms": 1700014400000,
     "max_order_notional_usd": 500.0,
     "operator_note": "morning session"
+  },
+  "onchain": {
+    "live_enabled": false,
+    "dry_run": true,
+    "networks": ["base", "ethereum", "solana"],
+    "gas_ceiling_wei": "200000000000",
+    "arming": {
+      "live_enabled": false,
+      "reason": "live_not_requested",
+      "detail": "transfers are off: OPENETHER_LIVE_TRADING is not set.",
+      "effective_max_order_notional_usd": 0.0,
+      "venue": "onchain",
+      "armed_at_ms": null,
+      "expires_at_ms": null,
+      "max_order_notional_usd": null,
+      "operator_note": null
+    }
   }
 }
 ```
 
+`onchain` is a **separate decision** from `arming`. The wallet needs its own
+record (`openether-live arm --target onchain`); a venue record never moves
+coins, and a wallet record never places orders. `networks` lists the chains
+with an RPC url, and `dry_run` must be `false` before a transfer can be signed.
+
 `reason` is `null` when live trading is on. Otherwise it is one of
 `arming_file_unset`, `arming_file_missing`, `arming_file_unreadable`,
-`arming_version_unsupported`, `arming_venue_mismatch`,
+`arming_version_unsupported`, `arming_target_mismatch`,
 `arming_confirmation_invalid`, `arming_expired`, `arming_config_changed`,
 `live_not_requested`.
 
