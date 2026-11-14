@@ -122,6 +122,39 @@ const risk = {
   ts_ms: 1,
 };
 
+const journal = {
+  query: { symbol: 'SOL/USDT', limit: 10 },
+  fills: [
+    {
+      id: 'f1',
+      venue: 'paper',
+      symbol: 'SOL/USDT',
+      side: 'sell',
+      qty: 1,
+      price: 140,
+      fee: 0.1,
+      realized_pnl: -12.5,
+      ts_ms: 2,
+      rationale: 'stop loss',
+      source: 'paper',
+    },
+  ],
+  summary: {
+    fills: 4,
+    buys: 2,
+    sells: 2,
+    bought_usd: 280,
+    sold_usd: 276,
+    fees_usd: 0.4,
+    realized_pnl_usd: -12.5,
+    winning_fills: 0,
+    losing_fills: 1,
+    gross_profit_usd: 0,
+    gross_loss_usd: -12.5,
+    profit_factor: 0,
+  },
+};
+
 async function run(core: ScriptedCore, model: ScriptedModel) {
   const logger = new AgentLogger(directory, 'info', 'http://127.0.0.1:1');
   const orchestrator = new Orchestrator({
@@ -159,6 +192,7 @@ describe('the verify step', () => {
       get_risk_state: risk,
       get_market_data: { ticks: [] },
       get_trade_history: [],
+      get_journal: journal,
       get_orders: [order({ status: 'partially_filled', fills: [fill(0.4, 130)] })],
       execute_trade: { approved: true, reason: '', detail: '', order_id: 'o-1', status: 'accepted' },
     });
@@ -183,6 +217,7 @@ describe('the verify step', () => {
       get_risk_state: risk,
       get_market_data: { ticks: [] },
       get_trade_history: [],
+      get_journal: journal,
       get_orders: [order()],
       execute_trade: { approved: true, reason: '', detail: '', order_id: 'o-1', status: 'accepted' },
     });
@@ -204,6 +239,7 @@ describe('the verify step', () => {
       get_risk_state: risk,
       get_market_data: { ticks: [] },
       get_trade_history: [],
+      get_journal: journal,
       get_orders: [order(), order({ order_id: 'o-2', status: 'filled', fills: [fill(1, 130)] })],
     });
     const model = new ScriptedModel([[]]);
@@ -235,6 +271,7 @@ describe('the verify step', () => {
       get_risk_state: risk,
       get_market_data: { ticks: [] },
       get_trade_history: [],
+      get_journal: journal,
       get_orders: [order()],
       cancel_order: { ok: false, status: 400, response: 'order o-1 is filled: only a resting order can be cancelled' },
     });
@@ -243,5 +280,27 @@ describe('the verify step', () => {
 
     expect(core.calls.some((call) => call.name === 'cancel_order')).toBe(true);
     expect(result.tradeAttempted).toBe(false);
+  });
+});
+
+describe('the journal', () => {
+  it('gives the model the symbol track record before it plans', async () => {
+    const core = new ScriptedCore({
+      get_portfolio: portfolio,
+      get_risk_state: risk,
+      get_market_data: { ticks: [] },
+      get_trade_history: [],
+      get_journal: journal,
+      get_orders: [],
+    });
+    const model = new ScriptedModel([[]]);
+    await run(core, model);
+
+    const call = core.calls.find((entry) => entry.name === 'get_journal');
+    expect(call?.args).toEqual({ symbol: 'SOL/USDT', limit: 10 });
+
+    const prompt = model.requests[0]?.messages.find((message) => message.role === 'user')?.content;
+    expect(prompt).toContain('"realized_pnl_usd": -12.5');
+    expect(prompt).toContain('stop loss');
   });
 });

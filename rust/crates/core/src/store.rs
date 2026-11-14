@@ -16,6 +16,7 @@ use crate::exchange::OpenOrder;
 use crate::risk::{BreakerState, RiskState};
 use crate::types::{Side, TrackedOrder, TradeRecord, Venue};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -49,6 +50,177 @@ pub struct PositionRow {
     pub symbol: String,
     pub qty: f64,
     pub avg_entry: f64,
+}
+
+fn default_journal_limit() -> usize {
+    100
+}
+
+/// What to read from the trade journal.
+///
+/// Every field is optional: an empty filter is "the newest fills". The journal
+/// is the durable record of what actually filled, so it is queried by the
+/// operator, the dashboard and the agent's own planning loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JournalFilter {
+    pub symbol: Option<String>,
+    pub side: Option<Side>,
+    pub venue: Option<Venue>,
+    pub source: Option<String>,
+    pub from_ms: Option<i64>,
+    pub to_ms: Option<i64>,
+    #[serde(default = "default_journal_limit")]
+    pub limit: usize,
+}
+
+impl Default for JournalFilter {
+    fn default() -> Self {
+        Self {
+            symbol: None,
+            side: None,
+            venue: None,
+            source: None,
+            from_ms: None,
+            to_ms: None,
+            limit: default_journal_limit(),
+        }
+    }
+}
+
+impl JournalFilter {
+    /// Whether a fill belongs in this journal view.
+    pub fn matches(&self, trade: &TradeRecord) -> bool {
+        if let Some(symbol) = &self.symbol {
+            if &trade.symbol != symbol {
+                return false;
+            }
+        }
+        if let Some(side) = self.side {
+            if trade.side != side {
+                return false;
+            }
+        }
+        if let Some(venue) = self.venue {
+            if trade.venue != venue {
+                return false;
+            }
+        }
+        if let Some(source) = &self.source {
+            if &trade.source != source {
+                return false;
+            }
+        }
+        if let Some(from_ms) = self.from_ms {
+            if trade.ts_ms < from_ms {
+                return false;
+            }
+        }
+        if let Some(to_ms) = self.to_ms {
+            if trade.ts_ms > to_ms {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn clamped_limit(&self) -> usize {
+        self.limit.clamp(1, 1_000)
+    }
+}
+
+/// Totals over every fill the filter matched, not just the returned page.
+#[derive(Debug, Clone, Serialize)]
+pub struct JournalSummary {
+    pub fills: i64,
+    pub buys: i64,
+    pub sells: i64,
+    /// Notional bought and sold, in quote currency.
+    pub bought_usd: f64,
+    pub sold_usd: f64,
+    pub fees_usd: f64,
+    pub realized_pnl_usd: f64,
+    /// Fills that closed a position at a profit or a loss.
+    pub winning_fills: i64,
+    pub losing_fills: i64,
+    pub gross_profit_usd: f64,
+    /// Negative or zero.
+    pub gross_loss_usd: f64,
+    /// Gross profit over gross loss; `None` when nothing lost money.
+    pub profit_factor: Option<f64>,
+}
+
+/// One page of the journal plus the totals for the whole filtered range.
+#[derive(Debug, Clone, Serialize)]
+pub struct JournalPage {
+    pub query: JournalFilter,
+    pub fills: Vec<TradeRecord>,
+    pub summary: JournalSummary,
+}
+
+/// Summarise fills that are already in memory, newest first.
+///
+/// Used when the core runs without a state database, so the journal keeps
+/// working against the engine's own ring buffer.
+pub fn summarize(fills: &[TradeRecord]) -> JournalSummary {
+    let mut summary = JournalSummary {
+        fills: fills.len() as i64,
+        buys: 0,
+        sells: 0,
+        bought_usd: 0.0,
+        sold_usd: 0.0,
+        fees_usd: 0.0,
+        realized_pnl_usd: 0.0,
+        winning_fills: 0,
+        losing_fills: 0,
+        gross_profit_usd: 0.0,
+        gross_loss_usd: 0.0,
+        profit_factor: None,
+    };
+    for trade in fills {
+        match trade.side {
+            Side::Buy => {
+                summary.buys += 1;
+                summary.bought_usd += trade.qty * trade.price;
+            }
+            Side::Sell => {
+                summary.sells += 1;
+                summary.sold_usd += trade.qty * trade.price;
+            }
+        }
+        summary.fees_usd += trade.fee;
+        summary.realized_pnl_usd += trade.realized_pnl;
+        if trade.realized_pnl > 0.0 {
+            summary.winning_fills += 1;
+            summary.gross_profit_usd += trade.realized_pnl;
+        } else if trade.realized_pnl < 0.0 {
+            summary.losing_fills += 1;
+            summary.gross_loss_usd += trade.realized_pnl;
+        }
+    }
+    summary.profit_factor = if summary.gross_loss_usd < 0.0 {
+        Some(summary.gross_profit_usd / -summary.gross_loss_usd)
+    } else {
+        None
+    };
+    summary
+}
+
+/// Page and summarise an in-memory ring buffer, newest first.
+pub fn page_from_memory(fills: &[TradeRecord], filter: &JournalFilter) -> JournalPage {
+    let matched: Vec<TradeRecord> = fills
+        .iter()
+        .filter(|trade| filter.matches(trade))
+        .cloned()
+        .collect();
+    JournalPage {
+        query: filter.clone(),
+        fills: matched
+            .iter()
+            .take(filter.clamped_limit())
+            .cloned()
+            .collect(),
+        summary: summarize(&matched),
+    }
 }
 
 /// Durable store for the engine's risk-relevant state.
@@ -290,25 +462,108 @@ impl Store {
              FROM trades ORDER BY ts_ms DESC LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map(params![limit as i64], |r| {
-                let venue: String = r.get(1)?;
-                let side: String = r.get(3)?;
-                Ok(TradeRecord {
-                    id: r.get(0)?,
-                    venue: Venue::parse(&venue).unwrap_or(Venue::Paper),
-                    symbol: r.get(2)?,
-                    side: Side::parse(&side).unwrap_or(Side::Buy),
-                    qty: r.get(4)?,
-                    price: r.get(5)?,
-                    fee: r.get(6)?,
-                    realized_pnl: r.get(7)?,
-                    ts_ms: r.get(8)?,
-                    rationale: r.get(9)?,
-                    source: r.get(10)?,
-                })
-            })?
+            .query_map(params![limit as i64], read_trade)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Read a filtered page of the journal and the totals for the range.
+    ///
+    /// The summary covers every matching fill, while `fills` is only the page
+    /// the caller asked for: "what did SOL do last week" must not change its
+    /// answer because the page size changed.
+    pub fn journal(&self, filter: &JournalFilter) -> anyhow::Result<JournalPage> {
+        let conn = self.lock()?;
+        let limit = filter.clamped_limit() as i64;
+        let side = filter.side.map(|side| side.as_str());
+        let venue = filter.venue.map(|venue| venue.as_str());
+        let symbol = filter.symbol.as_deref();
+        let source = filter.source.as_deref();
+        let from_ms = filter.from_ms;
+        let to_ms = filter.to_ms;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, venue, symbol, side, qty, price, fee, realized_pnl, ts_ms, rationale, source
+             FROM trades
+             WHERE (:symbol IS NULL OR symbol = :symbol)
+               AND (:side IS NULL OR side = :side)
+               AND (:venue IS NULL OR venue = :venue)
+               AND (:source IS NULL OR source = :source)
+               AND (:from_ms IS NULL OR ts_ms >= :from_ms)
+               AND (:to_ms IS NULL OR ts_ms <= :to_ms)
+             ORDER BY ts_ms DESC, id DESC
+             LIMIT :limit",
+        )?;
+        let fills = stmt
+            .query_map(
+                rusqlite::named_params! {
+                    ":symbol": symbol,
+                    ":side": side,
+                    ":venue": venue,
+                    ":source": source,
+                    ":from_ms": from_ms,
+                    ":to_ms": to_ms,
+                    ":limit": limit,
+                },
+                read_trade,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let summary = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN side = 'buy' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN side = 'sell' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN side = 'buy' THEN qty * price ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN side = 'sell' THEN qty * price ELSE 0 END), 0),
+                    COALESCE(SUM(fee), 0),
+                    COALESCE(SUM(realized_pnl), 0),
+                    COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN realized_pnl < 0 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN realized_pnl ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN realized_pnl < 0 THEN realized_pnl ELSE 0 END), 0)
+             FROM trades
+             WHERE (:symbol IS NULL OR symbol = :symbol)
+               AND (:side IS NULL OR side = :side)
+               AND (:venue IS NULL OR venue = :venue)
+               AND (:source IS NULL OR source = :source)
+               AND (:from_ms IS NULL OR ts_ms >= :from_ms)
+               AND (:to_ms IS NULL OR ts_ms <= :to_ms)",
+            rusqlite::named_params! {
+                ":symbol": symbol,
+                ":side": side,
+                ":venue": venue,
+                ":source": source,
+                ":from_ms": from_ms,
+                ":to_ms": to_ms,
+            },
+            |row| {
+                let gross_loss: f64 = row.get(10)?;
+                Ok(JournalSummary {
+                    fills: row.get(0)?,
+                    buys: row.get(1)?,
+                    sells: row.get(2)?,
+                    bought_usd: row.get(3)?,
+                    sold_usd: row.get(4)?,
+                    fees_usd: row.get(5)?,
+                    realized_pnl_usd: row.get(6)?,
+                    winning_fills: row.get(7)?,
+                    losing_fills: row.get(8)?,
+                    gross_profit_usd: row.get(9)?,
+                    gross_loss_usd: gross_loss,
+                    profit_factor: if gross_loss < 0.0 {
+                        Some(row.get::<_, f64>(9)? / -gross_loss)
+                    } else {
+                        None
+                    },
+                })
+            },
+        )?;
+
+        Ok(JournalPage {
+            query: filter.clone(),
+            fills,
+            summary,
+        })
     }
 
     /// Number of fills in the journal.
@@ -579,6 +834,24 @@ impl Store {
     }
 }
 
+fn read_trade(row: &rusqlite::Row<'_>) -> rusqlite::Result<TradeRecord> {
+    let venue: String = row.get(1)?;
+    let side: String = row.get(3)?;
+    Ok(TradeRecord {
+        id: row.get(0)?,
+        venue: Venue::parse(&venue).unwrap_or(Venue::Paper),
+        symbol: row.get(2)?,
+        side: Side::parse(&side).unwrap_or(Side::Buy),
+        qty: row.get(4)?,
+        price: row.get(5)?,
+        fee: row.get(6)?,
+        realized_pnl: row.get(7)?,
+        ts_ms: row.get(8)?,
+        rationale: row.get(9)?,
+        source: row.get(10)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,5 +1026,122 @@ mod tests {
         s.save_portfolio(PortfolioRow::default()).unwrap();
         assert!(path.exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn journal_fixture() -> Store {
+        let s = store();
+        let mut btc = trade("btc", 1_000);
+        btc.symbol = "BTC/USDT".into();
+        let mut sol_sell = trade("sol-sell", 2_000);
+        sol_sell.side = Side::Sell;
+        sol_sell.realized_pnl = 5.0;
+        let sol_buy = trade("sol-buy", 3_000);
+        s.record_trade(&btc).unwrap();
+        s.record_trade(&sol_sell).unwrap();
+        s.record_trade(&sol_buy).unwrap();
+        s
+    }
+
+    #[test]
+    fn the_journal_filters_by_symbol_side_and_range() {
+        let s = journal_fixture();
+
+        let page = s
+            .journal(&JournalFilter {
+                symbol: Some("SOL/USDT".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.fills.len(), 2);
+        assert_eq!(page.fills[0].id, "sol-buy", "newest first");
+        assert_eq!(page.summary.fills, 2);
+
+        let page = s
+            .journal(&JournalFilter {
+                side: Some(Side::Sell),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.fills.len(), 1);
+        assert_eq!(page.fills[0].id, "sol-sell");
+        assert_eq!(page.summary.sells, 1);
+
+        let page = s
+            .journal(&JournalFilter {
+                from_ms: Some(1_500),
+                to_ms: Some(2_500),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.fills.len(), 1);
+        assert_eq!(page.fills[0].id, "sol-sell");
+    }
+
+    #[test]
+    fn the_summary_covers_the_range_not_the_page() {
+        let s = store();
+        let mut buy = trade("b1", 1_000);
+        buy.fee = 0.02;
+        let mut win = trade("w", 2_000);
+        win.side = Side::Sell;
+        win.fee = 0.5;
+        win.realized_pnl = 10.0;
+        let mut loss = trade("l", 3_000);
+        loss.side = Side::Sell;
+        loss.fee = 0.5;
+        loss.realized_pnl = -4.0;
+        for t in [&buy, &win, &loss] {
+            s.record_trade(t).unwrap();
+        }
+
+        let page = s
+            .journal(&JournalFilter {
+                limit: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.fills.len(), 1);
+        assert_eq!(page.query.limit, 1, "the page echoes the filter");
+
+        let sum = page.summary;
+        assert_eq!(sum.fills, 3);
+        assert_eq!(sum.buys, 1);
+        assert_eq!(sum.sells, 2);
+        assert!((sum.bought_usd - 1.5 * 142.0).abs() < 1e-9);
+        assert!((sum.fees_usd - 1.02).abs() < 1e-9);
+        assert!((sum.realized_pnl_usd - 6.0).abs() < 1e-9);
+        assert_eq!(sum.winning_fills, 1);
+        assert_eq!(sum.losing_fills, 1);
+        assert!((sum.gross_profit_usd - 10.0).abs() < 1e-9);
+        assert!((sum.gross_loss_usd + 4.0).abs() < 1e-9);
+        assert_eq!(sum.profit_factor, Some(2.5));
+    }
+
+    #[test]
+    fn an_empty_journal_summarises_to_zero() {
+        let s = store();
+        let page = s.journal(&JournalFilter::default()).unwrap();
+        assert!(page.fills.is_empty());
+        assert_eq!(page.summary.fills, 0);
+        assert_eq!(page.summary.profit_factor, None);
+    }
+
+    #[test]
+    fn the_in_memory_journal_applies_the_same_filter() {
+        let mut sell = trade("sell", 2_000);
+        sell.side = Side::Sell;
+        sell.realized_pnl = 3.0;
+        let fills = vec![trade("buy", 3_000), sell];
+        let page = page_from_memory(
+            &fills,
+            &JournalFilter {
+                side: Some(Side::Sell),
+                ..Default::default()
+            },
+        );
+        assert_eq!(page.fills.len(), 1);
+        assert_eq!(page.fills[0].id, "sell");
+        assert_eq!(page.summary.sells, 1);
+        assert_eq!(page.summary.winning_fills, 1);
     }
 }

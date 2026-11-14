@@ -213,8 +213,8 @@ a strategy of your own.
 ### Tests
 
 ```bash
-cargo test --workspace --manifest-path rust/Cargo.toml   # 259 tests
-pnpm --dir ts -r test                                    # 127 tests
+cargo test --workspace --manifest-path rust/Cargo.toml   # 263 tests
+pnpm --dir ts -r test                                    # 128 tests
 pnpm --dir ts -r typecheck
 pnpm --dir ts -r build
 ```
@@ -387,6 +387,44 @@ flight.
 Leaving the variable unset (or set to `memory`) keeps everything in RAM. That is
 fine for a throwaway demo and **wrong for a live run**: equity would reset to
 zero and every limit would re-open.
+
+### The trade journal
+
+The same database is a queryable journal. `GET /api/journal` filters the fills
+and returns totals for everything the filter matched:
+
+```bash
+# How did SOL do yesterday, sells only, newest 20?
+curl -s "http://localhost:8080/api/journal?symbol=SOL/USDT&side=sell&from_ms=1763078400000&limit=20"
+```
+
+```json
+{
+  "query": {"symbol": "SOL/USDT", "side": "sell", "venue": null, "source": null,
+            "from_ms": 1763078400000, "to_ms": null, "limit": 20},
+  "fills": [{"id": "paper-00000002-…", "side": "sell", "qty": 1.0, "price": 141.97,
+             "fee": 0.071, "realized_pnl": -0.146, "rationale": "journal test exit"}],
+  "summary": {"fills": 2, "buys": 1, "sells": 1, "bought_usd": 142.12,
+              "sold_usd": 141.97, "fees_usd": 0.142, "realized_pnl_usd": -0.146,
+              "winning_fills": 0, "losing_fills": 1, "gross_profit_usd": 0.0,
+              "gross_loss_usd": -0.146, "profit_factor": 0.0}
+}
+```
+
+`fills` is the page; `summary` covers every matching fill, so "how much did SOL
+make this week" does not change its answer when the page size does. The
+filters are `symbol`, `side`, `venue`, `source`, `from_ms`, `to_ms` and `limit`
+(1–1,000, default 100). A bad side, venue or inverted range is
+`400 journal_invalid_query`. With no state database the same filters run over
+the engine's in-memory ring.
+
+The agent reads this journal every cycle through the `get_journal` MCP tool and
+puts the summary and the last five fills into its planning context, then writes
+the cycle's outcome — plan, approved or rejected, the journal's realized P&L —
+into its own memory. The memory is a file-backed vector store
+(`data/memory/memory.jsonl`): it survives restarts, is inspectable by hand and
+is recalled by cosine similarity, using a local hashed embedder unless
+`OPENAI_API_KEY` is set.
 
 ### Backtesting
 
@@ -842,8 +880,8 @@ anything sensitive behind it.
 ## MCP tools
 
 **Rust core** (`rust/crates/mcp-server`): `execute_trade`, `get_portfolio`,
-`get_positions`, `get_trade_history`, `get_risk_state`, `get_market_data`,
-`get_agent_logs`, `fetch_onchain_data`.
+`get_positions`, `get_trade_history`, `get_journal`, `get_risk_state`,
+`get_market_data`, `get_agent_logs`, `fetch_onchain_data`, `set_strategy`.
 
 **Market + on-chain** (`ts/packages/mcp-data`): `list_top_coins`,
 `get_coin_price`, `get_coin_details`, `search_dex_pairs`, `get_dex_liquidity`,
@@ -940,7 +978,8 @@ Exchange credentials are only read when live trading is armed. `.env`,
 ### HTTP API
 
 `GET /healthz`, `/metrics`, `/api/config`, `/api/portfolio`, `/api/positions`,
-`/api/orders`, `/api/trades`, `/api/logs`, `/api/ticks`, `/api/risk`,
+`/api/orders`, `/api/trades`, `/api/journal`, `/api/logs`, `/api/ticks`,
+`/api/risk`,
 `/api/risk/decisions`, `/api/risk/rules`, `/api/strategy`, `/api/strategies`,
 `/api/venues`,
 `/api/wallet`, `/api/wallet/holdings`, `/api/wallet/broadcasts`, `/api/live`,
@@ -958,7 +997,7 @@ Exchange credentials are only read when live trading is armed. `.env`,
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **259 passing**, including the encrypted keystore,
+- `cargo test --workspace` — **263 passing**, including the encrypted keystore,
   EVM and Solana dry-run signing, live signing recovered against the wallet
   address, signature tampering, wrong-passphrase rejection, and the API
   refusing to sign when dry run is off. The broadcaster suite covers EIP-1559
@@ -1007,7 +1046,7 @@ Checked locally on macOS (arm64):
   same accounts.
 - `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings`
   — clean, so the CI gate passes as written.
-- `pnpm -r test` — **127 passing** across the agent guard and verify loop, the
+- `pnpm -r test` — **128 passing** across the agent guard and verify loop, the
   data server, the browser trading engine and the order accounting.
 - `pnpm -r typecheck` and `pnpm -r build` — clean.
 - The risk contract proven to be shared: the Rust risk layer and the browser
@@ -1113,6 +1152,13 @@ Checked locally on macOS (arm64):
   was refused with `swap_network_unsupported` before any quote; and both
   signed transactions came back from `/api/wallet/broadcasts` after a core
   restart.
+- The trade journal exercised against a **running core** on a SQLite state file:
+  symbol, side and time-range filters each narrowed the fills, a `limit=1` page
+  returned one fill while its summary still counted every matching fill, a bad
+  `side` and a range whose `from_ms` was after its `to_ms` were both refused
+  with `400 journal_invalid_query`, and two fills were still there after the
+  core was stopped and restarted on the same file. The agent test asserts the
+  journal summary and the last fills reach the planning prompt.
 
 **Not verified:** live exchange connections (no credentials were used), a
 transfer or swap broadcast to a public chain (both paths were exercised against

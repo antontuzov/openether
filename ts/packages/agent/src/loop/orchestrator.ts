@@ -1,5 +1,6 @@
 import type {
   ChatMessage,
+  JournalPage,
   LlmProvider,
   MarketTick,
   PortfolioSnapshot,
@@ -39,6 +40,7 @@ export interface CycleSnapshot {
   risk: RiskState | null;
   ticks: MarketTick[];
   orders: TrackedOrder[];
+  journal: JournalPage | null;
 }
 
 export interface CycleResult {
@@ -70,8 +72,9 @@ export class Orchestrator {
     const risk = await this.readRisk();
     const ticks = await this.readTicks();
     const orders = await this.readOrders();
+    const journal = await this.readJournal();
 
-    this.options.onContext?.({ portfolio, risk, ticks, orders });
+    this.options.onContext?.({ portfolio, risk, ticks, orders, journal });
 
     if (risk) {
       metrics.breakerState.set(
@@ -93,6 +96,23 @@ export class Orchestrator {
       // Resting orders are exposure that has not been booked yet. Without them
       // the model would re-submit a trade it already has working.
       working_orders: orders.filter(isWorking).map(summarizeOrder),
+      // The journal is what actually filled: totals over the symbol's whole
+      // history plus the most recent fills and the rationale that placed them.
+      // Without it every cycle plans as if it had never traded before.
+      journal: journal
+        ? {
+            summary: journal.summary,
+            recent_fills: journal.fills.slice(0, 5).map((fill) => ({
+              ts_ms: fill.ts_ms,
+              side: fill.side,
+              qty: fill.qty,
+              price: fill.price,
+              fee: fill.fee,
+              realized_pnl: fill.realized_pnl,
+              rationale: fill.rationale,
+            })),
+          }
+        : null,
       relevant_memories: memories.map((record) => ({
         ts: record.ts,
         kind: record.kind,
@@ -170,9 +190,12 @@ export class Orchestrator {
       await this.verify(tradeApproved, tradeReason, tradeOrderId);
     }
 
+    const journalNote = journal
+      ? ` (journal: ${journal.summary.fills} fills, realized $${journal.summary.realized_pnl_usd.toFixed(2)})`
+      : '';
     await memory.append({
       kind: tradeAttempted ? 'outcome' : 'plan',
-      text: `cycle on ${this.options.symbol}: ${plan.slice(0, 800)}`,
+      text: `cycle on ${this.options.symbol}: ${plan.slice(0, 800)}${journalNote}`,
       tags: tradeAttempted ? ['trade', tradeApproved ? 'approved' : 'rejected'] : ['plan'],
     });
 
@@ -329,6 +352,20 @@ export class Orchestrator {
     const raw = await this.safeCall('get_trade_history', { limit: 5 });
     const parsed = safeParse(raw);
     return Array.isArray(parsed) ? parsed : [];
+  }
+
+  /** The symbol's own track record, with totals over its whole history. */
+  private async readJournal(): Promise<JournalPage | null> {
+    const raw = await this.safeCall('get_journal', { symbol: this.options.symbol, limit: 10 });
+    const parsed = safeParse(raw);
+    if (!isObject(parsed)) {
+      return null;
+    }
+    const page = parsed as unknown as JournalPage;
+    if (!isObject(page.summary) || !Array.isArray(page.fills)) {
+      return null;
+    }
+    return page;
   }
 
   private async readOrders(): Promise<TrackedOrder[]> {

@@ -117,6 +117,43 @@ export interface MarketTick {
   ts_ms: number;
 }
 
+/** One fill in the durable trade journal. */
+export interface JournalFill {
+  id: string;
+  venue: string;
+  symbol: string;
+  side: 'buy' | 'sell';
+  qty: number;
+  price: number;
+  fee: number;
+  realized_pnl: number;
+  ts_ms: number;
+  rationale: string;
+  source: string;
+}
+
+/** Totals over every fill the journal filter matched. */
+export interface JournalSummary {
+  fills: number;
+  buys: number;
+  sells: number;
+  bought_usd: number;
+  sold_usd: number;
+  fees_usd: number;
+  realized_pnl_usd: number;
+  winning_fills: number;
+  losing_fills: number;
+  gross_profit_usd: number;
+  gross_loss_usd: number;
+  profit_factor: number | null;
+}
+
+export interface JournalPage {
+  query: Record<string, unknown>;
+  fills: JournalFill[];
+  summary: JournalSummary;
+}
+
 export interface OrderFill {
   venue: string;
   order_id: string;

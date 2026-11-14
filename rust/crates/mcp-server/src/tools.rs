@@ -76,6 +76,22 @@ pub fn definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "get_journal",
+            "description": "Query the durable trade journal: fills with realized PnL, fees and the rationale that placed them, plus totals for the filtered range. Filter by symbol, side, venue, source and time. The summary covers every matching fill; `fills` is only the page, so use it to answer 'how did SOL do yesterday' rather than paging through the ring.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Trading pair, e.g. SOL/USDT"},
+                    "side": {"type": "string", "enum": ["buy", "sell"]},
+                    "venue": {"type": "string", "description": "paper, binance, kraken or hyperliquid"},
+                    "source": {"type": "string", "description": "Who placed the fill, e.g. paper or engine"},
+                    "from_ms": {"type": "number", "description": "Earliest fill timestamp, inclusive"},
+                    "to_ms": {"type": "number", "description": "Latest fill timestamp, inclusive"},
+                    "limit": {"type": "number", "description": "Page size, default 100, at most 1000"}
+                }
+            }
+        }),
+        json!({
             "name": "fetch_onchain_data",
             "description": "Read-only on-chain data: native balance and token holdings on Solana or EVM chains.",
             "inputSchema": {
@@ -121,6 +137,7 @@ pub async fn call(ctx: &Context, name: &str, args: Value) -> Result<String, Stri
         "get_market_data" => market_data(ctx, args).await,
         "get_risk_state" => get(ctx, "/api/risk").await,
         "get_trade_history" => trade_history(ctx, args).await,
+        "get_journal" => journal(ctx, args).await,
         "fetch_onchain_data" => onchain(ctx, args).await,
         "set_strategy" => set_strategy(ctx, args).await,
         "get_agent_logs" => logs(ctx, args).await,
@@ -291,6 +308,47 @@ async fn trade_history(ctx: &Context, args: Value) -> Result<String, String> {
         .unwrap_or(50.0)
         .clamp(1.0, 500.0) as usize;
     get(ctx, &format!("/api/trades?limit={limit}")).await
+}
+
+async fn journal(ctx: &Context, args: Value) -> Result<String, String> {
+    let mut query: Vec<(&str, String)> = Vec::new();
+    for key in ["symbol", "side", "venue", "source"] {
+        if let Some(value) = args.get(key).and_then(|v| v.as_str()) {
+            let value = value.trim();
+            if !value.is_empty() {
+                query.push((key, value.to_string()));
+            }
+        }
+    }
+    for key in ["from_ms", "to_ms"] {
+        if let Some(value) = args.get(key).and_then(|v| v.as_i64()) {
+            query.push((key, value.to_string()));
+        }
+    }
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(100.0)
+        .clamp(1.0, 1_000.0) as i64;
+    query.push(("limit", limit.to_string()));
+
+    let response = ctx
+        .http
+        .get(format!("{}/api/journal", ctx.core_url))
+        .query(&query)
+        .send()
+        .await
+        .map_err(|e| format!("core unreachable: {e}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("could not read the core response: {e}"))?;
+    if status.is_success() {
+        Ok(text)
+    } else {
+        Err(format!("core returned {status}: {text}"))
+    }
 }
 
 async fn logs(ctx: &Context, args: Value) -> Result<String, String> {

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const MAX_TICKS: usize = 2_000;
-const MAX_TRADES: usize = 1_000;
+pub const MAX_TRADES: usize = 1_000;
 const MAX_LOGS: usize = 2_000;
 const MAX_ORDERS: usize = 500;
 const MAX_BROADCASTS: usize = 500;

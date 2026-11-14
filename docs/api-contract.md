@@ -15,6 +15,7 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 | GET | `/api/portfolio` | `PortfolioSnapshot` |
 | GET | `/api/positions` | `Position[]` |
 | GET | `/api/trades?limit=200` | `TradeRecord[]`, newest first |
+| GET | `/api/journal?symbol=&side=&venue=&source=&from_ms=&to_ms=&limit=100` | `JournalPage` — filtered fills plus range totals (see below) |
 | GET | `/api/logs?limit=200&source=agent` | `LogEntry[]`, newest first |
 | GET | `/api/ticks?limit=200` | `MarketTick[]`, newest first |
 | POST | `/api/logs` | Body `LogEntry` (source/level/message/context) — the AI agent pushes its reasoning here |
@@ -217,6 +218,65 @@ Response `200`: `{ "ok": true }`
 
 Response `400` (plain text): `unknown order`, or
 `order … is filled: only a resting order can be cancelled`.
+
+### `GET /api/journal`
+
+`GET /api/trades` reports the engine's in-memory ring — the last few hundred
+fills, unfiltered. The journal is the durable view: it reads the SQLite store
+when one is configured and normalises the answer, so the same client works
+either way. Filters are all optional and compose with AND.
+
+| Parameter | Meaning |
+| --- | --- |
+| `symbol` | Exact symbol, e.g. `SOL/USDT` |
+| `side` | `buy` or `sell` |
+| `venue` | A known venue (`paper`, `binance`, `kraken`, `hyperliquid`, …) |
+| `source` | `agent`, `strategy` or `manual` |
+| `from_ms` / `to_ms` | Inclusive epoch-millisecond bounds |
+| `limit` | Page size, clamped to `1..=1000` (default `100`) |
+
+```json
+{
+  "query": {
+    "symbol": "SOL/USDT", "side": null, "venue": null, "source": null,
+    "from_ms": null, "to_ms": null, "limit": 100
+  },
+  "fills": [
+    {
+      "id": "2c1f…", "venue": "binance", "symbol": "SOL/USDT", "side": "buy",
+      "qty": 2.0, "price": 130.0, "fee": 0.0104, "realized_pnl": 0.0,
+      "ts_ms": 1700000003000, "rationale": "momentum breakout on 5m",
+      "source": "agent"
+    }
+  ],
+  "summary": {
+    "fills": 12, "buys": 7, "sells": 5,
+    "bought_usd": 1820.0, "sold_usd": 1440.5,
+    "fees_usd": 3.26, "realized_pnl_usd": 84.12,
+    "winning_fills": 3, "losing_fills": 2,
+    "gross_profit_usd": 140.4, "gross_loss_usd": -56.28,
+    "profit_factor": 2.49
+  }
+}
+```
+
+**The page is not the range.** `fills` is at most `limit` rows, newest first;
+`summary` aggregates *everything* the filter matched. Asking for `limit=1` in a
+month with forty fills returns one fill and a summary of forty. `profit_factor`
+is `null` when nothing in the range lost money, because the ratio is undefined
+rather than infinite.
+
+`realized_pnl_usd` sums the per-fill `realized_pnl`; it is the booked result of
+closing fills, not a mark on open positions.
+
+Errors are JSON with `"ok": false` and a stable `code`:
+
+- `400 journal_invalid_query` — an unknown `side` or `venue`, or `from_ms`
+  after `to_ms`.
+- `500 journal_unavailable` — the store refused the read.
+
+Without `OPENETHER_STATE_DB` the filter runs over the engine ring, so the shape
+is identical but the history is only as long as the process has kept it.
 
 ### `POST /api/wallet/sign-dry-run`
 
@@ -853,6 +913,7 @@ Tools:
 | `get_market_data` | `{symbol, venue?, lookback?}` | recent ticks + last price |
 | `get_risk_state` | `{}` | breaker state and utilisation |
 | `get_trade_history` | `{limit?}` | recent fills |
+| `get_journal` | `{symbol?, side?, venue?, source?, from_ms?, to_ms?, limit?}` | `JournalPage` — filtered fills plus range totals |
 | `fetch_onchain_data` | `{chain, address, ...}` | wallet balances / token holdings |
 | `set_strategy` | `{path}` | hot-swap the WASM strategy |
 | `get_agent_logs` | `{limit?}` | engine-side logs |

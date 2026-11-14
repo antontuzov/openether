@@ -30,6 +30,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/portfolio", get(portfolio))
         .route("/api/positions", get(positions))
         .route("/api/trades", get(trades))
+        .route("/api/journal", get(journal))
         .route("/api/logs", get(logs))
         .route("/api/logs", post(push_log))
         .route("/api/ticks", get(ticks))
@@ -199,6 +200,113 @@ async fn trades(
     Query(query): Query<LimitQuery>,
 ) -> Json<Vec<TradeRecord>> {
     Json(state.trades(query.limit.unwrap_or(200)))
+}
+
+#[derive(Debug, Deserialize)]
+struct JournalQuery {
+    symbol: Option<String>,
+    side: Option<String>,
+    venue: Option<String>,
+    source: Option<String>,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+    limit: Option<usize>,
+}
+
+/// A filtered, summarised view of the trade journal.
+///
+/// The fills come from the durable store when there is one, so the journal
+/// spans restarts and is not capped by the engine's in-memory ring. Without a
+/// store, the same filters run over the ring the engine keeps.
+async fn journal(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<JournalQuery>,
+) -> Response {
+    let side = match query.side.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => match Side::parse(raw) {
+            Some(side) => Some(side),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "code": "journal_invalid_query",
+                        "error": "side must be buy or sell",
+                    })),
+                )
+                    .into_response()
+            }
+        },
+    };
+    let venue = match query.venue.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => match Venue::parse(raw) {
+            Some(venue) => Some(venue),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "code": "journal_invalid_query",
+                        "error": format!("unknown venue: {raw}"),
+                    })),
+                )
+                    .into_response()
+            }
+        },
+    };
+    let filter = crate::store::JournalFilter {
+        symbol: query
+            .symbol
+            .map(|symbol| symbol.trim().to_string())
+            .filter(|symbol| !symbol.is_empty()),
+        side,
+        venue,
+        source: query
+            .source
+            .map(|source| source.trim().to_string())
+            .filter(|source| !source.is_empty()),
+        from_ms: query.from_ms,
+        to_ms: query.to_ms,
+        limit: query.limit.unwrap_or(100),
+    };
+    if let (Some(from_ms), Some(to_ms)) = (filter.from_ms, filter.to_ms) {
+        if from_ms > to_ms {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "code": "journal_invalid_query",
+                    "error": "from_ms must not be after to_ms",
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    match state.store.as_ref() {
+        Some(store) => match store.journal(&filter) {
+            Ok(page) => (StatusCode::OK, Json(page)).into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "code": "journal_unavailable",
+                    "error": error.to_string(),
+                })),
+            )
+                .into_response(),
+        },
+        None => {
+            let fills = state.trades(crate::engine::MAX_TRADES);
+            (
+                StatusCode::OK,
+                Json(crate::store::page_from_memory(&fills, &filter)),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn logs(
