@@ -685,6 +685,12 @@ impl ExchangeConnector for BinanceConnector {
             )));
         }
 
+        if req.oco_group.is_some() {
+            return Err(ExchangeError::InvalidRequest(
+                "this client cannot link two separate orders into a binance OCO; submit the stop and the target separately and cancel the survivor".into(),
+            ));
+        }
+
         let symbol = to_binance_symbol(&req.symbol);
         let mut params: Vec<(&str, String)> = vec![
             ("symbol", symbol.clone()),
@@ -697,6 +703,8 @@ impl ExchangeConnector for BinanceConnector {
                 match req.order_type {
                     OrderType::Market => "MARKET",
                     OrderType::Limit => "LIMIT",
+                    OrderType::Stop => "STOP_LOSS",
+                    OrderType::TakeProfit => "TAKE_PROFIT",
                 }
                 .to_string(),
             ),
@@ -718,6 +726,23 @@ impl ExchangeConnector for BinanceConnector {
                 }
                 params.push(("timeInForce", "GTC".to_string()));
                 params.push(("price", format_qty(price)));
+            }
+            // STOP_LOSS / TAKE_PROFIT trade at market once `stopPrice` is
+            // reached, which is exactly the trigger-and-fill semantics the
+            // engine asks for.
+            OrderType::Stop | OrderType::TakeProfit => {
+                let Some(trigger) = req.trigger_price else {
+                    return Err(ExchangeError::InvalidRequest(format!(
+                        "{} orders require a trigger price",
+                        req.order_type.as_str()
+                    )));
+                };
+                if !trigger.is_finite() || trigger <= 0.0 {
+                    return Err(ExchangeError::InvalidRequest(format!(
+                        "trigger price must be a positive finite number (got {trigger})"
+                    )));
+                }
+                params.push(("stopPrice", format_qty(trigger)));
             }
         }
 

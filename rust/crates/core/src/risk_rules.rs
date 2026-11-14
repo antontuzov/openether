@@ -25,10 +25,13 @@ pub const CONTRACT_VERSION: u32 = 1;
 ///
 /// A refusal is reported with the first check that failed, so the order is
 /// part of the contract: the browser simulator walks the same list.
-pub const CHECK_ORDER: [&str; 15] = [
+pub const CHECK_ORDER: [&str; 18] = [
     "breaker_open",
     "invalid_quantity",
     "invalid_price",
+    "invalid_trigger",
+    "trigger_already_crossed",
+    "conditional_not_reduce_only",
     "invalid_equity",
     "invalid_symbol",
     "symbol_not_allowed",

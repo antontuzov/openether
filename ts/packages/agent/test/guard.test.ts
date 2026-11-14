@@ -116,6 +116,20 @@ describe('validateToolArguments', () => {
     expect(validateToolArguments('execute_trade', { ...valid, symbol }).ok).toBe(false);
   });
 
+  it.each(['stop', 'take_profit'])('needs a trigger for a %s exit', (orderType) => {
+    const exit = { ...valid, side: 'sell', order_type: orderType, trigger_price: 130 };
+    expect(validateToolArguments('execute_trade', exit)).toEqual({ ok: true });
+    for (const trigger_price of [undefined, null, 0, -1, Number.NaN, '130']) {
+      expect(validateToolArguments('execute_trade', { ...exit, trigger_price }).ok).toBe(false);
+    }
+  });
+
+  it('rejects an order type the venue does not have', () => {
+    expect(validateToolArguments('execute_trade', { ...valid, order_type: 'trailing_stop' }).ok).toBe(
+      false,
+    );
+  });
+
   it('does not constrain other tools', () => {
     expect(validateToolArguments('get_portfolio', {})).toEqual({ ok: true });
     expect(validateToolArguments('get_orders', {})).toEqual({ ok: true });

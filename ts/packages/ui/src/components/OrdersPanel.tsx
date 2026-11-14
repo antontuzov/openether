@@ -101,7 +101,7 @@ export function OrdersPanel({ orders, onCancel }: OrdersPanelProps) {
                   const filled = filledQty(order);
                   const active = isActive(order);
                   const average = avgFillPrice(order);
-                  const price = filled > 0 ? average : order.limit_price;
+                  const price = filled > 0 ? average : (order.trigger_price ?? order.limit_price);
                   return (
                     <tr key={order.order_id}>
                       <td className="num dim" title={order.order_id}>
@@ -113,7 +113,15 @@ export function OrdersPanel({ orders, onCancel }: OrdersPanelProps) {
                           {order.side.toUpperCase()}
                         </span>
                       </td>
-                      <td className="dim">{order.order_type}</td>
+                      <td className="dim">
+                        {order.order_type}
+                        {active && order.oco_group !== null ? (
+                          <span className="orders__rest" title={`OCO group ${order.oco_group}`}>
+                            {' '}
+                            · oco
+                          </span>
+                        ) : null}
+                      </td>
                       <td className="ta-r num">
                         {fmtQty(filled)} / {fmtQty(order.qty)}
                         {filled > 0 && active ? (
@@ -122,6 +130,9 @@ export function OrdersPanel({ orders, onCancel }: OrdersPanelProps) {
                       </td>
                       <td className="ta-r num dim">
                         {price === null ? 'market' : `$${fmtPrice(price)}`}
+                        {filled === 0 && order.trigger_price !== null ? (
+                          <span className="orders__rest"> · trigger</span>
+                        ) : null}
                         {filled > 0 ? (
                           <span className="orders__rest"> · fee {fmtQty(totalFee(order))}</span>
                         ) : null}

@@ -668,10 +668,18 @@ impl ExchangeConnector for KrakenConnector {
             )));
         }
 
+        if req.oco_group.is_some() {
+            return Err(ExchangeError::InvalidRequest(
+                "kraken does not link two orders into an OCO; submit the stop and the target separately and cancel the survivor".into(),
+            ));
+        }
+
         let pair = pair_for(&req.symbol);
         let order_type = match req.order_type {
             OrderType::Market => "market",
             OrderType::Limit => "limit",
+            OrderType::Stop => "stop-loss",
+            OrderType::TakeProfit => "take-profit",
         };
         let mut params: Vec<(&str, String)> = vec![
             ("pair", pair.clone()),
@@ -707,6 +715,23 @@ impl ExchangeConnector for KrakenConnector {
                     )));
                 }
                 params.push(("price", format_qty(price)));
+            }
+            // Kraken calls the trigger `price` for its conditional order types,
+            // and trades at market once it is reached. That is the semantics the
+            // engine asks for, so the same field carries the trigger.
+            OrderType::Stop | OrderType::TakeProfit => {
+                let Some(trigger) = req.trigger_price else {
+                    return Err(ExchangeError::InvalidRequest(format!(
+                        "{} orders require a trigger price",
+                        req.order_type.as_str()
+                    )));
+                };
+                if !trigger.is_finite() || trigger <= 0.0 {
+                    return Err(ExchangeError::InvalidRequest(format!(
+                        "trigger price must be a positive finite number (got {trigger})"
+                    )));
+                }
+                params.push(("price", format_qty(trigger)));
             }
         }
 

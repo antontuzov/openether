@@ -9,7 +9,7 @@ pub fn definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "execute_trade",
-            "description": "Submit a buy or sell order to the configured venue. The order passes through a non-bypassable risk layer; a rejection is final and must not be retried without a new plan. In paper mode the trade is simulated. An accepted order is not a fill: a limit order rests until the price crosses it, so verify the outcome with get_orders.",
+            "description": "Submit a buy or sell order to the configured venue. The order passes through a non-bypassable risk layer; a rejection is final and must not be retried without a new plan. In paper mode the trade is simulated. An accepted order is not a fill: a limit order rests until the price crosses it, so verify the outcome with get_orders. A stop or take_profit is a reduce-only exit the venue holds: it fires even if this process is down, so use one to protect an open position, and give two exits the same oco_group on the paper venue so filling one cancels the other.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -17,8 +17,11 @@ pub fn definitions() -> Vec<Value> {
                     "side": {"type": "string", "enum": ["buy", "sell"]},
                     "qty": {"type": "number", "description": "Order size in units of the base asset"},
                     "venue": {"type": "string", "description": "Optional venue override; defaults to the engine venue"},
-                    "order_type": {"type": "string", "enum": ["market", "limit"]},
-                    "limit_price": {"type": "number"},
+                    "order_type": {"type": "string", "enum": ["market", "limit", "stop", "take_profit"], "description": "market (default) fills now; limit rests at limit_price; stop and take_profit wait for trigger_price"},
+                    "limit_price": {"type": "number", "description": "Required for a limit order"},
+                    "trigger_price": {"type": "number", "description": "Required for stop and take_profit: the price that fires the exit"},
+                    "reduce_only": {"type": "boolean", "description": "Required for stop and take_profit: the order may only close a position"},
+                    "oco_group": {"type": "string", "description": "Orders sharing a group cancel each other when one fills (paper venue)"},
                     "rationale": {"type": "string", "description": "Why this trade is being made; stored with the trade"}
                 },
                 "required": ["symbol", "side", "qty"]
@@ -157,6 +160,15 @@ async fn execute_trade(ctx: &Context, args: Value) -> Result<String, String> {
     }
     if let Some(limit_price) = args.get("limit_price").and_then(|v| v.as_f64()) {
         body["limit_price"] = json!(limit_price);
+    }
+    if let Some(trigger_price) = args.get("trigger_price").and_then(|v| v.as_f64()) {
+        body["trigger_price"] = json!(trigger_price);
+    }
+    if let Some(reduce_only) = args.get("reduce_only").and_then(|v| v.as_bool()) {
+        body["reduce_only"] = json!(reduce_only);
+    }
+    if let Some(oco_group) = args.get("oco_group").and_then(|v| v.as_str()) {
+        body["oco_group"] = json!(oco_group);
     }
 
     let response = ctx
@@ -445,5 +457,27 @@ mod tests {
             .find(|tool| tool["name"] == "cancel_order")
             .expect("cancel_order is advertised");
         assert_eq!(cancel["inputSchema"]["required"], json!(["order_id"]));
+    }
+
+    /// The model can only ask for a protective exit if the schema names it and
+    /// carries the field that arms it.
+    #[test]
+    fn the_trade_schema_offers_the_conditional_order_types() {
+        let definitions = definitions();
+        let trade = definitions
+            .iter()
+            .find(|tool| tool["name"] == "execute_trade")
+            .expect("execute_trade is advertised");
+        let properties = &trade["inputSchema"]["properties"];
+        assert_eq!(
+            properties["order_type"]["enum"],
+            json!(["market", "limit", "stop", "take_profit"])
+        );
+        for field in ["trigger_price", "reduce_only", "oco_group"] {
+            assert!(
+                properties.get(field).is_some(),
+                "the trade schema does not carry {field}"
+            );
+        }
     }
 }

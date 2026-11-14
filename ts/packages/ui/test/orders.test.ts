@@ -24,6 +24,8 @@ function order(overrides: Partial<TrackedOrder> = {}): TrackedOrder {
     side: 'buy',
     order_type: 'limit',
     limit_price: 130,
+    trigger_price: null,
+    oco_group: null,
     qty: 2,
     status: 'accepted',
     rationale: '',

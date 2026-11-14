@@ -29,6 +29,10 @@ Read this before running anything.
   and the API refuses to sign at all if dry run is switched off.
 - **The risk layer is absolute.** The agent has no tool, flag or prompt that
   reaches around it. See [Risk layer](#risk-layer).
+- **Protective exits live at the venue, not in the agent's head.** A stop or
+  take-profit is a reduce-only order the venue holds and fires from its own
+  price feed, so the exit survives a core restart, and the risk layer refuses a
+  conditional order that could open a position or fire on arrival.
 - **Keys are never hardcoded.** The keystore is AES-256-GCM with an
   Argon2id-derived key. The passphrase is supplied per request, held only for
   the signing call, and zeroized afterwards.
@@ -184,8 +188,8 @@ and memory limits and can be hot-swapped at runtime via
 ### Tests
 
 ```bash
-cargo test --workspace --manifest-path rust/Cargo.toml   # 171 tests
-pnpm --dir ts -r test                                    # 124 tests
+cargo test --workspace --manifest-path rust/Cargo.toml   # 185 tests
+pnpm --dir ts -r test                                    # 127 tests
 pnpm --dir ts -r typecheck
 pnpm --dir ts -r build
 ```
@@ -223,18 +227,21 @@ order is refused:
 | 1 | The breaker is closed | `breaker_open` |
 | 2 | The size is a positive number | `invalid_quantity` |
 | 3 | The price is known and positive | `invalid_price` |
-| 4 | The equity is known | `invalid_equity` |
-| 5 | The symbol is not empty | `invalid_symbol` |
-| 6 | The symbol is on the allowlist | `symbol_not_allowed` |
-| 7 | The venue is on the allowlist | `venue_not_allowed` |
-| 8 | The contract is on the allowlist | `contract_not_allowed` |
-| 9 | The order is large enough | `notional_too_small` |
-| 10 | The order is under the per-order cap | `notional_too_large` |
-| 11 | The sell does not flip the position | `reduce_only_violation` |
-| 12 | The position is under the size cap | `position_size_exceeds_max_pct` |
-| 13 | The book is under the gross cap | `gross_exposure_exceeded` |
-| 14 | There is room for another position | `max_open_positions` |
-| 15 | The probe order is small enough | `half_open_probe_too_large` |
+| 4 | A conditional order has a real trigger | `invalid_trigger` |
+| 5 | That trigger is still ahead of the market | `trigger_already_crossed` |
+| 6 | A conditional order only reduces a position | `conditional_not_reduce_only` |
+| 7 | The equity is known | `invalid_equity` |
+| 8 | The symbol is not empty | `invalid_symbol` |
+| 9 | The symbol is on the allowlist | `symbol_not_allowed` |
+| 10 | The venue is on the allowlist | `venue_not_allowed` |
+| 11 | The contract is on the allowlist | `contract_not_allowed` |
+| 12 | The order is large enough | `notional_too_small` |
+| 13 | The order is under the per-order cap | `notional_too_large` |
+| 14 | The sell does not flip the position | `reduce_only_violation` |
+| 15 | The position is under the size cap | `position_size_exceeds_max_pct` |
+| 16 | The book is under the gross cap | `gross_exposure_exceeded` |
+| 17 | There is room for another position | `max_open_positions` |
+| 18 | The probe order is small enough | `half_open_probe_too_large` |
 
 The venue then applies its own rules on top: `no_position` when there is
 nothing to sell, `reduce_only` when the sell would flip the position, and
@@ -407,6 +414,12 @@ is not an advisory number. An order above it is refused with
   `place_order` returns `Unsupported`.
 - **The paper venue never trades live**, and `openether-live arm` refuses to
   arm it.
+- **Protective exits are venue orders on every connector.** Binance maps them
+  to `STOP_LOSS` / `TAKE_PROFIT` with `stopPrice`, Kraken to `stop-loss` /
+  `take-profit`, and the paper venue fires them from its price feed.
+- **One-cancels-the-other is enforced by the paper venue only.** Binance and
+  Kraken refuse a request that carries an `oco_group` rather than leave two
+  exits live while claiming they are linked.
 - **On-chain transactions are still dry-run only.** The wallet signs and logs;
   there is no broadcast path.
 
@@ -680,7 +693,7 @@ Exchange credentials are only read when live trading is armed. `.env`,
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **171 passing**, including the encrypted keystore,
+- `cargo test --workspace` — **185 passing**, including the encrypted keystore,
   EVM and Solana dry-run signing, signature tampering, wrong-passphrase
   rejection, and the API refusing to sign when dry run is off. Two further
   tests are `#[ignore]`d because they need the network; both pass when run.
@@ -700,7 +713,7 @@ Checked locally on macOS (arm64):
   same accounts.
 - `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings`
   — clean, so the CI gate passes as written.
-- `pnpm -r test` — **124 passing** across the agent guard and verify loop, the
+- `pnpm -r test` — **127 passing** across the agent guard and verify loop, the
   data server, the browser trading engine and the order accounting.
 - `pnpm -r typecheck` and `pnpm -r build` — clean.
 - The risk contract proven to be shared: the Rust risk layer and the browser
@@ -768,6 +781,19 @@ Checked locally on macOS (arm64):
   A 1 ETH order at $3,285 (32.9% of equity) tripped the breaker with
   `position_size_exceeds_max_pct` and every later order was refused until the
   breaker was reset.
+- Protective exits verified end to end against a **running core**, through HTTP
+  and the real MCP server: a non-reduce-only stop was refused with
+  `conditional_not_reduce_only`, a stop without a trigger with
+  `invalid_trigger`, and a sell stop above the market with
+  `trigger_already_crossed`. After opening a long, a stop and a take-profit were
+  armed as one `oco_group`, both `accepted` with their `trigger_price` reported.
+  The take-profit fired one second later at the market with exit slippage, the
+  position went flat, the venue no longer knew the stop (`DELETE` → "unknown
+  paper order id"), and the engine retired the sibling to `cancelled` after the
+  grace window. Through the MCP server, the non-reduce-only stop was refused
+  before it reached the venue, a reduce-only stop was accepted, `get_orders`
+  showed its trigger and group, and that stop later fired and closed the long
+  (entry 142.17, exit 142.16, one fee per side).
 - The wallet valued from **real mainnet data**: a public Ethereum address read
   over JSON-RPC returned 0.8083523704434918 ETH plus USDC and USDT with the
   right 6 decimals and symbols, priced at $1,931.68 / $1.0008 / $1.0039 for a

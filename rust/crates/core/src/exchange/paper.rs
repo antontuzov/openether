@@ -165,10 +165,44 @@ struct PaperOrder {
     symbol: String,
     side: Side,
     qty: f64,
+    /// The limit price of a limit order, or the trigger of a conditional one.
     price: f64,
+    order_type: OrderType,
     reduce_only: bool,
+    /// Orders sharing this group are one-cancels-the-other.
+    oco_group: Option<String>,
     rationale: String,
     created_ts_ms: i64,
+}
+
+impl PaperOrder {
+    /// Whether this order executes at `price`.
+    ///
+    /// A limit waits for the price to cross it; a conditional waits for its
+    /// trigger, then behaves like a market order.
+    fn triggers_at(&self, price: f64) -> bool {
+        match self.order_type {
+            OrderType::Limit => match self.side {
+                Side::Buy => price <= self.price,
+                Side::Sell => price >= self.price,
+            },
+            OrderType::Stop | OrderType::TakeProfit => {
+                self.order_type.trigger_hit(self.side, self.price, price)
+            }
+            OrderType::Market => false,
+        }
+    }
+
+    /// The price this order executes at once it triggers.
+    ///
+    /// A limit order fills at its limit (conservative). A conditional becomes a
+    /// market order, so it fills at the market with slippage against the trader.
+    fn execution_price(&self, price: f64, slippage_bps: f64) -> f64 {
+        match self.order_type {
+            OrderType::Limit => self.price,
+            _ => price * (1.0 + self.side.sign() * slippage_bps / 10_000.0),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -318,27 +352,29 @@ impl PaperConnector {
             state.mark_price(symbol)
         };
 
-        // Fill resting limit orders that the new price crosses.
-        let crossed: Vec<usize> = state
+        // Fill every resting order the new price triggers. Ids, not indices:
+        // a fill can also cancel an OCO sibling, which would shift the list.
+        let firing: Vec<String> = state
             .open_orders
             .iter()
-            .enumerate()
-            .filter(|(_, o)| o.symbol == symbol)
-            .filter(|(_, o)| match o.side {
-                Side::Buy => new_price <= o.price,
-                Side::Sell => new_price >= o.price,
-            })
-            .map(|(i, _)| i)
+            .filter(|o| o.symbol == symbol)
+            .filter(|o| o.triggers_at(new_price))
+            .map(|o| o.order_id.clone())
             .collect();
 
-        // The mark follows the last trade: a filled limit order becomes the
-        // new mark price (the fill happened at the limit price).
+        // The mark follows the last trade: a filled order becomes the new mark
+        // price (a limit fills at its limit, a conditional at the market).
         let mut mark = new_price;
-        for idx in crossed {
-            let Some(order) = state.open_orders.get(idx).cloned() else {
+        for order_id in firing {
+            let Some(idx) = state
+                .open_orders
+                .iter()
+                .position(|o| o.order_id == order_id)
+            else {
                 continue;
             };
-            state.open_orders.remove(idx);
+            let order = state.open_orders.remove(idx);
+            let fill_price = order.execution_price(new_price, cfg.slippage_bps);
             match execute_fill(
                 state,
                 cfg,
@@ -346,23 +382,41 @@ impl PaperConnector {
                     symbol: &order.symbol,
                     side: order.side,
                     qty: order.qty,
-                    price: order.price,
+                    price: fill_price,
                     reduce_only: order.reduce_only,
                     rationale: &order.rationale,
                     order_id: &order.order_id,
                 },
             ) {
                 Ok(trade) => {
-                    mark = order.price;
+                    mark = fill_price;
                     tracing::info!(
                         venue = "paper",
                         symbol = %trade.symbol,
                         side = %trade.side,
                         qty = trade.qty,
                         price = trade.price,
+                        order_type = order.order_type.as_str(),
                         client_id = %order.client_id,
-                        "limit order filled"
+                        "resting order filled"
                     );
+                    // One-cancels-the-other: the sibling guards the same
+                    // position, which this fill just changed, so it must go.
+                    if let Some(group) = order.oco_group.as_deref() {
+                        let before = state.open_orders.len();
+                        state
+                            .open_orders
+                            .retain(|o| o.oco_group.as_deref() != Some(group));
+                        let cancelled = before - state.open_orders.len();
+                        if cancelled > 0 {
+                            tracing::info!(
+                                venue = "paper",
+                                group,
+                                cancelled,
+                                "OCO sibling cancelled after a fill"
+                            );
+                        }
+                    }
                     push_trade(state, trade, &order.order_id);
                 }
                 Err(err) => {
@@ -370,8 +424,9 @@ impl PaperConnector {
                         venue = "paper",
                         symbol = %order.symbol,
                         order_id = %order.order_id,
+                        order_type = order.order_type.as_str(),
                         error = %err,
-                        "resting limit order could not be filled and was dropped"
+                        "resting order could not be filled and was dropped"
                     );
                 }
             }
@@ -574,6 +629,48 @@ fn push_trade(state: &mut PaperState, trade: TradeRecord, order_id: &str) {
         let excess = state.trades.len() - MAX_TRADES;
         state.trades.drain(0..excess);
         state.fills.drain(0..excess);
+    }
+}
+
+/// Validate a reduce-only order against the open position and clamp it to what
+/// is actually held, so a protective order can never trade more than the
+/// position it protects. Returns the quantity that will rest at the venue.
+fn reduce_only_qty(state: &PaperState, req: &OrderRequest) -> ExchangeResult<f64> {
+    if !req.reduce_only {
+        return Ok(req.qty);
+    }
+    let pos_qty = state.position_qty(&req.symbol);
+    match req.side {
+        Side::Sell => {
+            if pos_qty <= 0.0 {
+                return Err(ExchangeError::InvalidRequest(
+                    "reduce-only sell requires an open long position".into(),
+                ));
+            }
+            Ok(req.qty.min(pos_qty))
+        }
+        Side::Buy => {
+            if pos_qty >= 0.0 {
+                return Err(ExchangeError::InvalidRequest(
+                    "reduce-only buy requires an open short position".into(),
+                ));
+            }
+            Ok(req.qty.min(-pos_qty))
+        }
+    }
+}
+
+/// Normalise the one-cancels-the-other group id.
+///
+/// A blank id would link an order to nothing, so the caller would believe two
+/// exits protect each other when in fact both are independent.
+fn oco_group(req: &OrderRequest) -> ExchangeResult<Option<String>> {
+    match req.oco_group.as_deref().map(str::trim) {
+        None => Ok(None),
+        Some("") => Err(ExchangeError::InvalidRequest(
+            "oco_group must not be blank".into(),
+        )),
+        Some(group) => Ok(Some(group.to_string())),
     }
 }
 
@@ -852,29 +949,7 @@ impl ExchangeConnector for PaperConnector {
 
                 // Validate the reduce-only semantics and the margin
                 // requirement up front; both are re-checked at fill time.
-                let pos_qty = state.position_qty(&req.symbol);
-                let mut qty = req.qty;
-                if req.reduce_only {
-                    match req.side {
-                        Side::Sell => {
-                            if pos_qty <= 0.0 {
-                                return Err(ExchangeError::InvalidRequest(
-                                    "reduce-only sell requires an open long position".into(),
-                                ));
-                            }
-                            qty = qty.min(pos_qty);
-                        }
-                        Side::Buy => {
-                            if pos_qty >= 0.0 {
-                                return Err(ExchangeError::InvalidRequest(
-                                    "reduce-only buy requires an open short position".into(),
-                                ));
-                            }
-                            qty = qty.min(-pos_qty);
-                        }
-                    }
-                }
-
+                let qty = reduce_only_qty(&state, req)?;
                 let available = state.cash - state.locked_margin();
                 let required = qty * limit_price;
                 if required > available {
@@ -893,7 +968,9 @@ impl ExchangeConnector for PaperConnector {
                     side: req.side,
                     qty,
                     price: limit_price,
+                    order_type: OrderType::Limit,
                     reduce_only: req.reduce_only,
+                    oco_group: oco_group(req)?,
                     rationale: req.rationale.clone(),
                     created_ts_ms: now_ms(),
                 });
@@ -906,6 +983,61 @@ impl ExchangeConnector for PaperConnector {
                     message: format!(
                         "resting limit order for {} {} @ {}",
                         qty, req.symbol, limit_price
+                    ),
+                })
+            }
+            // A stop or take-profit is the venue's order to watch, not the
+            // engine's: it fires from the price feed even if the core is down.
+            OrderType::Stop | OrderType::TakeProfit => {
+                let kind = req.order_type.as_str();
+                let Some(trigger) = req.trigger_price else {
+                    return Err(ExchangeError::InvalidRequest(format!(
+                        "{kind} orders require a trigger price"
+                    )));
+                };
+                if !trigger.is_finite() || trigger <= 0.0 {
+                    return Err(ExchangeError::InvalidRequest(format!(
+                        "trigger price must be a positive finite number (got {trigger})"
+                    )));
+                }
+                // The risk layer refuses this too; the venue refuses it so a
+                // caller cannot turn a protective order into a pending entry.
+                if !req.reduce_only {
+                    return Err(ExchangeError::InvalidRequest(format!(
+                        "{kind} orders must be reduce_only: they close a position, they do not open one"
+                    )));
+                }
+                let mark = state.mark_price(&req.symbol);
+                if req.order_type.trigger_hit(req.side, trigger, mark) {
+                    return Err(ExchangeError::InvalidRequest(format!(
+                        "{kind} trigger {trigger} is already crossed by the mark {mark}; a conditional order that fires immediately is a market order"
+                    )));
+                }
+
+                let qty = reduce_only_qty(&state, req)?;
+                let order_id = state.next_id("paper");
+                state.open_orders.push(PaperOrder {
+                    order_id: order_id.clone(),
+                    client_id: req.client_id.clone(),
+                    symbol: req.symbol.clone(),
+                    side: req.side,
+                    qty,
+                    price: trigger,
+                    order_type: req.order_type,
+                    reduce_only: true,
+                    oco_group: oco_group(req)?,
+                    rationale: req.rationale.clone(),
+                    created_ts_ms: now_ms(),
+                });
+                Ok(OrderAck {
+                    venue: Venue::Paper,
+                    order_id,
+                    client_id: req.client_id.clone(),
+                    status: OrderStatus::Accepted,
+                    accepted_ts_ms: now_ms(),
+                    message: format!(
+                        "armed {kind} to close {} {} at {}",
+                        qty, req.symbol, trigger
                     ),
                 })
             }
@@ -1339,6 +1471,171 @@ mod tests {
         assert!(c.resting_orders().is_empty());
         let err = c.cancel_order(&ack.order_id).await.expect_err("gone");
         assert!(matches!(err, ExchangeError::InvalidRequest(_)), "{err}");
+    }
+
+    /// A protective exit the venue holds: it fires from the price feed, not
+    /// from an engine loop, so a stop protects the position even if the core is
+    /// down.
+    fn conditional(symbol: &str, side: Side, kind: OrderType, trigger: f64) -> OrderRequest {
+        let mut req = market(symbol, side, 1.0);
+        req.order_type = kind;
+        req.trigger_price = Some(trigger);
+        req.reduce_only = true;
+        req
+    }
+
+    #[tokio::test]
+    async fn a_stop_sells_when_the_price_falls_through_the_trigger() {
+        let c = connector();
+        c.place_order(&market("SOL/USDT", Side::Buy, 1.0))
+            .await
+            .unwrap();
+
+        let ack = c
+            .place_order(&conditional("SOL/USDT", Side::Sell, OrderType::Stop, 130.0))
+            .await
+            .unwrap();
+        assert_eq!(ack.status, OrderStatus::Accepted);
+        assert_eq!(c.resting_orders().len(), 1);
+        assert_eq!(c.trades().len(), 1, "arming a stop is not a trade");
+
+        // Ahead of the trigger: still armed, nothing booked.
+        c.set_price("SOL/USDT", 135.0);
+        assert_eq!(c.resting_orders().len(), 1);
+        assert_eq!(c.trades().len(), 1);
+
+        // Through the trigger: fires as a market order with exit slippage.
+        c.set_price("SOL/USDT", 128.0);
+        assert!(c.resting_orders().is_empty());
+        let trades = c.trades();
+        assert_eq!(trades.len(), 2);
+        let expected = 128.0 * (1.0 - 2.0 / 10_000.0);
+        assert!(
+            (trades[1].price - expected).abs() < 1e-9,
+            "{}",
+            trades[1].price
+        );
+        assert!(c.positions().is_empty(), "the stop must close the long");
+    }
+
+    #[tokio::test]
+    async fn a_take_profit_sells_when_the_price_rises_to_it() {
+        let c = connector();
+        c.place_order(&market("SOL/USDT", Side::Buy, 1.0))
+            .await
+            .unwrap();
+
+        c.place_order(&conditional(
+            "SOL/USDT",
+            Side::Sell,
+            OrderType::TakeProfit,
+            150.0,
+        ))
+        .await
+        .unwrap();
+
+        c.set_price("SOL/USDT", 145.0);
+        assert_eq!(c.resting_orders().len(), 1, "below the target, still armed");
+
+        c.set_price("SOL/USDT", 151.0);
+        assert!(c.resting_orders().is_empty());
+        assert_eq!(c.trades().len(), 2);
+        assert!(c.realized_pnl() > 0.0, "the target was above the entry");
+        assert!(c.positions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_conditional_order_that_would_fire_at_once_is_refused() {
+        let c = connector();
+        c.place_order(&market("SOL/USDT", Side::Buy, 1.0))
+            .await
+            .unwrap();
+
+        // A sell stop above the market is already crossed.
+        let err = c
+            .place_order(&conditional("SOL/USDT", Side::Sell, OrderType::Stop, 150.0))
+            .await
+            .expect_err("a crossed trigger must be refused");
+        assert!(matches!(err, ExchangeError::InvalidRequest(_)), "{err}");
+        assert!(c.resting_orders().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_conditional_order_must_be_a_reduce_only_exit() {
+        let c = connector();
+        c.place_order(&market("SOL/USDT", Side::Buy, 1.0))
+            .await
+            .unwrap();
+
+        let mut req = conditional("SOL/USDT", Side::Sell, OrderType::Stop, 130.0);
+        req.reduce_only = false;
+        let err = c.place_order(&req).await.expect_err("must be reduce-only");
+        assert!(matches!(err, ExchangeError::InvalidRequest(_)), "{err}");
+        assert!(c.resting_orders().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_oco_group_cancels_the_sibling_when_one_side_fills() {
+        let c = connector();
+        c.place_order(&market("SOL/USDT", Side::Buy, 1.0))
+            .await
+            .unwrap();
+
+        let mut stop = conditional("SOL/USDT", Side::Sell, OrderType::Stop, 130.0);
+        stop.oco_group = Some("sol-exit".into());
+        let mut target = conditional("SOL/USDT", Side::Sell, OrderType::TakeProfit, 160.0);
+        target.oco_group = Some("sol-exit".into());
+
+        let stop_ack = c.place_order(&stop).await.unwrap();
+        c.place_order(&target).await.unwrap();
+        assert_eq!(c.resting_orders().len(), 2);
+
+        // The target fills; the stop on the same group must be gone.
+        c.set_price("SOL/USDT", 165.0);
+        assert!(
+            c.resting_orders().is_empty(),
+            "the OCO sibling was cancelled"
+        );
+        assert!(c.positions().is_empty());
+        assert_eq!(c.trades().len(), 2);
+
+        // The cancelled sibling is no longer a live order at the venue.
+        let err = c.cancel_order(&stop_ack.order_id).await.expect_err("gone");
+        assert!(matches!(err, ExchangeError::InvalidRequest(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_armed_conditional_can_be_cancelled() {
+        let c = connector();
+        c.place_order(&market("SOL/USDT", Side::Buy, 1.0))
+            .await
+            .unwrap();
+        let ack = c
+            .place_order(&conditional("SOL/USDT", Side::Sell, OrderType::Stop, 130.0))
+            .await
+            .unwrap();
+
+        c.cancel_order(&ack.order_id).await.unwrap();
+        c.set_price("SOL/USDT", 120.0);
+        assert_eq!(c.trades().len(), 1, "a cancelled stop must not fire");
+        assert_eq!(
+            c.positions().len(),
+            1,
+            "the position is no longer protected"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blank_oco_group_is_refused() {
+        let c = connector();
+        c.place_order(&market("SOL/USDT", Side::Buy, 1.0))
+            .await
+            .unwrap();
+        let mut stop = conditional("SOL/USDT", Side::Sell, OrderType::Stop, 130.0);
+        stop.oco_group = Some("   ".into());
+        let err = c.place_order(&stop).await.expect_err("must be refused");
+        assert!(matches!(err, ExchangeError::InvalidRequest(_)), "{err}");
+        assert!(c.resting_orders().is_empty());
     }
 
     #[tokio::test]

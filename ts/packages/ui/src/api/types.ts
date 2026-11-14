@@ -53,7 +53,7 @@ export interface TradeRecord {
 }
 
 /** Order type as serialised by the engine. */
-export type OrderType = 'market' | 'limit';
+export type OrderType = 'market' | 'limit' | 'stop' | 'take_profit';
 
 /** Lifecycle state of a submitted order. */
 export type OrderStatus = 'accepted' | 'filled' | 'rejected' | 'cancelled' | 'partially_filled';
@@ -86,6 +86,10 @@ export interface TrackedOrder {
   side: Side;
   order_type: OrderType;
   limit_price: number | null;
+  /** The price a stop or take_profit waits for. */
+  trigger_price: number | null;
+  /** Orders sharing a group cancel each other when one fills. */
+  oco_group: string | null;
   /** The quantity asked for, not the quantity filled. */
   qty: number;
   status: OrderStatus;

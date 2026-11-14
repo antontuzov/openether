@@ -38,14 +38,30 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 {
   "venue": "paper",
   "symbol": "SOL/USDT",
-  "side": "buy",
+  "side": "sell",
   "qty": 1.5,
-  "order_type": "market",
+  "order_type": "stop",
   "limit_price": null,
-  "reduce_only": false,
-  "rationale": "momentum breakout on 5m, risk 0.4% of equity"
+  "trigger_price": 136.5,
+  "reduce_only": true,
+  "oco_group": "sol-long-1",
+  "rationale": "protect the long: 2×ATR below the entry"
 }
 ```
+
+`order_type` is `market`, `limit`, `stop` or `take_profit`.
+
+- A **limit** order needs `limit_price` and rests until the price crosses it.
+- A **stop** is a reduce-only exit that fires as a market order when the price
+  reaches `trigger_price`: at or below it for a sell, at or above it for a buy.
+- A **take_profit** is the mirror: at or above the trigger for a sell, at or
+  below it for a buy.
+- Conditional orders must be `reduce_only` and their trigger must still be
+  ahead of the market — a trigger that is already crossed is refused with
+  `trigger_already_crossed`, because such an order is a market order.
+- `oco_group` links orders one-cancels-the-other. It is enforced by the paper
+  venue; the live venues refuse a group they cannot honour instead of pretending
+  both orders are protected.
 
 Response `200`:
 ```json
@@ -73,6 +89,8 @@ the venue's own trade history. `GET /api/orders` is where that truth is reported
     "side": "buy",
     "order_type": "limit",
     "limit_price": 130.0,
+    "trigger_price": null,
+    "oco_group": null,
     "qty": 2.0,
     "status": "partially_filled",
     "rationale": "momentum breakout on 5m",
@@ -90,6 +108,15 @@ the venue's own trade history. `GET /api/orders` is where that truth is reported
 
 Rules the engine holds itself to:
 
+- **A conditional order is held by the venue, not by the engine.** A stop or
+  take-profit rests at the venue and fires from its price feed, so the exit
+  survives a core restart. Once it fires, the fill is booked like any other and
+  the order moves to `filled`; a stop that fired while the core was down is
+  booked on the next reconciliation.
+- **An OCO sibling is cancelled by the venue when its partner fills.** The
+  cancelled sibling leaves the open list and is retired to `cancelled` after the
+  same grace window; the engine cannot see *why* an order left the list, so it
+  reports the one fact it has.
 - **Only venue-reported fills are booked.** A fill is matched by `order_id` and
   deduped by `(ts_ms, qty, price)`, so reconciliation can re-read an overlapping
   window without double-counting. There is no synthetic-fill fallback: an empty
@@ -298,6 +325,9 @@ Response `200`:
     "breaker_open",
     "invalid_quantity",
     "invalid_price",
+    "invalid_trigger",
+    "trigger_already_crossed",
+    "conditional_not_reduce_only",
     "invalid_equity",
     "invalid_symbol",
     "symbol_not_allowed",
@@ -316,6 +346,9 @@ Response `200`:
     "breaker_open",
     "invalid_quantity",
     "invalid_price",
+    "invalid_trigger",
+    "trigger_already_crossed",
+    "conditional_not_reduce_only",
     "invalid_equity",
     "invalid_symbol",
     "symbol_not_allowed",
@@ -395,7 +428,7 @@ Tools:
 
 | Tool | Args | Result |
 | --- | --- | --- |
-| `execute_trade` | `{venue, symbol, side, qty, order_type?, limit_price?, rationale?}` | risk verdict + venue acknowledgement (not proof of a fill) |
+| `execute_trade` | `{venue, symbol, side, qty, order_type?, limit_price?, trigger_price?, reduce_only?, oco_group?, rationale?}` | risk verdict + venue acknowledgement (not proof of a fill) |
 | `get_portfolio` | `{}` | portfolio snapshot with positions and PnL |
 | `get_orders` | `{}` | tracked orders with venue-confirmed fills; the Verify step reads this |
 | `cancel_order` | `{order_id}` | cancel a resting order; a refusal leaves it live |

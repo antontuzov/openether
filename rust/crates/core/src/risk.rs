@@ -425,6 +425,42 @@ impl RiskEngine {
                 breaker_state,
             );
         }
+        // A conditional order is an exit the venue holds for later, so it has to
+        // be a real price, still ahead of the market, and unable to open new
+        // exposure: a pending entry would be a position the limits never sized.
+        if req.order_type.is_conditional() {
+            let Some(trigger) = req.trigger_price.filter(|t| t.is_finite() && *t > 0.0) else {
+                return RiskVerdict::reject(
+                    "invalid_trigger",
+                    format!(
+                        "a {} order needs a positive finite trigger price, got {}",
+                        req.order_type.as_str(),
+                        req.trigger_price
+                            .map(|t| t.to_string())
+                            .unwrap_or_else(|| "none".into())
+                    ),
+                    breaker_state,
+                );
+            };
+            if req.order_type.trigger_hit(req.side, trigger, ctx.price) {
+                return RiskVerdict::reject(
+                    "trigger_already_crossed",
+                    format!(
+                        "the {} trigger {trigger} is already crossed by the market price {}; a conditional order that fires immediately is a market order",
+                        req.order_type.as_str(),
+                        ctx.price
+                    ),
+                    breaker_state,
+                );
+            }
+            if !req.reduce_only {
+                return RiskVerdict::reject(
+                    "conditional_not_reduce_only",
+                    "a stop or take-profit must be reduce_only: it closes a position and may never open one".to_string(),
+                    breaker_state,
+                );
+            }
+        }
         if !ctx.equity_usd.is_finite() || ctx.equity_usd <= 0.0 {
             return RiskVerdict::reject(
                 "invalid_equity",
@@ -961,6 +997,70 @@ mod tests {
         let verdict = risk.evaluate(&req, &context);
         assert!(!verdict.approved);
         assert_eq!(verdict.reason, "reduce_only_violation");
+    }
+
+    fn conditional(side: Side, trigger: f64) -> OrderRequest {
+        let mut req = OrderRequest::market(Venue::Paper, "SOL/USDT", side, 10.0);
+        req.order_type = OrderType::Stop;
+        req.trigger_price = Some(trigger);
+        req.reduce_only = true;
+        req
+    }
+
+    #[test]
+    fn a_conditional_order_needs_a_real_trigger() {
+        let (risk, _) = engine(cfg());
+        let mut context = ctx(10_000.0);
+        context.current_position_qty = 10.0;
+        for trigger in [None, Some(f64::NAN), Some(0.0), Some(-1.0)] {
+            let mut req = conditional(Side::Sell, 90.0);
+            req.trigger_price = trigger;
+            let verdict = risk.evaluate(&req, &context);
+            assert!(!verdict.approved, "{trigger:?}");
+            assert_eq!(verdict.reason, "invalid_trigger");
+        }
+    }
+
+    /// A conditional order that would fire the moment it is placed is a market
+    /// order wearing a trigger, and the agent should be told so.
+    #[test]
+    fn a_conditional_trigger_must_still_be_ahead_of_the_market() {
+        let (risk, _) = engine(cfg());
+        let mut context = ctx(10_000.0); // market price 100
+        context.current_position_qty = 10.0;
+        for (order_type, side, trigger) in [
+            (OrderType::Stop, Side::Sell, 120.0),
+            (OrderType::Stop, Side::Buy, 80.0),
+            (OrderType::TakeProfit, Side::Sell, 80.0),
+            (OrderType::TakeProfit, Side::Buy, 120.0),
+        ] {
+            let mut req = conditional(side, trigger);
+            req.order_type = order_type;
+            let verdict = risk.evaluate(&req, &context);
+            assert!(!verdict.approved, "{order_type:?} {side} {trigger}");
+            assert_eq!(verdict.reason, "trigger_already_crossed");
+        }
+    }
+
+    #[test]
+    fn a_conditional_order_may_not_open_a_position() {
+        let (risk, _) = engine(cfg());
+        let mut context = ctx(10_000.0);
+        context.current_position_qty = 10.0;
+        let mut req = conditional(Side::Sell, 90.0);
+        req.reduce_only = false;
+        let verdict = risk.evaluate(&req, &context);
+        assert!(!verdict.approved);
+        assert_eq!(verdict.reason, "conditional_not_reduce_only");
+    }
+
+    #[test]
+    fn a_reduce_only_stop_ahead_of_the_market_is_approved() {
+        let (risk, _) = engine(cfg());
+        let mut context = ctx(10_000.0);
+        context.current_position_qty = 10.0;
+        let verdict = risk.evaluate(&conditional(Side::Sell, 90.0), &context);
+        assert!(verdict.approved, "{}", verdict.detail);
     }
 
     #[test]

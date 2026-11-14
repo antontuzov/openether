@@ -114,6 +114,22 @@ export function validateToolArguments(
     if (typeof symbol !== 'string' || symbol.trim() === '') {
       return { ok: false, error: 'execute_trade needs a symbol' };
     }
+    const orderType = args['order_type'];
+    if (
+      orderType !== undefined &&
+      orderType !== 'market' &&
+      orderType !== 'limit' &&
+      orderType !== 'stop' &&
+      orderType !== 'take_profit'
+    ) {
+      return { ok: false, error: 'execute_trade order_type must be market, limit, stop or take_profit' };
+    }
+    if (orderType === 'stop' || orderType === 'take_profit') {
+      const trigger = args['trigger_price'];
+      if (typeof trigger !== 'number' || !Number.isFinite(trigger) || trigger <= 0) {
+        return { ok: false, error: `${orderType} needs a positive finite trigger_price` };
+      }
+    }
   }
   if (name === 'cancel_order') {
     const orderId = args['order_id'];

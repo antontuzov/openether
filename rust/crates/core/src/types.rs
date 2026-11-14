@@ -104,11 +104,48 @@ impl fmt::Display for Side {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum OrderType {
     #[default]
     Market,
     Limit,
+    /// A resting order that fires as a market order once the price reaches a
+    /// trigger: at or below it for a sell, at or above it for a buy.
+    Stop,
+    /// A resting order that fires as a market order once a profit target is
+    /// reached: at or above it for a sell, at or below it for a buy.
+    TakeProfit,
+}
+
+impl OrderType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OrderType::Market => "market",
+            OrderType::Limit => "limit",
+            OrderType::Stop => "stop",
+            OrderType::TakeProfit => "take_profit",
+        }
+    }
+
+    /// A conditional order waits for a price instead of resting at one.
+    pub fn is_conditional(self) -> bool {
+        matches!(self, OrderType::Stop | OrderType::TakeProfit)
+    }
+
+    /// Whether this conditional order fires at `price`.
+    ///
+    /// A stop protects a position by cutting a loss, so a sell stop fires when
+    /// the price falls to the trigger and a buy stop when it rises. A
+    /// take-profit is the mirror image. Anything else never fires.
+    pub fn trigger_hit(self, side: Side, trigger: f64, price: f64) -> bool {
+        match (self, side) {
+            (OrderType::Stop, Side::Sell) => price <= trigger,
+            (OrderType::Stop, Side::Buy) => price >= trigger,
+            (OrderType::TakeProfit, Side::Sell) => price >= trigger,
+            (OrderType::TakeProfit, Side::Buy) => price <= trigger,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -160,6 +197,13 @@ pub struct OrderRequest {
     pub order_type: OrderType,
     #[serde(default)]
     pub limit_price: Option<f64>,
+    /// The price a `stop` or `take_profit` order waits for.
+    #[serde(default)]
+    pub trigger_price: Option<f64>,
+    /// Orders sharing a group are one-cancels-the-other: when one fills, the
+    /// venue cancels the rest.
+    #[serde(default)]
+    pub oco_group: Option<String>,
     #[serde(default)]
     pub reduce_only: bool,
     #[serde(default = "default_client_id")]
@@ -184,6 +228,8 @@ impl OrderRequest {
             qty,
             order_type: OrderType::Market,
             limit_price: None,
+            trigger_price: None,
+            oco_group: None,
             reduce_only: false,
             client_id: default_client_id(),
             rationale: String::new(),
@@ -234,6 +280,12 @@ pub struct TrackedOrder {
     pub order_type: OrderType,
     #[serde(default)]
     pub limit_price: Option<f64>,
+    /// The price a conditional order waits for, as submitted.
+    #[serde(default)]
+    pub trigger_price: Option<f64>,
+    /// The one-cancels-the-other group this order belongs to, if any.
+    #[serde(default)]
+    pub oco_group: Option<String>,
     /// The quantity asked for.
     pub qty: f64,
     pub status: OrderStatus,
@@ -407,5 +459,37 @@ mod tests {
         let b = OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 1.0);
         assert_ne!(a.client_id, b.client_id);
         assert!(a.client_id.starts_with("oe-"));
+    }
+
+    #[test]
+    fn a_stop_and_a_take_profit_fire_on_opposite_sides_of_the_market() {
+        // A stop sells through a falling price and buys through a rising one.
+        assert!(OrderType::Stop.trigger_hit(Side::Sell, 130.0, 129.9));
+        assert!(!OrderType::Stop.trigger_hit(Side::Sell, 130.0, 130.1));
+        assert!(OrderType::Stop.trigger_hit(Side::Buy, 150.0, 150.0));
+        assert!(!OrderType::Stop.trigger_hit(Side::Buy, 150.0, 149.9));
+
+        // A take-profit is the mirror image.
+        assert!(OrderType::TakeProfit.trigger_hit(Side::Sell, 160.0, 161.0));
+        assert!(!OrderType::TakeProfit.trigger_hit(Side::Sell, 160.0, 159.0));
+        assert!(OrderType::TakeProfit.trigger_hit(Side::Buy, 90.0, 89.0));
+        assert!(!OrderType::TakeProfit.trigger_hit(Side::Buy, 90.0, 91.0));
+
+        // Only conditional orders wait for a trigger.
+        assert!(!OrderType::Market.trigger_hit(Side::Sell, 130.0, 1.0));
+        assert!(!OrderType::Limit.trigger_hit(Side::Sell, 130.0, 1.0));
+    }
+
+    #[test]
+    fn order_types_serialise_with_the_names_the_api_uses() {
+        for (order_type, wire) in [
+            (OrderType::Market, "\"market\""),
+            (OrderType::Limit, "\"limit\""),
+            (OrderType::Stop, "\"stop\""),
+            (OrderType::TakeProfit, "\"take_profit\""),
+        ] {
+            assert_eq!(serde_json::to_string(&order_type).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<OrderType>(wire).unwrap(), order_type);
+        }
     }
 }

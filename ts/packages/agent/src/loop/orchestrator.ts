@@ -397,6 +397,8 @@ function summarizeOrder(order: TrackedOrder) {
     side: order.side,
     order_type: order.order_type,
     limit_price: order.limit_price,
+    trigger_price: order.trigger_price,
+    oco_group: order.oco_group,
     qty: order.qty,
     filled_qty: filled,
     status: order.status,

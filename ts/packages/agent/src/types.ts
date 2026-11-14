@@ -140,8 +140,12 @@ export interface TrackedOrder {
   order_id: string;
   symbol: string;
   side: 'buy' | 'sell';
-  order_type: 'market' | 'limit';
+  order_type: 'market' | 'limit' | 'stop' | 'take_profit';
   limit_price: number | null;
+  /** The price a stop or take_profit waits for. */
+  trigger_price: number | null;
+  /** Orders sharing a group cancel each other when one fills. */
+  oco_group: string | null;
   qty: number;
   status: 'accepted' | 'filled' | 'rejected' | 'cancelled' | 'partially_filled';
   rationale: string;
