@@ -37,6 +37,7 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 | POST | `/api/swap/approve` | Body `{ "network", "token", "spender", "amount_raw", "passphrase", "account"?, "max_fee_per_gas_wei"? }` → a signed exact ERC-20 approval |
 | GET | `/api/live` | Live-trading arming state (see below) |
 | GET | `/api/risk/rules` | `RiskContract` — the limits, check order and reason codes the engine runs with (see below) |
+| POST | `/api/backtest` | Body `BacktestParams` plus `bars[]` → `BacktestReport`, replayed through the real risk layer (see below) |
 
 ### `POST /api/orders`
 
@@ -622,6 +623,96 @@ The same contract, with empty allowlists, is generated for the browser by
 `cargo run -p openether-core --bin openether-rules` and written to
 `ts/packages/ui/src/lib/risk-rules.json`. That file is generated, not
 hand-written, and a Rust test fails the build when it drifts.
+
+### `POST /api/backtest`
+
+Replays a bar series through the loaded WASM strategy and the **real risk
+layer** — the same `RiskEngine`, limits and reason codes that guard live
+orders. The strategy is forked for the run, so the replay starts with empty
+history and cannot disturb the live instance.
+
+Request:
+```json
+{
+  "symbol": "SOL/USDT",
+  "initial_equity_usd": 10000,
+  "fee_bps": 5,
+  "slippage_bps": 5,
+  "params": {},
+  "bars": [
+    {"ts_ms": 1700000000000, "open": 100, "high": 102, "low": 99,  "close": 101},
+    {"ts_ms": 1700000060000, "open": 101, "high": 104, "low": 100, "close": 103}
+  ]
+}
+```
+
+`symbol` is required. The rest defaults: `initial_equity_usd` 10,000,
+`fee_bps` 5, `slippage_bps` 5, and `params` to the live strategy's own
+parameters. `volume` is optional and defaults to 0.
+
+Response `200`:
+```json
+{
+  "symbol": "SOL/USDT",
+  "strategy": "momentum",
+  "bars": 2,
+  "first_ts_ms": 1700000000000,
+  "last_ts_ms": 1700000060000,
+  "initial_equity_usd": 10000.0,
+  "final_equity_usd": 10000.0,
+  "total_return_pct": 0.0,
+  "max_drawdown_pct": 0.0,
+  "sharpe": 0.0,
+  "win_rate": 0.0,
+  "profit_factor": null,
+  "trades": [],
+  "closed_trades": 0,
+  "fees_paid_usd": 0.0,
+  "final_position_qty": 0.0,
+  "final_cash_usd": 10000.0,
+  "rejected": {},
+  "breaker_trips": 0,
+  "final_breaker": "closed",
+  "limits": { "max_position_pct_of_equity": 20.0, "max_drawdown_pct": 10.0 },
+  "equity_curve": [
+    {"ts_ms": 1700000000000, "equity_usd": 10000.0, "drawdown_pct": 0.0},
+    {"ts_ms": 1700000060000, "equity_usd": 10000.0, "drawdown_pct": 0.0}
+  ]
+}
+```
+
+Guarantees:
+
+- **No lookahead.** A signal is produced at a bar's close and fills at the
+  next bar's open. The final bar is never traded — there is no open after it.
+- **Simulated time.** The breaker cooldown and the daily-loss rollover are
+  judged at each bar's `ts_ms`, not the wall clock, so a replay of months in a
+  second behaves like a slow live session.
+- **Costs.** Commission (`fee_bps`) and slippage (`slippage_bps`) are charged
+  per side; a buy fills above the open and a sell below it.
+- **Committed approvals.** Approved orders are counted as positions until
+  they fill, so several same-bar approvals cannot each pass the
+  position-size check on the same free equity.
+
+`rejected` counts refusals by the risk layer's reason codes (e.g.
+`{"position_size_exceeds_max_pct": 3}`). `profit_factor` is `null` when no
+closing trade lost money (the ratio would be infinite). `sharpe` is annualised
+from the median bar spacing and is 0 for a flat curve or too few bars.
+`limits` above is abridged; the response carries the full `RiskLimits` object.
+
+Bars: 2 to 5,000 per request, strictly increasing `ts_ms`, all OHLC finite and
+positive, `high ≥ max(open, close)` and `low ≤ min(open, close)`, `volume`
+finite and non-negative. `fee_bps` and `slippage_bps` must be within
+`0..=1000`; equity must be positive.
+
+Errors:
+
+| Status | Code | When |
+| --- | --- | --- |
+| 400 | `backtest_invalid_bars` | fewer than 2 or more than 5,000 bars, out of order, or inconsistent OHLC |
+| 400 | `backtest_invalid_params` | empty symbol, non-positive equity, or bps outside `0..=1000` |
+| 409 | `backtest_strategy_not_loaded` | no WASM strategy is loaded |
+| 500 | `backtest_strategy_error` | the strategy failed on a bar; the message names the bar and timestamp |
 
 ## Risk state
 

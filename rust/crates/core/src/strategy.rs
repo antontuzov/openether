@@ -50,6 +50,7 @@ pub struct StrategyInfo {
 }
 
 struct Loaded {
+    module: wasmtime::Module,
     path: String,
     store: Store<HostState>,
     instance: wasmtime::Instance,
@@ -166,6 +167,7 @@ impl StrategyHost {
             .map_err(|e| StrategyError::Load(e.to_string()))?;
 
         Ok(Loaded {
+            module,
             path: self.path.display().to_string(),
             store,
             instance,
@@ -287,6 +289,35 @@ impl StrategyHost {
             *state = Some(loaded);
         }
         Ok(self.info())
+    }
+
+    /// A second instance of the loaded module with its own memory and state.
+    ///
+    /// A replay runs on a fork so the live strategy's price history neither
+    /// leaks into the backtest nor gets polluted by it. The fork counts its
+    /// own metrics, so ticks inside a backtest never touch the live gauges.
+    pub fn fork(&self) -> Result<StrategyHost, StrategyError> {
+        let (module, sha256, name) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let loaded = state.as_ref().ok_or(StrategyError::NotLoaded)?;
+            (
+                loaded.module.clone(),
+                loaded.sha256.clone(),
+                loaded.name.clone(),
+            )
+        };
+        let host = StrategyHost {
+            engine: self.engine.clone(),
+            path: self.path.clone(),
+            fuel_per_tick: self.fuel_per_tick,
+            max_memory_bytes: self.max_memory_bytes,
+            logs: Arc::new(Mutex::new(Vec::new())),
+            metrics: Arc::new(Metrics::new()),
+            state: Mutex::new(None),
+        };
+        let loaded = host.instantiate(module, sha256, name)?;
+        *host.state.lock().unwrap_or_else(|e| e.into_inner()) = Some(loaded);
+        Ok(host)
     }
 
     pub fn info(&self) -> StrategyInfo {

@@ -1,3 +1,4 @@
+use crate::backtest::{BacktestError, BacktestParams, BacktestReport, Bar};
 use crate::broadcast::{
     Broadcast, BroadcastError, BroadcastState, Broadcaster, HttpRpc, TransferRequest, TxSigner,
 };
@@ -1787,6 +1788,36 @@ impl AppState {
             "stop_loss_pct": 2.0,
             "take_profit_pct": 4.0,
         })
+    }
+
+    /// Replays bars through the loaded strategy and the real risk layer.
+    ///
+    /// The live strategy is forked first, so the replay starts with empty
+    /// history and cannot disturb the instance that trades. Strategy
+    /// parameters default to the live ones unless the caller overrides them.
+    pub fn run_backtest(
+        &self,
+        params: &BacktestParams,
+        bars: &[Bar],
+    ) -> Result<BacktestReport, BacktestError> {
+        let strategy = {
+            let guard = self.strategy.lock().unwrap_or_else(|e| e.into_inner());
+            guard.clone().ok_or(BacktestError::NoStrategy)?
+        };
+        let replay = strategy.fork().map_err(|error| BacktestError::Strategy {
+            bar: 0,
+            ts_ms: 0,
+            message: error.to_string(),
+        })?;
+        let mut params = params.clone();
+        if params.params.is_null() {
+            params.params = self.strategy_params();
+        }
+        let mut report = crate::backtest::run(&params, bars, self.config.risk.clone(), |ctx| {
+            replay.on_tick(ctx).map_err(|error| error.to_string())
+        })?;
+        report.strategy = strategy.info().name;
+        Ok(report)
     }
 
     async fn apply_signal(&self, signal: StrategySignal) {

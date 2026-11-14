@@ -196,7 +196,7 @@ and memory limits and can be hot-swapped at runtime via
 ### Tests
 
 ```bash
-cargo test --workspace --manifest-path rust/Cargo.toml   # 238 tests
+cargo test --workspace --manifest-path rust/Cargo.toml   # 247 tests
 pnpm --dir ts -r test                                    # 127 tests
 pnpm --dir ts -r typecheck
 pnpm --dir ts -r build
@@ -332,6 +332,84 @@ flight.
 Leaving the variable unset (or set to `memory`) keeps everything in RAM. That is
 fine for a throwaway demo and **wrong for a live run**: equity would reset to
 zero and every limit would re-open.
+
+### Backtesting
+
+`POST /api/backtest` replays a bar series through the loaded strategy **and the
+real risk layer**. It is not a separate simulation with its own rules: every
+proposal the strategy makes is judged by the same `RiskEngine` that guards live
+orders, with the same limits, the same check order and the same reason codes.
+
+```bash
+curl -s -X POST http://localhost:8080/api/backtest \
+  -H 'content-type: application/json' \
+  -d '{
+    "symbol": "SOL/USDT",
+    "initial_equity_usd": 10000,
+    "fee_bps": 5,
+    "slippage_bps": 5,
+    "bars": [
+      {"ts_ms": 1700000000000, "open": 100, "high": 102, "low": 99,  "close": 101},
+      {"ts_ms": 1700000060000, "open": 101, "high": 104, "low": 100, "close": 103}
+    ]
+  }'
+```
+
+Four properties make the result something you can act on:
+
+- **No lookahead.** A signal is produced from a bar's close and fills at the
+  *next* bar's open. The last bar is never traded — there is no open to fill
+  against.
+- **The clock is simulated.** The breaker cooldown and the daily-loss rollover
+  are judged at each bar's timestamp, not at wall-clock time. A replay of
+  months of bars in a second still trips the breaker, lets it cool down and
+  reopens it exactly as a slow live session would.
+- **The strategy is forked.** The replay runs on a fresh instance of the
+  loaded WASM module, so the backtest starts with empty price history and never
+  disturbs — or is polluted by — the instance that trades.
+- **Costs are charged.** Commission and slippage are applied per side, so a
+  strategy that only wins before fees shows up as a loss.
+
+The response carries the full curve, the fills, realised PnL, fees, Sharpe
+(annualised from the median bar spacing), max drawdown, win rate, profit factor
+(`null` when there were no losing closes), refusals by reason code
+(`"rejected": {"position_size_exceeds_max_pct": 3}`), and the breaker state at
+the end:
+
+```json
+{
+  "symbol": "SOL/USDT",
+  "strategy": "momentum",
+  "bars": 2,
+  "initial_equity_usd": 10000.0,
+  "final_equity_usd": 10000.0,
+  "total_return_pct": 0.0,
+  "max_drawdown_pct": 0.0,
+  "sharpe": 0.0,
+  "win_rate": 0.0,
+  "profit_factor": null,
+  "trades": [],
+  "closed_trades": 0,
+  "fees_paid_usd": 0.0,
+  "rejected": {},
+  "breaker_trips": 0,
+  "final_breaker": "closed",
+  "equity_curve": [
+    {"ts_ms": 1700000000000, "equity_usd": 10000.0, "drawdown_pct": 0.0},
+    {"ts_ms": 1700000060000, "equity_usd": 10000.0, "drawdown_pct": 0.0}
+  ]
+}
+```
+
+(Two bars are not enough history for the default momentum strategy to trade, so
+this run is flat. `limits` is included too, describing the risk contract the
+replay was judged against.)
+
+Bars are capped at 5,000 per request and must be finite, positive, ordered by
+`ts_ms` and internally consistent (`high ≥ max(open, close)`,
+`low ≤ min(open, close)`). Parameters left out default to $10,000 equity, 5 bps
+fee and 5 bps slippage; `params` defaults to the live strategy's own
+parameters.
 
 ---
 
@@ -805,7 +883,7 @@ Exchange credentials are only read when live trading is armed. `.env`,
 `/api/swap`;
 `POST /api/orders`, `/api/logs`, `/api/onchain`, `/api/strategy/reload`,
 `/api/breaker/reset`, `/api/wallet/sign-dry-run`, `/api/wallet/broadcast`,
-`/api/swap/quote`, `/api/swap/execute`, `/api/swap/approve`;
+`/api/swap/quote`, `/api/swap/execute`, `/api/swap/approve`, `/api/backtest`;
 `DELETE /api/orders/{order_id}` to cancel a resting order;
 `GET /ws` for the live stream. Full shapes in [docs/api-contract.md](docs/api-contract.md).
 
@@ -815,13 +893,22 @@ Exchange credentials are only read when live trading is armed. `.env`,
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **238 passing**, including the encrypted keystore,
+- `cargo test --workspace` — **247 passing**, including the encrypted keystore,
   EVM and Solana dry-run signing, live signing recovered against the wallet
   address, signature tampering, wrong-passphrase rejection, and the API
   refusing to sign when dry run is off. The broadcaster suite covers EIP-1559
   encoding and hashing, fee ceilings, consecutive nonces, reorgs, replacement,
   revert fees and Solana finality. Two further tests are `#[ignore]`d because
   they need the network; both pass when run.
+- The backtester is exercised with hand-computed equity: a buy fills at the
+  *next* bar's open (no lookahead) and the final equity and realised PnL are
+  asserted to the cent; a $500 position is refused by the real risk layer and
+  trips the breaker; an open breaker refuses later signals with
+  `breaker_open`; the daily-loss limit trips on the simulated clock and reaches
+  `half_open` after the cooldown without wall-clock time passing; a short round
+  trip books its realised PnL; a signal for another symbol never reaches the
+  risk layer; the strategy sees only closed bars; malformed bars are refused
+  before the strategy runs; and a strategy error names the bar it failed on.
 - The live-trading arming ceremony exercised end to end against the real
   binaries: the env var alone arms nothing; arming without the confirmation
   phrase is refused; arming writes a record that flips `GET /api/live` to

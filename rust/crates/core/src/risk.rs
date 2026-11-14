@@ -382,7 +382,15 @@ impl RiskEngine {
 
     /// The single gate every order must pass.
     pub fn evaluate(&self, req: &OrderRequest, ctx: &RiskContext) -> RiskVerdict {
-        let ts_ms = now_ms();
+        self.evaluate_at(req, ctx, now_ms())
+    }
+
+    /// The same gate, judged at a caller-supplied time.
+    ///
+    /// A backtest replays months of bars in seconds, so the wall clock would
+    /// never let a breaker cooldown expire or a trading day roll over. The
+    /// simulated timestamp is what keeps those rules honest during a replay.
+    pub fn evaluate_at(&self, req: &OrderRequest, ctx: &RiskContext, ts_ms: i64) -> RiskVerdict {
         let mut state = self.lock();
         self.refresh_breaker(&mut state, ts_ms);
         let breaker_state = state.breaker.unwrap_or(BreakerState::Closed);

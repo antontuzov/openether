@@ -1,3 +1,4 @@
+use crate::backtest::{BacktestError, BacktestParams, Bar};
 use crate::broadcast::BroadcastError;
 use crate::engine::{AppState, SwapExecutionError, TransferError};
 use crate::holdings::WalletHoldings;
@@ -52,6 +53,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/swap/quote", post(swap_quote))
         .route("/api/swap/execute", post(swap_execute))
         .route("/api/swap/approve", post(swap_approve))
+        .route("/api/backtest", post(backtest))
         .route("/api/live", get(live_status))
         .route("/ws", get(ws_handler))
         .layer(Extension(wallet))
@@ -755,6 +757,43 @@ async fn swap_approve(
             .into_response(),
         Err(error) => swap_error_response(error),
     }
+}
+
+#[derive(Deserialize)]
+struct BacktestBody {
+    #[serde(flatten)]
+    params: BacktestParams,
+    /// The series to replay, oldest first.
+    bars: Vec<Bar>,
+}
+
+/// `POST /api/backtest`
+///
+/// Replays bars through the loaded strategy and the engine's own risk layer.
+/// A signal from bar i fills at bar i+1's open, and the risk decision is
+/// judged at the bar's timestamp, so the replay cannot see the future and a
+/// breaker cooldown or a new trading day behaves as it would live.
+async fn backtest(State(state): State<Arc<AppState>>, Json(body): Json<BacktestBody>) -> Response {
+    match state.run_backtest(&body.params, &body.bars) {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(error) => backtest_error_response(error),
+    }
+}
+
+fn backtest_error_response(error: BacktestError) -> Response {
+    let (status, code) = match &error {
+        BacktestError::InvalidBars(_) => (StatusCode::BAD_REQUEST, "backtest_invalid_bars"),
+        BacktestError::InvalidParams(_) => (StatusCode::BAD_REQUEST, "backtest_invalid_params"),
+        BacktestError::NoStrategy => (StatusCode::CONFLICT, "backtest_strategy_not_loaded"),
+        BacktestError::Strategy { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "backtest_strategy_error")
+        }
+    };
+    (
+        status,
+        Json(json!({ "ok": false, "error": error.to_string(), "code": code })),
+    )
+        .into_response()
 }
 
 fn swap_error_response(error: SwapExecutionError) -> Response {
