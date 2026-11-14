@@ -1,3 +1,4 @@
+use crate::auth::AdminAuth;
 use crate::live_arm::LiveArmingState;
 use crate::risk::RiskConfig;
 use crate::types::{Chain, Venue};
@@ -46,6 +47,12 @@ pub struct Config {
     /// reset equity to zero and silently re-open every risk limit.
     pub state_db_path: Option<PathBuf>,
     pub wallet: WalletConfig,
+    /// The token that authorizes the endpoints able to loosen a limit or move
+    /// money. Without one those routes are open, which is only acceptable on a
+    /// throwaway local run.
+    pub admin_auth: AdminAuth,
+    /// Where breaker events are pushed. `None` disables the webhook.
+    pub alert_webhook: Option<String>,
 }
 
 /// Wallet configuration.
@@ -214,11 +221,36 @@ impl Config {
                     .map(|v| v.trim().to_string())
                     .filter(|v| !v.is_empty()),
             },
+            admin_auth: AdminAuth::from_env(),
+            alert_webhook: std::env::var("OPENETHER_ALERT_WEBHOOK")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
         }
     }
 
     pub fn addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// Refuse to serve real money without a token guarding the routes that can
+    /// loosen the risk layer.
+    ///
+    /// A paper run is open on purpose: it is how the dashboard works out of the
+    /// box. The moment the venue or the wallet is armed, an unauthenticated
+    /// `POST /api/breaker/reset` would undo the halt that protects capital, so
+    /// the safe configuration becomes mandatory instead of advisory.
+    pub fn check_serve_safety(&self) -> Result<(), String> {
+        let armed = self.live_trading || self.onchain_live;
+        if armed && !self.admin_auth.enabled() {
+            return Err(
+                "live trading or an armed wallet needs OPENETHER_ADMIN_TOKEN: \
+                 without it any caller that can reach this port can reset the \
+                 circuit breaker or sign with the keystore"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -291,4 +323,36 @@ fn env_list(key: &str, default: &[&str]) -> Vec<String> {
             .collect()
     };
     source
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_armed_run_needs_an_admin_token() {
+        let mut config = Config::from_env();
+        config.admin_auth = AdminAuth::new(None);
+        config.live_trading = false;
+        config.onchain_live = false;
+        assert!(
+            config.check_serve_safety().is_ok(),
+            "a paper run stays open on purpose"
+        );
+
+        config.live_trading = true;
+        let refused = config.check_serve_safety().unwrap_err();
+        assert!(refused.contains("OPENETHER_ADMIN_TOKEN"), "{refused}");
+
+        config.admin_auth = AdminAuth::new(Some("operator-token".into()));
+        assert!(config.check_serve_safety().is_ok());
+
+        config.live_trading = false;
+        config.onchain_live = true;
+        config.admin_auth = AdminAuth::new(None);
+        assert!(
+            config.check_serve_safety().is_err(),
+            "an armed wallet is real money too"
+        );
+    }
 }

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
-import type { LogEntry, PortfolioSnapshot, Position, RiskState, TradeRecord } from '../api/types';
+import type { AdminStatus, LogEntry, PortfolioSnapshot, Position, RiskState, TradeRecord } from '../api/types';
+import { readAdminToken, writeAdminToken } from '../lib/adminSession';
 import { STARTING_CASH } from '../lib/demo';
 import type { DemoTrade } from '../lib/demo';
 import { fmtClock, fmtPct, fmtPrice, fmtSignedUsd, fmtUsd, titleise, truncate } from '../lib/format';
@@ -38,6 +39,15 @@ export interface AdminPanelProps {
   startingEquity?: number;
   /** Called when the viewer dismisses the panel. */
   onClose?: () => void;
+  /**
+   * Ask the live core whether a token is the operator's.
+   *
+   * When present the panel is gated by the engine, not by the bundle: the
+   * token is checked server-side and stays in this tab. When absent (the
+   * published demo has no core) the baked-in hash is the only gate, and the UI
+   * says so.
+   */
+  verifyToken?: (token: string) => Promise<AdminStatus>;
   /**
    * Optional pre-computed equity curve.
    *
@@ -357,10 +367,15 @@ export function AdminPanel({
   logs,
   startingEquity,
   onClose,
+  verifyToken,
   equitySeries: equitySeriesProp,
 }: AdminPanelProps) {
-  const configured = CONFIGURED_HASH.length > 0;
-  const [unlocked, setUnlocked] = useState<boolean>(() => configured && readUnlocked());
+  const configured = Boolean(verifyToken) || CONFIGURED_HASH.length > 0;
+  const [unlocked, setUnlocked] = useState<boolean>(() =>
+    verifyToken ? false : configured && readUnlocked(),
+  );
+  const [coreAuth, setCoreAuth] = useState<'required' | 'disabled' | null>(null);
+  const [checking, setChecking] = useState<boolean>(() => Boolean(verifyToken && readAdminToken()));
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -376,6 +391,32 @@ export function AdminPanel({
     }
   }, [configured]);
 
+  // With a live core the stored token is re-checked on mount instead of being
+  // trusted: a stale or revoked token must not keep the panel open.
+  useEffect(() => {
+    if (!verifyToken) return;
+    const token = readAdminToken();
+    if (!token) return;
+    let alive = true;
+    verifyToken(token)
+      .then((status) => {
+        if (!alive) return;
+        setCoreAuth(status.admin_auth);
+        setUnlocked(true);
+      })
+      .catch(() => {
+        if (!alive) return;
+        writeAdminToken('');
+        setUnlocked(false);
+      })
+      .finally(() => {
+        if (alive) setChecking(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [verifyToken]);
+
   const handleUnlock = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault();
@@ -385,6 +426,14 @@ export function AdminPanel({
       setError(null);
       setBusy(true);
       try {
+        if (verifyToken) {
+          const status = await verifyToken(password);
+          writeAdminToken(password);
+          setCoreAuth(status.admin_auth);
+          setUnlocked(true);
+          setPassword('');
+          return;
+        }
         const digest = await sha256Hex(password);
         if (timingSafeEqual(digest, CONFIGURED_HASH.toLowerCase())) {
           writeUnlocked(true);
@@ -394,16 +443,21 @@ export function AdminPanel({
           setError('That password does not match.');
         }
       } catch {
-        setError('This browser could not hash the password (a secure context is required).');
+        setError(
+          verifyToken
+            ? 'The core did not accept that token.'
+            : 'This browser could not hash the password (a secure context is required).',
+        );
       } finally {
         setBusy(false);
       }
     },
-    [configured, password],
+    [configured, password, verifyToken],
   );
 
   const handleLock = useCallback(() => {
     writeUnlocked(false);
+    writeAdminToken('');
     setUnlocked(false);
     setPassword('');
     setError(null);
@@ -544,6 +598,30 @@ export function AdminPanel({
     );
   }
 
+  if (checking) {
+    return (
+      <div className="admin" role="dialog" aria-modal="true" aria-label="Private analytics">
+        <header className="admin__hd">
+          <span className="panel__tick" aria-hidden="true" />
+          <h1 className="admin__title">Private analytics</h1>
+          <div className="admin__actions">
+            <button type="button" className="btn btn--tiny" onClick={handleClose}>
+              close
+            </button>
+          </div>
+        </header>
+        <div className="admin__bd">
+          <div className="admin__lock">
+            <div className="admin__lock-card">
+              <p className="admin__lock-title">Checking the stored token</p>
+              <p className="admin__lock-copy">Waiting for the core to answer.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   if (!unlocked) {
     return (
       <div className="admin" role="dialog" aria-modal="true" aria-label="Private analytics">
@@ -560,14 +638,14 @@ export function AdminPanel({
         <div className="admin__bd">
           <div className="admin__lock">
             <form className="admin__lock-card" onSubmit={handleUnlock}>
-              <p className="admin__lock-title">Admin password</p>
+              <p className="admin__lock-title">{verifyToken ? 'Operator token' : 'Admin password'}</p>
               <p className="admin__lock-copy">
-                The analytics view is private. This is a static site, so the gate only keeps casual
-                visitors out of these numbers — it is not a substitute for keeping the real engine on
-                a private network.
+                {verifyToken
+                  ? 'The analytics view is private. The core checks this token before it unlocks; it stays in this tab and is never part of the bundle.'
+                  : 'The analytics view is private. This is a static site, so the gate only keeps casual visitors out of these numbers — it is not a substitute for keeping the real engine on a private network.'}
               </p>
               <label className="admin__lock-label" htmlFor="admin-password">
-                password
+                {verifyToken ? 'token' : 'password'}
               </label>
               <input
                 id="admin-password"
@@ -616,6 +694,13 @@ export function AdminPanel({
       </header>
 
       <div className="admin__bd">
+        {coreAuth === 'disabled' ? (
+          <p className="inline-msg inline-msg--warn" role="status">
+            This core has admin auth disabled. Anyone who can reach its port can reset the breaker
+            or sign with the keystore; set <code className="num">OPENETHER_ADMIN_TOKEN</code> on the
+            core to require an operator token.
+          </p>
+        ) : null}
         <div className="stats adm-stats">
           <div className="stat">
             <span className="stat__k">total trades</span>

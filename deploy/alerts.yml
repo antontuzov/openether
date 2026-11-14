@@ -1,0 +1,89 @@
+# Alert rules for a local openEther run.
+#
+#   prometheus --config.file=deploy/prometheus.yml
+#
+# The breaker rule is the one that matters: the engine halts trading by itself,
+# and an operator has to hear about it. The rest are early warnings that the
+# engine is being pushed around by the market or by the agent.
+
+groups:
+  - name: openether
+    rules:
+      - alert: OpenEtherBreakerOpen
+        expr: openether_breaker_state == 2
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Circuit breaker is open — trading is halted'
+          description: >-
+            The risk layer halted trading. Nothing will fill until the cause is
+            understood and an operator resets the breaker with the admin token.
+            Check openether_drawdown_pct and the core log for the reason.
+
+      - alert: OpenEtherDrawdownWarning
+        expr: openether_drawdown_pct > 7
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Drawdown is {{ $value | printf "%.2f" }}% of peak equity'
+          description: >-
+            The drawdown limit is close. A breach halts trading; the breaker
+            opens at 10% by default (OPENETHER_MAX_DRAWDOWN_PCT).
+
+      - alert: OpenEtherRejectionStorm
+        expr: increase(openether_orders_rejected_total[10m]) > 10
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'More than 10 orders refused by the risk layer in 10 minutes'
+          description: >-
+            The agent or strategy keeps asking for orders the limits refuse.
+            That is usually a sizing or symbol mistake, not a market event.
+
+      - alert: OpenEtherStrategyErrors
+        expr: increase(openether_strategy_errors_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'The WASM strategy raised an error'
+          description: >-
+            The sandbox caught a guest error or ran out of fuel. Trading
+            continues without a strategy until it is fixed or swapped.
+
+      - alert: OpenEtherCoreDown
+        expr: up{job="openether-core"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'The openEther core is not answering /metrics'
+          description: >-
+            The engine is down. Working orders stay at the venue; a stop or
+            take-profit still fires there, but nothing reconciles until it is
+            back.
+
+      - alert: OpenEtherNoEvents
+        expr: increase(openether_events_published_total[10m]) == 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'No engine events in 10 minutes'
+          description: >-
+            Market data has stopped reaching the bus, so the strategy and the
+            risk estimates are running blind.
+
+      - alert: OpenEtherAgentQuiet
+        expr: increase(openether_agent_cycles_total[15m]) == 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'The agent has not completed a cycle in 15 minutes'
+          description: >-
+            The cortex is not planning. Check the agent process and its LLM
+            provider; the engine keeps trading on its strategy meanwhile.

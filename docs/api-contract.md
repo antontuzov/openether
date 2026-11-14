@@ -12,6 +12,7 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 | GET | `/healthz` | `{ "status": "ok", "live_trading": false, "version": "0.1.0" }` |
 | GET | `/metrics` | Prometheus text exposition (no trailing slash) |
 | GET | `/api/config` | Effective runtime config (redacted) |
+| GET | `/api/admin` | `{ "admin_auth": "required" \| "disabled", "authorized": bool }` — whether this request presented a valid operator token |
 | GET | `/api/portfolio` | `PortfolioSnapshot` |
 | GET | `/api/positions` | `Position[]` |
 | GET | `/api/trades?limit=200` | `TradeRecord[]`, newest first |
@@ -41,6 +42,81 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 | GET | `/api/live` | Live-trading arming state (see below) |
 | GET | `/api/risk/rules` | `RiskContract` — the limits, check order and reason codes the engine runs with (see below) |
 | POST | `/api/backtest` | Body `BacktestParams` plus `bars[]` → `BacktestReport`, replayed through the real risk layer (see below) |
+
+### Operator token
+
+Set `OPENETHER_ADMIN_TOKEN` on the core to require a bearer token on the
+endpoints that can place an order, loosen a limit, run new code, sign with the
+keystore or move money:
+
+| Method | Path |
+| --- | --- |
+| POST | `/api/orders` |
+| DELETE | `/api/orders/{order_id}` |
+| POST | `/api/breaker/reset` |
+| POST | `/api/strategy/reload` |
+| POST | `/api/strategy/select` |
+| POST | `/api/wallet/sign-dry-run` |
+| POST | `/api/wallet/broadcast` |
+| POST | `/api/swap/execute` |
+| POST | `/api/swap/approve` |
+
+Reads stay public so the dashboard and the agent can keep rendering while the
+token is held by the operator. A request presents the token either as
+`Authorization: Bearer <token>` (the scheme is case-insensitive) or as
+`X-Admin-Token: <token>`; surrounding whitespace is ignored and a blank value
+counts as absent. The comparison is constant time and the token is never
+echoed in a response, a header or a log line.
+
+With no token configured the core treats the caller as trusted — that is the
+paper-trading default — and `GET /api/admin` answers:
+
+```json
+{ "admin_auth": "disabled", "authorized": true }
+```
+
+With a token configured and a valid one presented:
+
+```json
+{ "admin_auth": "required", "authorized": true }
+```
+
+A missing or wrong token is `401` on both `/api/admin` and every guarded route:
+
+```json
+{ "ok": false, "code": "admin_token_required", "error": "this endpoint needs the operator's admin token" }
+```
+
+`GET /api/config` reports `"admin_auth": "required" | "disabled"` and
+`"alert_webhook": bool` so a dashboard can tell the truth about the core it is
+talking to. The core **refuses to boot** when live trading or the on-chain
+wallet is armed and no token is set: a caller that can reach the port could
+otherwise reset the breaker or sign with the keystore.
+
+### Alerts
+
+`OPENETHER_ALERT_WEBHOOK` turns breaker transitions into outbound JSON. The
+core `POST`s (5-second timeout, fire-and-forget, failures only logged):
+
+```json
+{
+  "source": "openether",
+  "event": "breaker_opened",
+  "ts_ms": 1760000000000,
+  "severity": "critical",
+  "reason": "position_size_exceeds_max_pct",
+  "breaker_state": "open",
+  "equity_usd": 10000.0,
+  "peak_equity_usd": 10000.0,
+  "drawdown_pct": 0.0,
+  "daily_pnl_usd": 0.0,
+  "gross_exposure_usd": 0.0
+}
+```
+
+`event` is `breaker_opened` or `breaker_reset`. An opening alert fires once, on
+the transition into `open`; further refusals while it stays open do not repeat.
+`deploy/alerts.yml` holds the same signals as Prometheus rules.
 
 ### Strategies
 

@@ -213,8 +213,8 @@ a strategy of your own.
 ### Tests
 
 ```bash
-cargo test --workspace --manifest-path rust/Cargo.toml   # 263 tests
-pnpm --dir ts -r test                                    # 128 tests
+cargo test --workspace --manifest-path rust/Cargo.toml   # 275 tests
+pnpm --dir ts -r test                                    # 129 tests
 pnpm --dir ts -r typecheck
 pnpm --dir ts -r build
 ```
@@ -854,26 +854,78 @@ the cap in force.
   hidden. Labelled read-only — it is not trading equity. Transfers and swaps
   are deliberately not in the browser: a keystore passphrase stays in the
   operator's shell, never in a page served from a public host.
-- **Admin analytics** (password-gated): net/gross P&L, fees, win rate, profit
-  factor, equity curve, P&L by bucket, and a pivot table across symbol, venue,
-  side, day, hour and source.
+- **Admin analytics** (operator-token or password-gated): net/gross P&L, fees,
+  win rate, profit factor, equity curve, P&L by bucket, and a pivot table
+  across symbol, venue, side, day, hour and source.
 
 ### Enabling the admin panel
 
-The gate compares a SHA-256 digest computed in the browser against a digest
-baked in at build time. **The password itself is never shipped.** With no
-digest configured the panel stays permanently locked.
+There are two gates, and the panel uses whichever one applies:
+
+- **With a core reachable**, the panel asks for the core's operator token
+  (below) and verifies it against `GET /api/admin`. The token stays in this
+  tab's `sessionStorage` and is re-checked when the panel is reopened; a core
+  with auth disabled is reported honestly in a warning banner rather than
+  pretending the panel is protected.
+- **With no core** (the published site), the gate compares a SHA-256 digest
+  computed in the browser against a digest baked in at build time. **The
+  password itself is never shipped.** With no digest configured the panel
+  stays permanently locked.
+
+The static gate is only a screen lock; it is not access control. Anyone can
+read the bundle. Never put anything sensitive behind it. Real access control
+lives in the core, where a token guards the endpoints that can move money.
+
+For the static gate, hash the password and set the digest:
 
 ```bash
 printf '%s' 'your-password' | shasum -a 256
 ```
 
-Put the digest in `.env` as `VITE_ADMIN_PASSWORD_HASH` and rebuild. For the
-hosted site, set it as the `ADMIN_PASSWORD_HASH` repository secret; the Pages
+Put it in `.env` as `VITE_ADMIN_PASSWORD_HASH` and rebuild. For the hosted
+site, set it as the `ADMIN_PASSWORD_HASH` repository secret; the Pages
 workflow passes it into the build.
 
-This is a gate, not access control. Anyone can read the bundle. Never put
-anything sensitive behind it.
+### Operator token
+
+`OPENETHER_ADMIN_TOKEN` makes the core require a bearer token on the routes
+that can place or cancel an order, loosen a limit, run new code, sign with the
+keystore or move money: order placement and cancellation, breaker reset,
+strategy reload and select, dry-run signing, broadcast, swap execute and swap
+approve. Reads stay public, so the dashboard and the agent keep working, and
+the token is compared in constant time and never echoed.
+
+```bash
+export OPENETHER_ADMIN_TOKEN='a long random string'
+./scripts/run-core.sh
+
+curl -s localhost:8080/api/admin -H "Authorization: Bearer $OPENETHER_ADMIN_TOKEN"
+# {"admin_auth":"required","authorized":true}
+```
+
+`X-Admin-Token` works too. A missing or wrong token is
+`401 admin_token_required`. The core **refuses to start** when live trading or
+the on-chain wallet is armed and no token is set — an open port would
+otherwise let any caller reset the breaker or sign with the keystore. A
+paper-only run may stay open, and says so at boot. The MCP server reads the
+same variable, so the agent can reset the breaker when the operator has
+authorised it and is refused when they have not.
+
+### Alert webhook
+
+`OPENETHER_ALERT_WEBHOOK` posts a JSON alert when the breaker opens, and again
+when it is reset. The opening alert fires once per transition: a second
+refusal while it stays open does not repeat it. Delivery is fire-and-forget
+with a five-second timeout, so a dead webhook cannot stall the risk layer.
+
+```bash
+export OPENETHER_ALERT_WEBHOOK='https://hooks.example.org/openether'
+```
+
+The payload carries the reason, breaker state, equity, peak equity, drawdown,
+daily P&L and gross exposure. `deploy/alerts.yml` expresses the same signals
+(plus a rejection storm, strategy errors and a silent core / agent) as
+Prometheus rules and is loaded by `deploy/prometheus.yml`.
 
 ---
 
@@ -953,6 +1005,8 @@ Copy `.env.example` to `.env`. The important defaults:
 | --- | --- | --- |
 | `OPENETHER_LIVE_TRADING` | `0` | asks for real orders; needs an arming record too |
 | `OPENETHER_LIVE_ARMING_FILE` | *(empty)* | path to the arming record written by `openether-live arm` |
+| `OPENETHER_ADMIN_TOKEN` | *(empty)* | bearer token for the mutation endpoints; required once armed |
+| `OPENETHER_ALERT_WEBHOOK` | *(empty)* | URL that receives breaker open/reset alerts |
 | `OPENETHER_VENUE` | `paper` | `paper` / `binance` / `kraken` / `hyperliquid` (read-only) |
 | `OPENETHER_WALLET_DRY_RUN` | `1` | `0` allows live signing; still needs the on-chain arming |
 | `OPENETHER_BROADCAST_MAX_FEE_PER_GAS_WEI` | `200000000000` | most wei per gas the core will ever pay |
@@ -977,7 +1031,8 @@ Exchange credentials are only read when live trading is armed. `.env`,
 
 ### HTTP API
 
-`GET /healthz`, `/metrics`, `/api/config`, `/api/portfolio`, `/api/positions`,
+`GET /healthz`, `/metrics`, `/api/config`, `/api/admin`, `/api/portfolio`,
+`/api/positions`,
 `/api/orders`, `/api/trades`, `/api/journal`, `/api/logs`, `/api/ticks`,
 `/api/risk`,
 `/api/risk/decisions`, `/api/risk/rules`, `/api/strategy`, `/api/strategies`,
@@ -990,6 +1045,9 @@ Exchange credentials are only read when live trading is armed. `.env`,
 `/api/swap/approve`, `/api/backtest`;
 `DELETE /api/orders/{order_id}` to cancel a resting order;
 `GET /ws` for the live stream. Full shapes in [docs/api-contract.md](docs/api-contract.md).
+When `OPENETHER_ADMIN_TOKEN` is set, the order place/cancel, breaker reset,
+strategy reload/select, wallet sign/broadcast and swap execute/approve routes
+require it; the reads stay open.
 
 ---
 
@@ -997,7 +1055,7 @@ Exchange credentials are only read when live trading is armed. `.env`,
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **263 passing**, including the encrypted keystore,
+- `cargo test --workspace` — **275 passing**, including the encrypted keystore,
   EVM and Solana dry-run signing, live signing recovered against the wallet
   address, signature tampering, wrong-passphrase rejection, and the API
   refusing to sign when dry run is off. The broadcaster suite covers EIP-1559
@@ -1046,7 +1104,7 @@ Checked locally on macOS (arm64):
   same accounts.
 - `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings`
   — clean, so the CI gate passes as written.
-- `pnpm -r test` — **128 passing** across the agent guard and verify loop, the
+- `pnpm -r test` — **129 passing** across the agent guard and verify loop, the
   data server, the browser trading engine and the order accounting.
 - `pnpm -r typecheck` and `pnpm -r build` — clean.
 - The risk contract proven to be shared: the Rust risk layer and the browser
@@ -1056,6 +1114,23 @@ Checked locally on macOS (arm64):
   `max_open_positions`, `reduce_only`, `no_position` and `insufficient_cash`.
   The drift guard was checked both ways: a stale generated file fails the Rust
   build, a regenerated one passes.
+- The operator token exercised against a **running core**: with a token set,
+  `POST /api/breaker/reset` answered `401 admin_token_required` with no token
+  and with a wrong one, and `200` with the right one, while `GET /api/risk`
+  stayed public; `POST /api/orders` was `401` without the token and filled
+  through the risk layer with it, and `DELETE /api/orders/{id}` was `401`
+  without it; `GET /api/admin` reported `required` and never echoed the
+  token; and a core with live trading or an armed wallet and no token refused
+  to start. In the browser the admin panel refused a wrong token with "The
+  core did not accept that token.", unlocked on the right one against the
+  live core, re-verified a stored token after a reload without retyping it,
+  and showed its disabled-auth warning banner when the core ran without one.
+  The MCP server carried the same token to a guarded route.
+- Breaker alerting exercised with a local webhook listener: a 15 SOL order
+  (22.7% of equity) opened the breaker with `position_size_exceeds_max_pct`
+  and delivered exactly one `breaker_opened` payload carrying the reason,
+  equity, drawdown and exposure; a later refusal while it stayed open sent
+  nothing, and the reset delivered `breaker_reset`.
 - Dashboard exercised in a real browser: the simulator filled a DOGE order —
   a market outside the engine's own live allowlist, which the browser venue
   still offers — under the engine's $5,000 cap, then an oversized order was

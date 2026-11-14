@@ -37,9 +37,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let core_url = std::env::var("CORE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()?;
+    let admin_token = std::env::var("OPENETHER_ADMIN_TOKEN").ok();
+    let http = tools::http_client(admin_token.as_deref()).map_err(anyhow::Error::msg)?;
     let ctx = Arc::new(tools::Context { core_url, http });
 
     let stdin = std::io::stdin();

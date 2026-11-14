@@ -1,3 +1,4 @@
+use crate::alert::{Alerter, BreakerWatch};
 use crate::backtest::{BacktestError, BacktestParams, BacktestReport, Bar};
 use crate::broadcast::{
     Broadcast, BroadcastError, BroadcastState, Broadcaster, HttpRpc, TransferRequest, TxSigner,
@@ -219,6 +220,11 @@ pub struct AppState {
     /// Durable state. `None` when the run is configured to keep everything in
     /// memory.
     pub store: Option<Arc<Store>>,
+    /// Pushes breaker events to the operator's webhook.
+    pub alerts: Arc<Alerter>,
+    /// The last breaker state this process reported, so one opening is one
+    /// alert even when several orders are refused in a row.
+    breaker_watch: std::sync::Mutex<BreakerWatch>,
     data: std::sync::Mutex<DataStore>,
 }
 
@@ -242,6 +248,7 @@ impl AppState {
         let metrics = Arc::new(Metrics::new());
         let bus = Arc::new(EventBus::new(4_096, Arc::clone(&metrics)));
         let risk = Arc::new(RiskEngine::new(config.risk.clone(), Arc::clone(&metrics)));
+        let webhook = config.alert_webhook.clone();
 
         let onchain = Arc::new(
             OnchainClient::new(config.solana_rpc_url.clone(), config.evm_rpc_urls.clone())
@@ -353,6 +360,8 @@ impl AppState {
             swaps,
             ws_clients: std::sync::atomic::AtomicUsize::new(0),
             store,
+            alerts: Arc::new(Alerter::new(webhook)),
+            breaker_watch: std::sync::Mutex::new(BreakerWatch::default()),
             data: std::sync::Mutex::new(DataStore::default()),
         });
         {
@@ -1215,6 +1224,32 @@ impl AppState {
         self.risk.snapshot(self.equity(), now_ms())
     }
 
+    /// Push a breaker opening to the webhook, once.
+    ///
+    /// Called wherever the breaker can be observed to trip. Orders refused
+    /// while it is already open pass through here too, but only the transition
+    /// is news.
+    fn note_breaker(&self, state: crate::risk::BreakerState) {
+        let opened = {
+            let mut watch = self
+                .breaker_watch
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            watch.note(state)
+        };
+        if !opened {
+            return;
+        }
+        let risk = self.risk_state();
+        self.alerts
+            .send(self.alerts.breaker_opened(&risk, now_ms()));
+    }
+
+    /// Tell the operator that a human reset the halt.
+    pub fn note_breaker_reset(&self) {
+        self.alerts.send(self.alerts.breaker_reset(now_ms()));
+    }
+
     /// The single entry point for placing an order.
     ///
     /// Every path — the agent through MCP, the WASM strategy, the HTTP API —
@@ -1264,6 +1299,7 @@ impl AppState {
         };
 
         let verdict = self.risk.evaluate(&req, &context);
+        self.note_breaker(verdict.breaker_state);
         if !verdict.approved {
             self.log(
                 source,
@@ -1619,6 +1655,7 @@ impl AppState {
                     data.cash_usd = account.free_usd;
                 }
                 self.risk.update_equity(account.equity_usd, account.ts_ms);
+                self.note_breaker(self.risk.breaker_state());
                 self.metrics
                     .gauge_set("openether_pnl_usd", &[], self.risk.daily_realized_pnl());
                 let portfolio = self.portfolio();

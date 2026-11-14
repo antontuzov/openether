@@ -15,6 +15,15 @@ export type Side = 'buy' | 'sell';
 /** Circuit breaker state. */
 export type BreakerState = 'closed' | 'half_open' | 'open';
 
+/**
+ * Whether the core requires an operator token, and whether the request that
+ * asked presented one. The token itself is never part of an answer.
+ */
+export interface AdminStatus {
+  admin_auth: 'required' | 'disabled';
+  authorized: boolean;
+}
+
 /** A single market data point. */
 export interface MarketTick {
   venue: Venue;

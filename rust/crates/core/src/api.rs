@@ -1,3 +1,4 @@
+use crate::auth::Decision;
 use crate::backtest::{BacktestError, BacktestParams, Bar};
 use crate::broadcast::BroadcastError;
 use crate::engine::{AppState, StrategySelectError, SwapExecutionError, TransferError};
@@ -6,8 +7,9 @@ use crate::swap::{SwapError, SwapRequest};
 use crate::types::*;
 use crate::wallet::{AccountSelector, TxEnvelope, WalletError, WalletService};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Extension, Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Extension, Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -23,10 +25,28 @@ pub fn router(state: Arc<AppState>) -> Router {
     // wide and the holdings loop and the API share one keystore.
     let wallet = Arc::clone(&state.wallet);
 
+    // The routes that can loosen a limit, run new code, sign with the keystore
+    // or move money. A read never needs the token; these do.
+    let admin = Router::new()
+        .route("/api/orders", post(place_order))
+        .route("/api/orders/{order_id}", delete(cancel_order))
+        .route("/api/breaker/reset", post(reset_breaker))
+        .route("/api/strategy/reload", post(strategy_reload))
+        .route("/api/strategy/select", post(strategy_select))
+        .route("/api/wallet/sign-dry-run", post(wallet_sign_dry_run))
+        .route("/api/wallet/broadcast", post(wallet_broadcast))
+        .route("/api/swap/execute", post(swap_execute))
+        .route("/api/swap/approve", post(swap_approve))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_admin,
+        ));
+
     Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/api/config", get(config))
+        .route("/api/admin", get(admin_status))
         .route("/api/portfolio", get(portfolio))
         .route("/api/positions", get(positions))
         .route("/api/trades", get(trades))
@@ -39,29 +59,73 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/risk/rules", get(risk_rules))
         .route("/api/onchain", post(onchain))
         .route("/api/strategy", get(strategy))
-        .route("/api/strategy/reload", post(strategy_reload))
         .route("/api/strategies", get(strategies))
-        .route("/api/strategy/select", post(strategy_select))
-        .route("/api/orders", post(place_order))
         .route("/api/orders", get(orders))
-        .route("/api/orders/{order_id}", delete(cancel_order))
-        .route("/api/breaker/reset", post(reset_breaker))
         .route("/api/venues", get(venues))
         .route("/api/wallet", get(wallet_metadata))
         .route("/api/wallet/holdings", get(wallet_holdings))
-        .route("/api/wallet/sign-dry-run", post(wallet_sign_dry_run))
-        .route("/api/wallet/broadcast", post(wallet_broadcast))
         .route("/api/wallet/broadcasts", get(wallet_broadcasts))
         .route("/api/swap", get(swap_status))
         .route("/api/swap/quote", post(swap_quote))
-        .route("/api/swap/execute", post(swap_execute))
-        .route("/api/swap/approve", post(swap_approve))
         .route("/api/backtest", post(backtest))
         .route("/api/live", get(live_status))
         .route("/ws", get(ws_handler))
+        .merge(admin)
         .layer(Extension(wallet))
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+/// Gate a request on the operator's token, when one is configured.
+async fn require_admin(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match state.config.admin_auth.authorize(request.headers()) {
+        Decision::Disabled | Decision::Allowed => next.run(request).await,
+        Decision::Refused => admin_refused(),
+    }
+}
+
+fn admin_refused() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "ok": false,
+            "code": "admin_token_required",
+            "error": "this endpoint needs the operator's admin token",
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /api/admin`
+///
+/// Whether the core requires a token and whether this request presented one.
+/// The token itself is never echoed, so the answer is safe to log.
+async fn admin_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match state.config.admin_auth.authorize(&headers) {
+        Decision::Disabled => Json(json!({
+            "admin_auth": "disabled",
+            "authorized": true,
+        }))
+        .into_response(),
+        Decision::Allowed => Json(json!({
+            "admin_auth": "required",
+            "authorized": true,
+        }))
+        .into_response(),
+        Decision::Refused => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "admin_auth": "required",
+                "authorized": false,
+                "code": "admin_token_required",
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn healthz(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -107,6 +171,10 @@ async fn config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         },
         "strategy_wasm": cfg.strategy_wasm.as_ref().map(|p| p.display().to_string()),
         "chains": state.onchain.chains(),
+        // Whether the sensitive routes need a token. The token itself is
+        // never reported, only the fact that one is in force.
+        "admin_auth": if cfg.admin_auth.enabled() { "required" } else { "disabled" },
+        "alert_webhook": cfg.alert_webhook.is_some(),
     }))
 }
 
@@ -562,6 +630,7 @@ async fn reset_breaker(
                 "circuit breaker was reset manually",
                 serde_json::json!({"confirmed": true}),
             );
+            state.note_breaker_reset();
             (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
@@ -1354,6 +1423,9 @@ mod tests {
         let mut config = Config::from_env();
         config.venue = Venue::Paper;
         config.live_trading = false;
+        // The test drives the routes without a token, so it must not inherit
+        // one from the environment it happens to run in.
+        config.admin_auth = crate::auth::AdminAuth::new(None);
         config.wallet = WalletConfig {
             keystore_path: Some(path.clone()),
             chain: Some(Chain::Evm),
@@ -1465,6 +1537,7 @@ mod tests {
         let mut config = Config::from_env();
         config.venue = Venue::Paper;
         config.live_trading = false;
+        config.admin_auth = crate::auth::AdminAuth::new(None);
         config.paper_start_equity = 10_000.0;
         config.state_db_path = Some(dir.join("state.db"));
         config.strategy_wasm = None;
@@ -1573,5 +1646,124 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Reads stay open; the route that can close a halt does not.
+    #[tokio::test]
+    async fn an_admin_token_guards_only_the_routes_that_can_loosen_a_limit() {
+        let mut config = Config::from_env();
+        config.venue = Venue::Paper;
+        config.live_trading = false;
+        config.admin_auth = crate::auth::AdminAuth::new(Some("operator-token".into()));
+        let state = crate::engine::AppState::new(config).unwrap();
+        let app = router(Arc::clone(&state));
+
+        let send = |method: &str, uri: &str, token: Option<&str>| {
+            let app = app.clone();
+            let method = method.to_string();
+            let uri = uri.to_string();
+            let token = token.map(str::to_string);
+            async move {
+                let body = if uri == "/api/breaker/reset" {
+                    Body::from(serde_json::json!({"confirm": true}).to_string())
+                } else if uri == "/api/orders" {
+                    Body::from(
+                        serde_json::json!({"symbol": "SOL/USDT", "side": "buy", "qty": 1.0})
+                            .to_string(),
+                    )
+                } else {
+                    Body::empty()
+                };
+                let mut builder = Request::builder().method(method.as_str()).uri(uri.as_str());
+                if let Some(token) = token {
+                    builder = builder.header("authorization", format!("Bearer {token}"));
+                }
+                let request = builder
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap();
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8_lossy(&bytes).to_string())
+            }
+        };
+
+        // Public: a read still works without a token.
+        assert_eq!(send("GET", "/api/risk", None).await.0, StatusCode::OK);
+        // Placing an order is a money path, so it is guarded too.
+        assert_eq!(
+            send("POST", "/api/orders", None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_ne!(
+            send("POST", "/api/orders", Some("operator-token")).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        // Cancelling is a venue write, so it is guarded the same way.
+        assert_eq!(
+            send("DELETE", "/api/orders/none", None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send("DELETE", "/api/orders/none", Some("operator-token"))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        // The halt is not something any caller may undo.
+        let (status, body) = send("POST", "/api/breaker/reset", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("admin_token_required"), "{body}");
+        assert_eq!(
+            send("POST", "/api/breaker/reset", Some("wrong")).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send("POST", "/api/breaker/reset", Some("operator-token"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        // The status endpoint tells the dashboard which mode it is in.
+        let (status, body) = send("GET", "/api/admin", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("\"admin_auth\":\"required\""), "{body}");
+        let (status, body) = send("GET", "/api/admin", Some("operator-token")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"authorized\":true"), "{body}");
+        assert!(
+            !body.contains("operator-token"),
+            "the status endpoint must never echo the token"
+        );
+    }
+
+    /// With no token the routes stay open, and the status says so plainly
+    /// instead of pretending the request was authenticated.
+    #[tokio::test]
+    async fn without_a_token_the_admin_status_says_it_is_disabled() {
+        let mut config = Config::from_env();
+        config.venue = Venue::Paper;
+        config.live_trading = false;
+        config.admin_auth = crate::auth::AdminAuth::new(None);
+        let state = crate::engine::AppState::new(config).unwrap();
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert!(body.contains("\"admin_auth\":\"disabled\""), "{body}");
     }
 }

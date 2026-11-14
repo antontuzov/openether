@@ -1,3 +1,5 @@
+pub mod alert;
+pub mod auth;
 pub mod broadcast;
 pub mod bus;
 pub mod config;

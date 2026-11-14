@@ -104,6 +104,10 @@ export default function App() {
     [dash],
   );
 
+  // The panel is gated by the core when one is reachable; without one the
+  // static build keeps its baked-in screen lock.
+  const verifyAdminToken = useCallback((token: string) => api.verifyAdmin(token), []);
+
   const handleResetBreaker = useCallback(async (): Promise<ActionOutcome> => {
     try {
       const response = await api.resetBreaker();
@@ -295,6 +299,7 @@ export default function App() {
           portfolio={adminPortfolio}
           risk={adminRisk}
           logs={dash.logs}
+          verifyToken={dash.coreReachable ? verifyAdminToken : undefined}
           onClose={() => setAdminOpen(false)}
         />
       ) : null}

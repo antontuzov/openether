@@ -5,6 +5,26 @@ pub struct Context {
     pub http: reqwest::Client,
 }
 
+/// The client every tool call goes through.
+///
+/// When the core is protected by `OPENETHER_ADMIN_TOKEN`, the same token is
+/// attached here so the tools that reach an admin route (hot-swapping a
+/// strategy) keep working. A token with a control character in it is refused,
+/// which also makes header injection through the environment impossible.
+pub fn http_client(admin_token: Option<&str>) -> Result<reqwest::Client, String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = admin_token.map(str::trim).filter(|token| !token.is_empty()) {
+        let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|error| format!("invalid admin token: {error}"))?;
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .default_headers(headers)
+        .build()
+        .map_err(|error| error.to_string())
+}
+
 pub fn definitions() -> Vec<Value> {
     vec![
         json!({
@@ -515,6 +535,17 @@ mod tests {
             .find(|tool| tool["name"] == "cancel_order")
             .expect("cancel_order is advertised");
         assert_eq!(cancel["inputSchema"]["required"], json!(["order_id"]));
+    }
+
+    /// The client must carry the token when there is one and stay clean when
+    /// there is not. A newline in the environment is refused rather than
+    /// becoming a second header.
+    #[test]
+    fn the_core_client_carries_the_admin_token_safely() {
+        assert!(http_client(None).is_ok());
+        assert!(http_client(Some("   ")).is_ok());
+        assert!(http_client(Some("operator-token")).is_ok());
+        assert!(http_client(Some("token\nx-injected: 1")).is_err());
     }
 
     /// The model can only ask for a protective exit if the schema names it and

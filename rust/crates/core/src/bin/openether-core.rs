@@ -13,6 +13,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env();
+    config.check_serve_safety().map_err(anyhow::Error::msg)?;
+    if !config.admin_auth.enabled() {
+        tracing::warn!(
+            "admin auth is disabled: whoever can reach this port can reset the \
+             breaker. Set OPENETHER_ADMIN_TOKEN before arming live trading."
+        );
+    }
     let addr = config.addr();
     let venue = config.venue;
     let live = config.live_trading;

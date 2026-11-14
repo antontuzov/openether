@@ -9,6 +9,9 @@ global:
   scrape_interval: 5s
   evaluation_interval: 15s
 
+rule_files:
+  - 'deploy/alerts.yml'
+
 scrape_configs:
   - job_name: openether-core
     static_configs:

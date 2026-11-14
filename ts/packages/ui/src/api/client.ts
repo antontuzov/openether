@@ -10,7 +10,9 @@
  * same origin and CORS never enters the picture.
  */
 
+import { adminHeaders } from '../lib/adminSession';
 import type {
+  AdminStatus,
   BreakerResetResponse,
   LogEntry,
   MarketTick,
@@ -27,6 +29,7 @@ import type {
 } from './types';
 
 export type {
+  AdminStatus,
   BreakerResetResponse,
   BreakerState,
   EngineStatus,
@@ -174,6 +177,7 @@ export function getOrders(): Promise<TrackedOrder[]> {
 export function cancelOrder(orderId: string): Promise<{ ok: boolean }> {
   return request<{ ok: boolean }>(`/api/orders/${encodeURIComponent(orderId)}`, {
     method: 'DELETE',
+    headers: adminHeaders(),
   });
 }
 
@@ -217,6 +221,7 @@ export function getVenues(): Promise<VenueHealth[]> {
 export function reloadStrategy(path: string): Promise<StrategyReloadResponse> {
   return request<StrategyReloadResponse>('/api/strategy/reload', {
     method: 'POST',
+    headers: adminHeaders(),
     body: JSON.stringify({ path }),
   });
 }
@@ -225,7 +230,19 @@ export function reloadStrategy(path: string): Promise<StrategyReloadResponse> {
 export function resetBreaker(): Promise<BreakerResetResponse> {
   return request<BreakerResetResponse>('/api/breaker/reset', {
     method: 'POST',
+    headers: adminHeaders(),
     body: JSON.stringify({ confirm: true }),
+  });
+}
+
+/**
+ * Ask the core whether `token` is the operator's token, and whether it needs
+ * one at all. A rejection surfaces as a 401 `ApiError`, which is the only
+ * answer that should lock the admin panel.
+ */
+export function verifyAdmin(token: string): Promise<AdminStatus> {
+  return request<AdminStatus>('/api/admin', {
+    headers: { authorization: `Bearer ${token}` },
   });
 }
 

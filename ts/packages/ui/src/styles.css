@@ -1528,6 +1528,12 @@ body::after {
   color: var(--tint-down);
 }
 
+.inline-msg--warn {
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+  background: var(--warn-dim);
+  color: var(--warn);
+}
+
 /* ------------------------------------------------------------ on-chain wallet */
 
 .wallet-note {
