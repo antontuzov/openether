@@ -47,6 +47,9 @@ pub const GAS_LIMIT_MARGIN_BPS: u64 = 2_000;
 pub const MIN_TRANSFER_GAS: u64 = 21_000;
 /// A plain transfer never gets close to this; it bounds a runaway estimate.
 pub const MAX_TRANSFER_GAS: u64 = 200_000;
+/// A contract call (a router swap) needs more room than a transfer, but an
+/// estimate that exceeds this is not a swap anyone should sign.
+pub const MAX_CALL_GAS: u64 = 1_500_000;
 /// The Solana system program.
 pub const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 /// `SystemInstruction::Transfer`.
@@ -103,7 +106,10 @@ pub struct Broadcast {
     /// EVM account nonce. Zero on Solana.
     #[serde(default)]
     pub nonce: u64,
-    pub amount_raw: u64,
+    /// Native value attached to the transaction, in wei or lamports. It is
+    /// `u128` because a token sale can attach more native value than a `u64`
+    /// holds, and truncating an amount before signing would be a silent loss.
+    pub amount_raw: u128,
     /// The most the transaction may cost in fees.
     pub fee_limit_raw: u64,
     /// What it did cost, once a receipt is known.
@@ -125,6 +131,10 @@ pub struct Broadcast {
     pub last_valid_block_height: u64,
     #[serde(default)]
     pub confirmations: u64,
+    /// The calldata of an EVM contract call, hex encoded. Empty for a plain
+    /// transfer, so the audit trail shows exactly what was signed.
+    #[serde(default)]
+    pub call_data: String,
     pub state: BroadcastState,
     /// Human-readable explanation of the current state, for the operator.
     pub note: String,
@@ -133,12 +143,21 @@ pub struct Broadcast {
 }
 
 /// A request to move coins out of the wallet.
+///
+/// With empty `data` this is a plain native transfer. With calldata it is a
+/// call to `to` — a DEX router, for example — and `amount_raw` is the native
+/// value attached to the call, which may be zero when the wallet is selling a
+/// token instead of the gas coin.
 #[derive(Debug, Clone)]
 pub struct TransferRequest {
     /// The network label the operator configured, e.g. `ethereum` or `solana`.
     pub network: String,
+    /// The destination address, or the contract a call is made to.
     pub to: String,
-    pub amount_raw: u64,
+    /// The native value attached to the call, in the chain's smallest unit.
+    pub amount_raw: u128,
+    /// Calldata for a contract call. Empty for a plain transfer.
+    pub data: Vec<u8>,
     /// A per-gas ceiling that only tightens the broadcaster's own.
     pub max_fee_per_gas_wei: Option<u128>,
 }
@@ -291,13 +310,18 @@ impl Broadcaster {
         networks
     }
 
-    /// Prepares, signs, verifies and sends one transfer.
+    /// The EIP-155 chain id of an EVM network this core can reach.
+    pub fn evm_chain_id(&self, network: &str) -> Option<u64> {
+        self.evm_chain_ids.get(network).copied()
+    }
+
+    /// Prepares, signs, verifies and sends one transfer or contract call.
     pub async fn transfer(
         &self,
         request: &TransferRequest,
         signer: &dyn TxSigner,
     ) -> Result<Broadcast, BroadcastError> {
-        if request.amount_raw == 0 {
+        if request.amount_raw == 0 && request.data.is_empty() {
             return Err(BroadcastError::InvalidRequest(
                 "the amount must be greater than zero".into(),
             ));
@@ -305,6 +329,11 @@ impl Broadcaster {
         if request.to.trim().is_empty() {
             return Err(BroadcastError::InvalidRequest(
                 "the destination must not be empty".into(),
+            ));
+        }
+        if !request.data.is_empty() && request.network == "solana" {
+            return Err(BroadcastError::InvalidRequest(
+                "program calls on solana are not supported; only native transfers are".into(),
             ));
         }
         if request.network == "solana" {
@@ -356,20 +385,26 @@ impl Broadcaster {
 
         let nonce = self.next_nonce(&rpc, &request.network, &from).await?;
 
-        // Gas: the node's estimate with a margin, bounded both ways.
+        // Gas: the node's estimate with a margin, bounded both ways. A call
+        // estimate has to include the calldata, otherwise the node prices a
+        // plain transfer and the call runs out of gas.
+        let mut call = json!({
+            "from": from,
+            "to": request.to,
+            "value": format!("0x{:x}", request.amount_raw),
+        });
+        if !request.data.is_empty() {
+            call["data"] = Value::String(format!("0x{}", hex::encode(&request.data)));
+        }
         let estimate = self
-            .call_evm(
-                &rpc,
-                "eth_estimateGas",
-                json!([{
-                    "from": from,
-                    "to": request.to,
-                    "value": format!("0x{:x}", request.amount_raw),
-                }]),
-            )
+            .call_evm(&rpc, "eth_estimateGas", json!([call]))
             .await?;
         let estimate = parse_quantity(&estimate, "eth_estimateGas")?;
-        let gas_limit = gas_limit_from(estimate);
+        let gas_limit = if request.data.is_empty() {
+            gas_limit_from(estimate)
+        } else {
+            gas_limit_for_call(estimate)
+        };
 
         let base_fee = self
             .call_evm(&rpc, "eth_getBlockByNumber", json!(["latest", false]))
@@ -391,8 +426,8 @@ impl Broadcaster {
             max_fee_per_gas: fees.max_fee,
             gas_limit,
             to,
-            value: request.amount_raw as u128,
-            data: Vec::new(),
+            value: request.amount_raw,
+            data: request.data.clone(),
         };
         let digest = tx.signing_hash();
         let signature = signer.sign_evm_digest(&digest)?;
@@ -432,6 +467,11 @@ impl Broadcaster {
             fee_paid_raw: 0,
             tx_hash: expected_hash,
             raw_tx: format!("0x{}", hex::encode(&raw)),
+            call_data: if request.data.is_empty() {
+                String::new()
+            } else {
+                format!("0x{}", hex::encode(&request.data))
+            },
             block_number: 0,
             block_hash: String::new(),
             last_valid_block_height: 0,
@@ -444,6 +484,19 @@ impl Broadcaster {
             created_at_ms: now,
             updated_at_ms: now,
         })
+    }
+
+    /// A read-only JSON-RPC call on a configured network. Used for the token
+    /// reads a swap needs (decimals, balance, allowance) without giving the
+    /// caller a way to send anything.
+    pub async fn call_rpc(
+        &self,
+        network: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, BroadcastError> {
+        let rpc = self.rpc_for(network)?.to_string();
+        self.call_evm(&rpc, method, params).await
     }
 
     async fn evm_tip(&self, rpc: &str) -> Result<u64, BroadcastError> {
@@ -637,7 +690,14 @@ impl Broadcaster {
             .ok_or_else(|| BroadcastError::Rpc("lastValidBlockHeight is missing".into()))?;
         let blockhash = decode_solana_address(blockhash_str)?;
 
-        let message = compile_transfer_message(&from_key, &to_key, &blockhash, request.amount_raw);
+        let message = compile_transfer_message(
+            &from_key,
+            &to_key,
+            &blockhash,
+            u64::try_from(request.amount_raw).map_err(|_| {
+                BroadcastError::InvalidRequest("the amount does not fit in a lamport count".into())
+            })?,
+        );
 
         // The fee is deterministic for a one-signature transfer, but the node
         // knows the current schedule, so ask it and fall back to the base fee.
@@ -695,6 +755,7 @@ impl Broadcaster {
             fee_paid_raw: 0,
             tx_hash: expected_signature,
             raw_tx: base64_encode(&raw),
+            call_data: String::new(),
             block_number: 0,
             block_hash: String::new(),
             last_valid_block_height,
@@ -822,6 +883,14 @@ pub fn gas_limit_from(estimate: u64) -> u64 {
     let with_margin =
         estimate.saturating_add(estimate.saturating_mul(GAS_LIMIT_MARGIN_BPS) / 10_000);
     with_margin.clamp(MIN_TRANSFER_GAS, MAX_TRANSFER_GAS)
+}
+
+/// The same margin for a contract call, which may legitimately need much more
+/// gas than a transfer but still has a ceiling.
+pub fn gas_limit_for_call(estimate: u64) -> u64 {
+    let with_margin =
+        estimate.saturating_add(estimate.saturating_mul(GAS_LIMIT_MARGIN_BPS) / 10_000);
+    with_margin.clamp(MIN_TRANSFER_GAS, MAX_CALL_GAS)
 }
 
 /// An EIP-1559 transaction, ready to sign.
@@ -957,7 +1026,7 @@ pub fn compile_transfer_message(
     message
 }
 
-fn parse_evm_address(value: &str) -> Result<[u8; 20], BroadcastError> {
+pub(crate) fn parse_evm_address(value: &str) -> Result<[u8; 20], BroadcastError> {
     let trimmed = value.trim();
     let hex_part = trimmed.strip_prefix("0x").unwrap_or(trimmed);
     let bytes = hex::decode(hex_part)
@@ -1165,6 +1234,7 @@ mod tests {
             network: "ethereum".into(),
             to: "0x000000000000000000000000000000000000dEaD".into(),
             amount_raw: 1_000_000_000_000_000,
+            data: Vec::new(),
             max_fee_per_gas_wei: None,
         }
     }
@@ -1409,6 +1479,7 @@ mod tests {
             fee_paid_raw: 0,
             tx_hash: "0xabc".into(),
             raw_tx: "0x02".into(),
+            call_data: String::new(),
             block_number: 0,
             block_hash: String::new(),
             last_valid_block_height: 0,
@@ -1564,6 +1635,7 @@ mod tests {
             fee_paid_raw: 0,
             tx_hash: "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW".into(),
             raw_tx: String::new(),
+            call_data: String::new(),
             block_number: 0,
             block_hash: String::new(),
             last_valid_block_height: 100,

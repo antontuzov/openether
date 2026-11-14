@@ -31,6 +31,10 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 | POST | `/api/wallet/sign-dry-run` | Body `{ "passphrase", "envelope", "account"? }` → `DryRunSignature` |
 | POST | `/api/wallet/broadcast` | Body `{ "network", "to", "amount_raw", "passphrase", "account"?, "max_fee_per_gas_wei"? }` → a signed, sent transfer |
 | GET | `/api/wallet/broadcasts?limit=50` | Transfers this core signed, newest first, plus the broadcast gates |
+| GET | `/api/swap` | Whether swaps are armed, the quote source and the cap in force |
+| POST | `/api/swap/quote` | Body `{ "network", "sell_token", "buy_token", "sell_amount_raw", "slippage_bps"?, "account"? }` → `SwapPlan`, nothing signed |
+| POST | `/api/swap/execute` | Same body plus `"passphrase"` and optional `"max_fee_per_gas_wei"` → a signed swap |
+| POST | `/api/swap/approve` | Body `{ "network", "token", "spender", "amount_raw", "passphrase", "account"?, "max_fee_per_gas_wei"? }` → a signed exact ERC-20 approval |
 | GET | `/api/live` | Live-trading arming state (see below) |
 | GET | `/api/risk/rules` | `RiskContract` — the limits, check order and reason codes the engine runs with (see below) |
 
@@ -266,9 +270,9 @@ Response `200`:
 
 ### `POST /api/wallet/broadcast`
 
-Moves the chain's native coin out of the wallet on a real chain. This is the
-only path that broadcasts, and every gate is checked before a signature is
-asked for:
+Moves the chain's native coin out of the wallet on a real chain, between two
+EOAs. This path never calls a contract; token sales go through
+`/api/swap/execute`. Every gate is checked before a signature is asked for:
 
 1. a valid **on-chain** arming record (`openether-live arm --target onchain`,
    separate from any venue's record);
@@ -356,6 +360,122 @@ Codes: `onchain_not_armed` (403), `wallet_dry_run` (409),
 
 Newest first. `networks` lists the chains that have an RPC url; an empty list
 means no transfer can be sent at all.
+
+Each record carries `call_data`: the hex calldata that was signed, empty for
+a plain native transfer. That is what makes a swap auditable from the same list
+as a transfer.
+
+### On-chain swaps
+
+Swaps are **EVM only**. A Solana swap is refused with
+`swap_network_unsupported` before any quote, because an aggregator transaction
+is opaque bytes and the core will not sign calldata it cannot validate.
+
+A swap is a contract call, so the quote source is treated as untrusted input:
+
+- the quote's `srcToken`, `destToken` and `srcAmount` echoes must match the
+  request;
+- the router (`to`) must be on `OPENETHER_CONTRACT_ALLOWLIST`, and so must the
+  allowance spender (`allowanceTarget` / `tokenTransferProxy`) when the quote
+  names one;
+- the calldata must be non-empty even-length hex, at most 8 KiB;
+- the native `value` must equal `sell_amount_raw` when selling the native coin
+  and be zero when selling a token;
+- an empty allowlist refuses every swap rather than meaning "anything goes".
+
+`GET /api/swap`:
+```json
+{
+  "enabled": true,
+  "source": "api.example.org",
+  "networks": ["ethereum"],
+  "contract_allowlist": ["0x1111…0582", "0x216b…fcae"],
+  "default_slippage_bps": 50,
+  "max_slippage_bps": 1000,
+  "onchain_live": true,
+  "dry_run": false,
+  "effective_max_swap_notional_usd": 100.0
+}
+```
+
+`POST /api/swap/quote` signs nothing and sends nothing:
+```json
+{
+  "network": "ethereum",
+  "sell_token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+  "buy_token": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+  "sell_amount_raw": 1000000,
+  "slippage_bps": 50
+}
+```
+
+Response `200`:
+```json
+{
+  "ok": true,
+  "from": "0x7099…79C8",
+  "notional_usd": 1.0,
+  "approval_required": false,
+  "quote": {
+    "network": "ethereum",
+    "sell_token": "0xa0b8…eb48",
+    "buy_token": "0xc02a…6cc2",
+    "sell_decimals": 6,
+    "buy_decimals": 18,
+    "sell_amount_raw": 1000000,
+    "buy_amount_raw": 500000000000000,
+    "value_raw": 0,
+    "to": "0x1111…0582",
+    "data": "0xdead…cafe",
+    "allowance_target": "0x216b…fcae",
+    "balance": { "token": "0xa0b8…eb48", "balance_raw": 5000000, "required_raw": 1000000, "sufficient": true },
+    "allowance": { "token": "0xa0b8…eb48", "spender": "0x216b…fcae", "current_raw": 5000000, "required_raw": 1000000, "sufficient": true },
+    "gas_limit_estimate": 200000,
+    "source": "api.example.org",
+    "fetched_at_ms": 1731200000000
+  }
+}
+```
+
+`POST /api/swap/execute` takes the same body plus `"passphrase"` and an optional
+`"max_fee_per_gas_wei"`, and returns `{ "ok", "notional_usd", "quote",
+"broadcast" }`. It **re-quotes** before signing, so a stored price can never
+become a transaction. It signs that calldata for the router behind the same
+three gates as a transfer, plus:
+
+- the sell side, priced from the DEX feed, must be at or below the on-chain
+  arming cap; an unpriced token is refused (`swap_unpriced`);
+- a short allowance returns `409` instead of an approval the agent could send:
+
+```json
+{
+  "ok": false,
+  "error": "the wallet must approve at least 1000000 raw units of 0xa0b8…eb48 for 0x216b…fcae",
+  "code": "approval_required",
+  "approval": {
+    "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+    "spender": "0x216b4b4ba9f3e719726886d34a177484278bfcae",
+    "required_raw": 1000000,
+    "current_raw": 0,
+    "endpoint": "/api/swap/approve"
+  }
+}
+```
+
+`POST /api/swap/approve` sends the standard ERC-20 `approve(spender, amount)`
+for **exactly** `amount_raw`, to the token contract. The spender must be on the
+allowlist. The core never sends an unlimited approval on its own. The resulting
+broadcast's `call_data` is the approve call, so the allowance it created is
+readable from `/api/wallet/broadcasts`.
+
+Swap codes: `onchain_not_armed` (403), `wallet_dry_run` and `approval_required`
+(409), `swap_not_configured`, `swap_network_unsupported`, `swap_invalid` (400),
+`swap_allowlist_empty` and `swap_contract_not_allowed` (403),
+`swap_quote_source_error` and `swap_quote_unreachable` (502),
+`swap_quote_malformed`, `swap_quote_mismatch`, `swap_value_mismatch`,
+`swap_insufficient_balance`, `swap_contract_read_failed`,
+`swap_unknown_decimals`, `swap_unpriced`, `swap_above_cap` (422), plus every
+broadcast and wallet code above.
 
 ### `GET /api/live`
 

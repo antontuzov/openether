@@ -42,6 +42,14 @@ const WRAPPED_NATIVE: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The address of a chain's wrapped native coin, if the chain has one.
+pub fn wrapped_native_address(chain: &str) -> Option<&'static str> {
+    WRAPPED_NATIVE
+        .iter()
+        .find(|(name, _, _)| name.eq_ignore_ascii_case(chain))
+        .map(|(_, address, _)| *address)
+}
+
 /// A token the wallet holds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenHolding {
@@ -273,6 +281,15 @@ impl HoldingsService {
     pub async fn native_price_usd(&self, chain: &str) -> Option<f64> {
         self.prices
             .native(chain)
+            .await
+            .map(|price| price.price_usd)
+            .filter(|price| price.is_finite() && *price > 0.0)
+    }
+
+    /// The dollar price of one ERC-20 token, by its contract address.
+    pub async fn token_price_usd(&self, chain: &str, address: &str) -> Option<f64> {
+        self.prices
+            .token(chain, address)
             .await
             .map(|price| price.price_usd)
             .filter(|price| price.is_finite() && *price > 0.0)

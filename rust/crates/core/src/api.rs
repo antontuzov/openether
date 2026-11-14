@@ -1,6 +1,7 @@
 use crate::broadcast::BroadcastError;
-use crate::engine::{AppState, TransferError};
+use crate::engine::{AppState, SwapExecutionError, TransferError};
 use crate::holdings::WalletHoldings;
+use crate::swap::{SwapError, SwapRequest};
 use crate::types::*;
 use crate::wallet::{AccountSelector, TxEnvelope, WalletError, WalletService};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -47,6 +48,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/wallet/sign-dry-run", post(wallet_sign_dry_run))
         .route("/api/wallet/broadcast", post(wallet_broadcast))
         .route("/api/wallet/broadcasts", get(wallet_broadcasts))
+        .route("/api/swap", get(swap_status))
+        .route("/api/swap/quote", post(swap_quote))
+        .route("/api/swap/execute", post(swap_execute))
+        .route("/api/swap/approve", post(swap_approve))
         .route("/api/live", get(live_status))
         .route("/ws", get(ws_handler))
         .layer(Extension(wallet))
@@ -493,7 +498,7 @@ struct WalletBroadcastRequest {
     /// The destination address (EVM hex or Solana base58).
     to: String,
     /// The amount in the chain's smallest unit: wei or lamports.
-    amount_raw: u64,
+    amount_raw: u128,
     /// A per-gas ceiling in wei. It may only tighten the core's own ceiling.
     #[serde(default)]
     max_fee_per_gas_wei: Option<u64>,
@@ -572,6 +577,276 @@ async fn wallet_broadcasts(
         "effective_max_transfer_notional_usd": cfg.onchain_arming.effective_max_order_notional_usd,
         "gas_ceiling_wei": cfg.broadcast_max_fee_per_gas_wei.to_string(),
     }))
+}
+
+/// `GET /api/swap`
+///
+/// Whether swaps can run at all, which source quotes them, which routers are
+/// allowed and what the armed per-swap cap is.
+async fn swap_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(state.swap_status())
+}
+
+#[derive(Deserialize)]
+struct SwapQuoteBody {
+    /// An EVM network with an RPC url: `ethereum` or `base`.
+    network: String,
+    /// `native` or a token contract address.
+    sell_token: String,
+    /// `native` or a token contract address.
+    buy_token: String,
+    /// The amount sold, in the sell token's smallest unit.
+    sell_amount_raw: u128,
+    /// Tolerance in basis points. Defaults to 50 (0.5 %).
+    #[serde(default)]
+    slippage_bps: Option<u16>,
+    #[serde(default)]
+    account: AccountSelector,
+}
+
+impl SwapQuoteBody {
+    fn to_request(&self) -> SwapRequest {
+        SwapRequest {
+            network: self.network.clone(),
+            sell_token: self.sell_token.clone(),
+            buy_token: self.buy_token.clone(),
+            sell_amount_raw: self.sell_amount_raw,
+            slippage_bps: self
+                .slippage_bps
+                .unwrap_or(crate::swap::DEFAULT_SLIPPAGE_BPS),
+        }
+    }
+}
+
+/// `POST /api/swap/quote`
+///
+/// Fetches a quote and runs every check that does not need a signature: the
+/// on-chain gates, the contract allowlist on the router and the spender, the
+/// wallet's balance, the spender's allowance and the armed cap. Nothing is
+/// signed or sent.
+async fn swap_quote(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SwapQuoteBody>,
+) -> Response {
+    match state.quote_swap(&body.to_request(), &body.account).await {
+        Ok(plan) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "quote": plan.quote,
+                "from": plan.from,
+                "notional_usd": plan.notional_usd,
+                "approval_required": plan.approval_required,
+            })),
+        )
+            .into_response(),
+        Err(error) => swap_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct SwapExecuteBody {
+    network: String,
+    sell_token: String,
+    buy_token: String,
+    sell_amount_raw: u128,
+    #[serde(default)]
+    slippage_bps: Option<u16>,
+    /// A per-gas ceiling in wei. It may only tighten the core's own ceiling.
+    #[serde(default)]
+    max_fee_per_gas_wei: Option<u64>,
+    passphrase: String,
+    #[serde(default)]
+    account: AccountSelector,
+}
+
+impl SwapExecuteBody {
+    fn to_request(&self) -> SwapRequest {
+        SwapRequest {
+            network: self.network.clone(),
+            sell_token: self.sell_token.clone(),
+            buy_token: self.buy_token.clone(),
+            sell_amount_raw: self.sell_amount_raw,
+            slippage_bps: self
+                .slippage_bps
+                .unwrap_or(crate::swap::DEFAULT_SLIPPAGE_BPS),
+        }
+    }
+}
+
+/// `POST /api/swap/execute`
+///
+/// Re-quotes, re-checks and then signs and sends the calldata of that fresh
+/// quote. A stored quote is never replayed. If the sell token's allowance is
+/// short the call returns `approval_required` with the spender to approve; it
+/// never signs an approval on its own.
+async fn swap_execute(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SwapExecuteBody>,
+) -> Response {
+    let request = body.to_request();
+    let passphrase = Zeroizing::new(body.passphrase);
+    match state
+        .execute_swap(
+            &request,
+            body.max_fee_per_gas_wei.map(u128::from),
+            &passphrase,
+            body.account,
+        )
+        .await
+    {
+        Ok(receipt) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "broadcast": receipt.broadcast,
+                "quote": receipt.quote,
+                "notional_usd": receipt.notional_usd,
+            })),
+        )
+            .into_response(),
+        Err(error) => swap_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct SwapApproveBody {
+    network: String,
+    /// The ERC-20 whose allowance is being granted.
+    token: String,
+    /// The spender a quote named. It must be on the contract allowlist.
+    spender: String,
+    /// The exact amount the spender may move, in the token's smallest unit.
+    amount_raw: u128,
+    #[serde(default)]
+    max_fee_per_gas_wei: Option<u64>,
+    passphrase: String,
+    #[serde(default)]
+    account: AccountSelector,
+}
+
+/// `POST /api/swap/approve`
+///
+/// Sends an exact ERC-20 approval to a spender on the contract allowlist. There
+/// is no "unlimited" option: the amount is what the caller asked for.
+async fn swap_approve(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SwapApproveBody>,
+) -> Response {
+    let passphrase = Zeroizing::new(body.passphrase);
+    match state
+        .approve_token(
+            crate::engine::TokenApproval {
+                network: body.network,
+                token: body.token,
+                spender: body.spender,
+                amount_raw: body.amount_raw,
+                max_fee_per_gas_wei: body.max_fee_per_gas_wei.map(u128::from),
+            },
+            &passphrase,
+            body.account,
+        )
+        .await
+    {
+        Ok(receipt) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "broadcast": receipt.broadcast })),
+        )
+            .into_response(),
+        Err(error) => swap_error_response(error),
+    }
+}
+
+fn swap_error_response(error: SwapExecutionError) -> Response {
+    let status = swap_error_status(&error);
+    let mut body = json!({
+        "ok": false,
+        "error": error.to_string(),
+        "code": swap_error_code(&error),
+    });
+    if let SwapExecutionError::ApprovalRequired {
+        spender,
+        current_raw,
+        token,
+        required_raw,
+    } = &error
+    {
+        body["approval"] = json!({
+            "token": token,
+            "spender": spender,
+            "required_raw": required_raw,
+            "current_raw": current_raw,
+            "endpoint": "/api/swap/approve",
+        });
+    }
+    (status, Json(body)).into_response()
+}
+
+fn swap_error_status(error: &SwapExecutionError) -> StatusCode {
+    match error {
+        SwapExecutionError::NotArmed(_) => StatusCode::FORBIDDEN,
+        SwapExecutionError::DryRun | SwapExecutionError::ApprovalRequired { .. } => {
+            StatusCode::CONFLICT
+        }
+        SwapExecutionError::NotConfigured | SwapExecutionError::NoQuoter => StatusCode::BAD_REQUEST,
+        SwapExecutionError::Unpriced(_) | SwapExecutionError::AboveCap(..) => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        SwapExecutionError::Wallet(error) => wallet_error_status(error),
+        SwapExecutionError::Broadcast(error) => broadcast_error_status(error),
+        SwapExecutionError::Swap(error) => swap_source_status(error),
+    }
+}
+
+fn swap_source_status(error: &SwapError) -> StatusCode {
+    match error {
+        SwapError::NotConfigured
+        | SwapError::NetworkUnsupported(..)
+        | SwapError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+        SwapError::EmptyAllowlist | SwapError::ContractNotAllowed(_) => StatusCode::FORBIDDEN,
+        SwapError::QuoteSource(_) | SwapError::Transport(_) => StatusCode::BAD_GATEWAY,
+        SwapError::MalformedQuote(_)
+        | SwapError::QuoteMismatch(..)
+        | SwapError::ValueMismatch(..)
+        | SwapError::InsufficientBalance(..)
+        | SwapError::ContractReadFailed(_)
+        | SwapError::UnknownDecimals(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        SwapError::Rpc(error) => broadcast_error_status(error),
+    }
+}
+
+fn swap_error_code(error: &SwapExecutionError) -> &'static str {
+    match error {
+        SwapExecutionError::NotArmed(_) => "onchain_not_armed",
+        SwapExecutionError::DryRun => "wallet_dry_run",
+        SwapExecutionError::NotConfigured => "broadcast_not_configured",
+        SwapExecutionError::NoQuoter => "swap_not_configured",
+        SwapExecutionError::Unpriced(_) => "swap_unpriced",
+        SwapExecutionError::AboveCap(..) => "swap_above_cap",
+        SwapExecutionError::ApprovalRequired { .. } => "approval_required",
+        SwapExecutionError::Wallet(error) => wallet_error_code(error),
+        SwapExecutionError::Broadcast(error) => broadcast_error_code(error),
+        SwapExecutionError::Swap(error) => swap_source_code(error),
+    }
+}
+
+fn swap_source_code(error: &SwapError) -> &'static str {
+    match error {
+        SwapError::NotConfigured => "swap_not_configured",
+        SwapError::NetworkUnsupported(..) => "swap_network_unsupported",
+        SwapError::InvalidRequest(_) => "swap_invalid",
+        SwapError::QuoteSource(_) => "swap_quote_source_error",
+        SwapError::Transport(_) => "swap_quote_unreachable",
+        SwapError::MalformedQuote(_) => "swap_quote_malformed",
+        SwapError::QuoteMismatch(..) => "swap_quote_mismatch",
+        SwapError::ValueMismatch(..) => "swap_value_mismatch",
+        SwapError::EmptyAllowlist => "swap_allowlist_empty",
+        SwapError::ContractNotAllowed(_) => "swap_contract_not_allowed",
+        SwapError::InsufficientBalance(..) => "swap_insufficient_balance",
+        SwapError::ContractReadFailed(_) => "swap_contract_read_failed",
+        SwapError::UnknownDecimals(_) => "swap_unknown_decimals",
+        SwapError::Rpc(error) => broadcast_error_code(error),
+    }
 }
 
 fn transfer_error_status(error: &TransferError) -> StatusCode {

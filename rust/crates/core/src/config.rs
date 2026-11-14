@@ -35,6 +35,9 @@ pub struct Config {
     /// broadcaster compares this ceiling against both the network's fee and
     /// any smaller per-request ceiling.
     pub broadcast_max_fee_per_gas_wei: u128,
+    /// A DEX quote source. The template must name `{sell_token}`, `{buy_token}`
+    /// and `{sell_amount}`; see `swap::HttpQuoter`. `None` disables swaps.
+    pub swap_quote_url: Option<String>,
     /// Where the engine keeps its durable state. `None` keeps everything in
     /// memory, which is only sensible for a throwaway run: a restart would
     /// reset equity to zero and silently re-open every risk limit.
@@ -160,6 +163,10 @@ impl Config {
                 "OPENETHER_BROADCAST_MAX_FEE_PER_GAS_WEI",
                 200_000_000_000, // 200 gwei
             ),
+            swap_quote_url: std::env::var("OPENETHER_SWAP_QUOTE_URL")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
             evm_rpc_urls: [("ethereum", "ETHEREUM_RPC_URL"), ("base", "BASE_RPC_URL")]
                 .iter()
                 .filter_map(|(name, key)| {

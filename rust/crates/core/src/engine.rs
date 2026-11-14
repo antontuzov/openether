@@ -10,6 +10,7 @@ use crate::onchain::OnchainClient;
 use crate::risk::{RiskContext, RiskEngine, RiskState, RiskVerdict};
 use crate::store::{PortfolioRow, PositionRow, Store};
 use crate::strategy::{StrategyHost, StrategySignal};
+use crate::swap::{encode_approve, HttpQuoter, SwapError, SwapQuote, SwapRequest, SwapService};
 use crate::types::*;
 use crate::wallet::{AccountSelector, WalletError, WalletService};
 use serde::Serialize;
@@ -85,6 +86,70 @@ pub enum TransferError {
     Broadcast(#[from] BroadcastError),
 }
 
+/// A checkable swap: the quote, the account that would sign it and the dollar
+/// value at risk.
+#[derive(Debug, Clone, Serialize)]
+pub struct SwapPlan {
+    pub quote: SwapQuote,
+    pub notional_usd: f64,
+    pub from: String,
+    /// `true` when the token sale needs an approval before it can execute.
+    pub approval_required: bool,
+}
+
+/// A swap that was signed and sent.
+#[derive(Debug, Clone, Serialize)]
+pub struct SwapReceipt {
+    pub broadcast: Broadcast,
+    pub quote: SwapQuote,
+    pub notional_usd: f64,
+}
+
+/// An exact ERC-20 approval to send.
+#[derive(Debug, Clone)]
+pub struct TokenApproval {
+    pub network: String,
+    /// The ERC-20 whose allowance is being granted.
+    pub token: String,
+    /// The spender, which must be on the contract allowlist.
+    pub spender: String,
+    /// The exact amount the spender may move.
+    pub amount_raw: u128,
+    pub max_fee_per_gas_wei: Option<u128>,
+}
+
+/// Why a swap was refused before anything was signed or sent.
+#[derive(Debug, thiserror::Error)]
+pub enum SwapExecutionError {
+    #[error("on-chain trading is not armed: {0}")]
+    NotArmed(String),
+    #[error("the wallet is in dry-run mode; live signing is disabled")]
+    DryRun,
+    #[error("on-chain transfers are not configured: no RPC client")]
+    NotConfigured,
+    #[error("swaps are not configured: set OPENETHER_SWAP_QUOTE_URL to a quote source")]
+    NoQuoter,
+    #[error("the {0} price could not be read, so the swap cannot be measured against the cap")]
+    Unpriced(String),
+    #[error("the swap is worth ${0:.2} of {1}, above the armed cap of ${2:.2}")]
+    AboveCap(f64, String, f64),
+    #[error(
+        "the spender {spender} may move {current_raw} raw units of {token}, but the swap sells {required_raw}; approve it first"
+    )]
+    ApprovalRequired {
+        spender: String,
+        current_raw: u128,
+        token: String,
+        required_raw: u128,
+    },
+    #[error(transparent)]
+    Swap(#[from] SwapError),
+    #[error(transparent)]
+    Wallet(#[from] WalletError),
+    #[error(transparent)]
+    Broadcast(#[from] BroadcastError),
+}
+
 #[derive(Debug, Default)]
 struct DataStore {
     ticks: VecDeque<MarketTick>,
@@ -127,6 +192,9 @@ pub struct AppState {
     /// Values the wallet's holdings. `None` only when the price client could
     /// not be built.
     pub holdings: Option<Arc<HoldingsService>>,
+    /// Quotes and checks DEX swaps. `None` when no quote source is configured,
+    /// in which case every swap is refused.
+    pub swaps: Option<Arc<SwapService>>,
     pub ws_clients: std::sync::atomic::AtomicUsize,
     /// Durable state. `None` when the run is configured to keep everything in
     /// memory.
@@ -194,6 +262,18 @@ impl AppState {
             }
         };
 
+        // Swaps need both a quote source and a way to send the transaction.
+        let swaps = match (config.swap_quote_url.clone(), broadcaster.clone()) {
+            (Some(template), Some(broadcaster)) => match HttpQuoter::new(template) {
+                Ok(quoter) => Some(Arc::new(SwapService::new(Arc::new(quoter), broadcaster))),
+                Err(e) => {
+                    tracing::warn!(error = %e, "swaps are disabled: the quote source is unusable");
+                    None
+                }
+            },
+            _ => None,
+        };
+
         let strategy = Arc::new(std::sync::Mutex::new(None));
         if let Some(path) = config.strategy_wasm.clone() {
             match StrategyHost::new(
@@ -239,6 +319,7 @@ impl AppState {
             wallet,
             broadcaster,
             holdings,
+            swaps,
             ws_clients: std::sync::atomic::AtomicUsize::new(0),
             store,
             data: std::sync::Mutex::new(DataStore::default()),
@@ -584,7 +665,7 @@ impl AppState {
         &self,
         network: &str,
         to: &str,
-        amount_raw: u64,
+        amount_raw: u128,
         max_fee_per_gas_wei: Option<u128>,
         passphrase: &str,
         account: AccountSelector,
@@ -637,6 +718,7 @@ impl AppState {
             network,
             to: to.to_string(),
             amount_raw,
+            data: Vec::new(),
             max_fee_per_gas_wei,
         };
         let mut broadcast = broadcaster.transfer(&request, &signer).await?;
@@ -669,6 +751,280 @@ impl AppState {
             broadcast,
             notional_usd,
         })
+    }
+
+    /// Quotes a swap and checks everything the core can check without a
+    /// signature: the on-chain gates, the contract allowlist, the wallet's
+    /// balance, the spender's allowance and the armed per-trade cap.
+    ///
+    /// Nothing here signs. The quote is fetched fresh on every call, and
+    /// [`Self::execute_swap`] quotes again rather than replaying a stored one.
+    pub async fn quote_swap(
+        &self,
+        request: &SwapRequest,
+        account: &AccountSelector,
+    ) -> Result<SwapPlan, SwapExecutionError> {
+        let swaps = self.require_swaps()?;
+        let from = self.evm_account(account)?;
+        let quote = swaps
+            .quote(request, &from, &self.config.contract_allowlist)
+            .await?;
+        let notional_usd = self.swap_notional_usd(&quote).await?;
+        let cap = self.config.onchain_arming.effective_max_order_notional_usd;
+        if !notional_usd.is_finite() || notional_usd > cap {
+            return Err(SwapExecutionError::AboveCap(
+                notional_usd,
+                quote.sell_token.clone(),
+                cap,
+            ));
+        }
+        let approval_required = quote
+            .allowance
+            .as_ref()
+            .map(|allowance| !allowance.sufficient)
+            .unwrap_or(false);
+        Ok(SwapPlan {
+            quote,
+            notional_usd,
+            from,
+            approval_required,
+        })
+    }
+
+    /// Quotes, checks and sends a swap.
+    ///
+    /// The transaction signs the calldata of the quote taken in this call, for
+    /// the router on the contract allowlist, behind the same gates as a
+    /// transfer. A token sale whose allowance is short is refused with the
+    /// spender to approve; the core never sends an unlimited approval on its
+    /// own.
+    pub async fn execute_swap(
+        &self,
+        request: &SwapRequest,
+        max_fee_per_gas_wei: Option<u128>,
+        passphrase: &str,
+        account: AccountSelector,
+    ) -> Result<SwapReceipt, SwapExecutionError> {
+        let plan = self.quote_swap(request, &account).await?;
+        if let Some(allowance) = plan.quote.allowance.as_ref().filter(|a| !a.sufficient) {
+            return Err(SwapExecutionError::ApprovalRequired {
+                spender: allowance.spender.clone(),
+                current_raw: allowance.current_raw,
+                token: allowance.token.clone(),
+                required_raw: allowance.required_raw,
+            });
+        }
+        let broadcaster = self
+            .broadcaster
+            .as_ref()
+            .ok_or(SwapExecutionError::NotConfigured)?;
+        let data = plan.quote.call_data()?;
+        let signer = WalletSigner {
+            wallet: &self.wallet,
+            passphrase,
+            selector: account,
+        };
+        let transfer = TransferRequest {
+            network: plan.quote.network.clone(),
+            to: plan.quote.to.clone(),
+            amount_raw: plan.quote.value_raw,
+            data,
+            max_fee_per_gas_wei,
+        };
+        let mut broadcast = broadcaster.transfer(&transfer, &signer).await?;
+        broadcast.updated_at_ms = now_ms();
+        self.metrics.counter_add(
+            "openether_swap_notional_usd",
+            &[("network", broadcast.chain.as_str())],
+            plan.notional_usd,
+        );
+        self.metrics.counter_add(
+            "openether_wallet_broadcasts_total",
+            &[
+                ("chain", broadcast.chain.as_str()),
+                ("state", broadcast.state.as_str()),
+            ],
+            1.0,
+        );
+        self.log(
+            "swap",
+            "info",
+            &format!(
+                "sent a {} swap of {} for {} worth ${:.2} through {}",
+                broadcast.chain,
+                plan.quote.sell_token,
+                plan.quote.buy_token,
+                plan.notional_usd,
+                plan.quote.to
+            ),
+            serde_json::json!({
+                "tx_hash": broadcast.tx_hash,
+                "router": plan.quote.to,
+                "sell_token": plan.quote.sell_token,
+                "sell_amount_raw": plan.quote.sell_amount_raw,
+                "buy_token": plan.quote.buy_token,
+                "buy_amount_raw": plan.quote.buy_amount_raw,
+                "notional_usd": plan.notional_usd,
+                "source": plan.quote.source,
+            }),
+        );
+        self.store_broadcast(broadcast.clone());
+        Ok(SwapReceipt {
+            broadcast,
+            quote: plan.quote,
+            notional_usd: plan.notional_usd,
+        })
+    }
+
+    /// Sends an exact ERC-20 approval for the spender a quote named.
+    ///
+    /// The spender must be on the contract allowlist; the amount is exactly
+    /// what the caller asks for, so the core never signs an unlimited
+    /// approval. An approval moves no tokens, so it is logged and gated like a
+    /// transfer but carries no notional.
+    pub async fn approve_token(
+        &self,
+        approval: TokenApproval,
+        passphrase: &str,
+        account: AccountSelector,
+    ) -> Result<TransferReceipt, SwapExecutionError> {
+        self.require_swaps()?;
+        let broadcaster = self
+            .broadcaster
+            .as_ref()
+            .ok_or(SwapExecutionError::NotConfigured)?;
+        let network = approval.network.trim().to_ascii_lowercase();
+        if broadcaster.evm_chain_id(&network).is_none() {
+            return Err(SwapExecutionError::Swap(SwapError::NetworkUnsupported(
+                network,
+                "it has no EVM RPC url configured".into(),
+            )));
+        }
+        if approval.amount_raw == 0 {
+            return Err(SwapExecutionError::Swap(SwapError::InvalidRequest(
+                "the allowance must be greater than zero".into(),
+            )));
+        }
+        let token = crate::swap::normalize_token(&approval.token)?;
+        if token == crate::swap::NATIVE_TOKEN {
+            return Err(SwapExecutionError::Swap(SwapError::InvalidRequest(
+                "the native coin needs no allowance".into(),
+            )));
+        }
+        let spender = crate::swap::normalize_address(&approval.spender)?;
+        crate::swap::enforce_allowlist(&spender, None, &self.config.contract_allowlist)?;
+        let amount_raw = approval.amount_raw;
+        let data = encode_approve(&spender, amount_raw)?;
+        let signer = WalletSigner {
+            wallet: &self.wallet,
+            passphrase,
+            selector: account,
+        };
+        let request = TransferRequest {
+            network: network.clone(),
+            to: token.clone(),
+            amount_raw: 0,
+            data,
+            max_fee_per_gas_wei: approval.max_fee_per_gas_wei,
+        };
+        let mut broadcast = broadcaster.transfer(&request, &signer).await?;
+        broadcast.updated_at_ms = now_ms();
+        self.metrics.counter_add(
+            "openether_wallet_broadcasts_total",
+            &[
+                ("chain", broadcast.chain.as_str()),
+                ("state", broadcast.state.as_str()),
+            ],
+            1.0,
+        );
+        self.log(
+            "swap",
+            "info",
+            &format!(
+                "approved {spender} to move up to {amount_raw} raw units of {token} on {network}"
+            ),
+            serde_json::json!({
+                "tx_hash": broadcast.tx_hash,
+                "token": token,
+                "spender": spender,
+                "amount_raw": amount_raw,
+            }),
+        );
+        self.store_broadcast(broadcast.clone());
+        Ok(TransferReceipt {
+            broadcast,
+            notional_usd: 0.0,
+        })
+    }
+
+    /// The state of the swap path, for the dashboard and the agent.
+    pub fn swap_status(&self) -> serde_json::Value {
+        let mut allowlist: Vec<String> = self.config.contract_allowlist.iter().cloned().collect();
+        allowlist.sort();
+        serde_json::json!({
+            "enabled": self.swaps.is_some(),
+            "source": self.swaps.as_ref().map(|swaps| swaps.source()),
+            "networks": self
+                .broadcaster
+                .as_ref()
+                .map(|broadcaster| broadcaster.networks())
+                .unwrap_or_default(),
+            "contract_allowlist": allowlist,
+            "default_slippage_bps": crate::swap::DEFAULT_SLIPPAGE_BPS,
+            "max_slippage_bps": crate::swap::MAX_SLIPPAGE_BPS,
+            "onchain_live": self.config.onchain_live,
+            "dry_run": self.config.wallet.dry_run,
+            "effective_max_swap_notional_usd": self
+                .config
+                .onchain_arming
+                .effective_max_order_notional_usd,
+        })
+    }
+
+    fn require_swaps(&self) -> Result<&Arc<SwapService>, SwapExecutionError> {
+        if !self.config.onchain_live {
+            return Err(SwapExecutionError::NotArmed(
+                self.config
+                    .onchain_arming
+                    .reason
+                    .unwrap_or("no valid on-chain arming record")
+                    .to_string(),
+            ));
+        }
+        if self.wallet.dry_run() {
+            return Err(SwapExecutionError::DryRun);
+        }
+        self.swaps.as_ref().ok_or(SwapExecutionError::NoQuoter)
+    }
+
+    fn evm_account(&self, selector: &AccountSelector) -> Result<String, SwapExecutionError> {
+        if let Some(chain) = selector.chain.as_deref() {
+            if crate::onchain::parse_chain(chain) != Some(Chain::Evm) {
+                return Err(SwapExecutionError::Swap(SwapError::InvalidRequest(
+                    "a swap is signed by an EVM account".into(),
+                )));
+            }
+        }
+        let account = self
+            .wallet
+            .address_for(Chain::Evm, selector.index.unwrap_or(0))?;
+        Ok(account.address)
+    }
+
+    async fn swap_notional_usd(&self, quote: &SwapQuote) -> Result<f64, SwapExecutionError> {
+        let service = self
+            .holdings
+            .as_ref()
+            .ok_or_else(|| SwapExecutionError::Unpriced(quote.sell_token.clone()))?;
+        let price = if quote.sell_token == crate::swap::NATIVE_TOKEN {
+            service.native_price_usd(&quote.network).await
+        } else {
+            service
+                .token_price_usd(&quote.network, &quote.sell_token)
+                .await
+        }
+        .ok_or_else(|| SwapExecutionError::Unpriced(quote.sell_token.clone()))?;
+        Ok(quote.sell_amount_raw as f64 / 10f64.powi(quote.sell_decimals as i32) * price)
     }
 
     /// Re-reads every transfer that has not reached a final state.
@@ -1667,6 +2023,8 @@ mod tests {
         config.paper_start_equity = 10_000.0;
         config.state_db_path = Some(db.to_path_buf());
         config.strategy_wasm = None;
+        // A test must not pick up a quote source from the developer's shell.
+        config.swap_quote_url = None;
         config
     }
 
@@ -2318,6 +2676,7 @@ mod tests {
             fee_paid_raw,
             tx_hash: format!("0x{id}"),
             raw_tx: "0x02".into(),
+            call_data: String::new(),
             block_number: 100,
             block_hash: "0xblock".into(),
             last_valid_block_height: 0,
@@ -2424,6 +2783,71 @@ mod tests {
             matches!(error, TransferError::UnsupportedNetwork(_)),
             "{error:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /* ------------------------------------------------------- swaps */
+
+    fn swap_request() -> crate::swap::SwapRequest {
+        crate::swap::SwapRequest {
+            network: "ethereum".into(),
+            sell_token: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
+            buy_token: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".into(),
+            sell_amount_raw: 1_000_000,
+            slippage_bps: crate::swap::DEFAULT_SLIPPAGE_BPS,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unarmed_core_never_quotes_or_swaps() {
+        let (dir, db) = temp_db();
+        let mut config = config_with_db(&db);
+        config.onchain_live = false;
+        config.wallet.dry_run = false;
+        let state = AppState::new(config).unwrap();
+
+        let error = state
+            .quote_swap(&swap_request(), &Default::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, SwapExecutionError::NotArmed(_)),
+            "{error:?}"
+        );
+        assert!(state.broadcasts(10).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_wallet_never_quotes_or_swaps() {
+        let (dir, db) = temp_db();
+        let mut config = config_with_db(&db);
+        armed_only_in_config(&mut config);
+        config.wallet.dry_run = true;
+        let state = AppState::new(config).unwrap();
+
+        let error = state
+            .quote_swap(&swap_request(), &Default::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SwapExecutionError::DryRun), "{error:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_core_without_a_quote_source_refuses_swaps() {
+        let (dir, db) = temp_db();
+        let mut config = config_with_db(&db);
+        armed_only_in_config(&mut config);
+        config.wallet.dry_run = false;
+        config.swap_quote_url = None;
+        let state = AppState::new(config).unwrap();
+
+        let error = state
+            .quote_swap(&swap_request(), &Default::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SwapExecutionError::NoQuoter), "{error:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

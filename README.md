@@ -30,6 +30,11 @@ Read this before running anything.
   gas-token price. Dry run is the default; `POST /api/wallet/broadcast` refuses
   everything until an operator has done the ceremony in
   [Sending coins](#sending-coins).
+- **Swaps treat the quote source as hostile.** On-chain swaps sign calldata, so
+  the core re-quotes on every execute, checks the token and amount echoes,
+  requires the router and the allowance spender to be on the contract
+  allowlist, caps the sell side in dollars and never auto-approves. See
+  [Swapping tokens](#swapping-tokens).
 - **The risk layer is absolute.** The agent has no tool, flag or prompt that
   reaches around it. See [Risk layer](#risk-layer).
 - **Protective exits live at the venue, not in the agent's head.** A stop or
@@ -119,7 +124,7 @@ sequenceDiagram
 
 ```
 rust/
-  crates/core/            engine, bus, risk, wallet, connectors, HTTP/WS API
+  crates/core/            engine, bus, risk, wallet, swaps, connectors, HTTP/WS API
   crates/mcp-server/      MCP stdio server exposing core functions as tools
   crates/strategies/      momentum strategy, compiled to wasm32
 ts/
@@ -191,7 +196,7 @@ and memory limits and can be hot-swapped at runtime via
 ### Tests
 
 ```bash
-cargo test --workspace --manifest-path rust/Cargo.toml   # 185 tests
+cargo test --workspace --manifest-path rust/Cargo.toml   # 238 tests
 pnpm --dir ts -r test                                    # 127 tests
 pnpm --dir ts -r typecheck
 pnpm --dir ts -r build
@@ -588,8 +593,77 @@ The fee of a final transfer is booked as `wallet_gas_usd` on the portfolio and
 per chain in the holdings. Gas is a cost the wallet paid, never a change to the
 trading account's equity.
 
-**What it cannot do:** swap tokens or call a contract. This path only moves
-the chain's native coin to an address; DEX execution is a separate subsystem.
+**What this path cannot do:** call a contract. It only moves the chain's native
+coin to an address. Token sales go through the swap path below, which is a
+contract call and is held to stricter rules.
+
+### Swapping tokens
+
+Swaps are EVM only. A Solana swap is refused before any quote: an aggregator
+transaction is opaque bytes, and the core will not sign calldata it cannot
+validate.
+
+Set one quote source; the core treats its JSON as untrusted input:
+
+```bash
+OPENETHER_SWAP_QUOTE_URL='https://api.example.org/quote?src={sell_token}&dst={buy_token}&amount={sell_amount}&chain={chain_id}&from={from}'
+OPENETHER_CONTRACT_ALLOWLIST=0x1111111254eeb25477b68fb85ed929f73a960582,0x216b4b4ba9f3e719726886d34a177484278bfcae
+```
+
+The template must contain `{sell_token}`, `{buy_token}` and `{sell_amount}`
+(`{chain_id}`, `{network}`, `{from}`, `{sell_decimals}`, `{buy_decimals}` and
+`{slippage_bps}` are also available). The answer may be a 1inch-style
+`priceRoute`, a nested `tx`, or a flat body; the core reads the fields it needs
+and refuses the rest.
+
+```bash
+# 1. Quote. Nothing is signed.
+curl -s localhost:8080/api/swap/quote -H 'content-type: application/json' -d '{
+  "network": "ethereum",
+  "sell_token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+  "buy_token": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+  "sell_amount_raw": 1000000
+}'
+
+# 2. If the allowance is short, approve exactly the amount being sold.
+curl -s localhost:8080/api/swap/approve -H 'content-type: application/json' -d '{
+  "network": "ethereum",
+  "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+  "spender": "0x216b4b4ba9f3e719726886d34a177484278bfcae",
+  "amount_raw": 1000000,
+  "passphrase": "…"
+}'
+
+# 3. Execute. Re-quotes, then signs that quote.
+curl -s localhost:8080/api/swap/execute -H 'content-type: application/json' -d '{
+  "network": "ethereum",
+  "sell_token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+  "buy_token": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+  "sell_amount_raw": 1000000,
+  "passphrase": "…"
+}'
+```
+
+A swap opens the same three gates as a transfer and adds four rules of its own:
+
+- **The quote is not trusted.** The echo of src/dest token and src amount has to
+  match the request; the router has to be a contract on the allowlist; the
+  calldata has to be non-empty hex within 8 KiB; and the native `value` must
+  equal the amount when selling the native coin and be zero otherwise. A quote
+  that fails any of these is refused, not corrected.
+- **The router and the spender must both be allowlisted.** An empty allowlist
+  refuses every swap rather than meaning "anything goes".
+- **The sell side is capped in dollars**, using the same on-chain arming cap as
+  a transfer, priced from the DEX feed. An unpriced token is refused.
+- **Approvals are exact.** The core never sends an unlimited approval on its
+  own. A short allowance returns `409 approval_required` with the spender and
+  the amount to approve; the operator sends the approval, not the agent.
+
+`POST /api/swap/execute` always re-quotes instead of replaying a stored quote,
+so a stale price can never become a signed transaction. The calldata that was
+signed is on the broadcast record as `call_data`, next to the value it moved.
+`GET /api/swap` reports whether swaps are armed, which source is configured and
+the cap in force.
 
 ---
 
@@ -605,7 +679,9 @@ the chain's native coin to an address; DEX execution is a separate subsystem.
   filterable and sortable, each with a trade button.
 - **On-chain wallet** (core view): native coins and tokens per chain, priced
   from the DEX feed, with unpriced and skipped holdings marked rather than
-  hidden. Labelled read-only — it is not trading equity.
+  hidden. Labelled read-only — it is not trading equity. Transfers and swaps
+  are deliberately not in the browser: a keystore passphrase stays in the
+  operator's shell, never in a page served from a public host.
 - **Admin analytics** (password-gated): net/gross P&L, fees, win rate, profit
   factor, equity curve, P&L by bucket, and a pivot table across symbol, venue,
   side, day, hour and source.
@@ -725,9 +801,11 @@ Exchange credentials are only read when live trading is armed. `.env`,
 `GET /healthz`, `/metrics`, `/api/config`, `/api/portfolio`, `/api/positions`,
 `/api/orders`, `/api/trades`, `/api/logs`, `/api/ticks`, `/api/risk`,
 `/api/risk/decisions`, `/api/risk/rules`, `/api/strategy`, `/api/venues`,
-`/api/wallet`, `/api/wallet/holdings`, `/api/wallet/broadcasts`, `/api/live`;
+`/api/wallet`, `/api/wallet/holdings`, `/api/wallet/broadcasts`, `/api/live`,
+`/api/swap`;
 `POST /api/orders`, `/api/logs`, `/api/onchain`, `/api/strategy/reload`,
-`/api/breaker/reset`, `/api/wallet/sign-dry-run`, `/api/wallet/broadcast`;
+`/api/breaker/reset`, `/api/wallet/sign-dry-run`, `/api/wallet/broadcast`,
+`/api/swap/quote`, `/api/swap/execute`, `/api/swap/approve`;
 `DELETE /api/orders/{order_id}` to cancel a resting order;
 `GET /ws` for the live stream. Full shapes in [docs/api-contract.md](docs/api-contract.md).
 
@@ -737,7 +815,7 @@ Exchange credentials are only read when live trading is armed. `.env`,
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **214 passing**, including the encrypted keystore,
+- `cargo test --workspace` — **238 passing**, including the encrypted keystore,
   EVM and Solana dry-run signing, live signing recovered against the wallet
   address, signature tampering, wrong-passphrase rejection, and the API
   refusing to sign when dry run is off. The broadcaster suite covers EIP-1559
@@ -854,12 +932,26 @@ Checked locally on macOS (arm64):
 - `GET /api/wallet/holdings` served by a running core with a throwaway HD
   keystore: `configured: true`, both chains, live SOL and ETH prices, and
   `onchain_value_usd` on `/api/portfolio` without touching equity.
+- The swap path driven end to end against a mock quote source and JSON-RPC node,
+  with a real encrypted keystore and an on-chain arming record capped at $100:
+  a quote for $1 of USDC reported the on-chain balance and a zero allowance;
+  execute returned `409 approval_required` with the spender and amount;
+  `/api/swap/approve` sent the exact ERC-20 `approve` (calldata checked byte by
+  byte: selector, spender word, amount word) and the source then reported the
+  allowance as sufficient; the next execute returned a signed swap whose
+  `to` was the router, whose `call_data` was the quoted bytes and whose native
+  value was zero; a $200 sell was refused with `swap_above_cap`; a Solana swap
+  was refused with `swap_network_unsupported` before any quote; and both
+  signed transactions came back from `/api/wallet/broadcasts` after a core
+  restart.
 
 **Not verified:** live exchange connections (no credentials were used), a
-transfer broadcast to a public chain (the broadcast path was exercised against
-a mock JSON-RPC node with a real keystore, an on-chain arming record and real
-signatures), and the <10µs dispatch target on your hardware. Grafana and
-Prometheus configs are provided but were not run against a live scrape here.
+transfer or swap broadcast to a public chain (both paths were exercised against
+a mock quote source and JSON-RPC node with a real keystore, an on-chain arming
+record and real signatures), a real DEX aggregator's quote shape beyond the
+1inch-style and flat bodies in the parser tests, and the <10µs dispatch target
+on your hardware. Grafana and Prometheus configs are provided but were not run
+against a live scrape here.
 
 Bugs found and fixed during that verification:
 
