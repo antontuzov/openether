@@ -125,6 +125,11 @@ impl Config {
                 "OPENETHER_BREAKER_HALT_ON_OVERSIZED_ORDER",
                 true,
             ),
+            max_correlated_exposure_pct: env_f64("OPENETHER_MAX_CORRELATED_EXPOSURE_PCT", 40.0),
+            correlation_threshold: env_f64("OPENETHER_CORRELATION_THRESHOLD", 0.7).clamp(0.0, 1.0),
+            volatility_target_pct: env_f64("OPENETHER_VOLATILITY_TARGET_PCT", 2.0).max(0.0),
+            volatility_window: env_usize("OPENETHER_VOLATILITY_WINDOW", 60).clamp(10, 500),
+            min_size_scale: env_f64("OPENETHER_MIN_SIZE_SCALE", 0.25).clamp(0.01, 1.0),
         };
 
         // The arming record decides whether live trading may run. The

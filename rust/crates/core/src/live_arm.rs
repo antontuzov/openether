@@ -151,7 +151,7 @@ pub fn live_requested() -> bool {
 /// it can only ever tighten.
 pub fn config_digest(venue: &str, risk: &RiskConfig) -> String {
     let mut canonical = String::new();
-    canonical.push_str("openether/live-arming/config/v2\n");
+    canonical.push_str("openether/live-arming/config/v3\n");
     canonical.push_str(&format!("venue={venue}\n"));
     canonical.push_str(&format!(
         "max_position_pct={}\n",
@@ -176,6 +176,20 @@ pub fn config_digest(venue: &str, risk: &RiskConfig) -> String {
         "hard_halt_on_oversized_order={}\n",
         risk.hard_halt_on_oversized_order
     ));
+    canonical.push_str(&format!(
+        "max_correlated_exposure_pct={}\n",
+        risk.max_correlated_exposure_pct
+    ));
+    canonical.push_str(&format!(
+        "correlation_threshold={}\n",
+        risk.correlation_threshold
+    ));
+    canonical.push_str(&format!(
+        "volatility_target_pct={}\n",
+        risk.volatility_target_pct
+    ));
+    canonical.push_str(&format!("volatility_window={}\n", risk.volatility_window));
+    canonical.push_str(&format!("min_size_scale={}\n", risk.min_size_scale));
     canonical.push_str(&format!("symbols={}\n", sorted(&risk.symbol_allowlist)));
     canonical.push_str(&format!(
         "venues={}\n",
@@ -585,6 +599,26 @@ mod tests {
             config_digest("binance", &base),
             config_digest("kraken", &base)
         );
+    }
+
+    #[test]
+    fn the_digest_covers_the_portfolio_limits() {
+        let base = risk();
+        for mutate in [
+            |c: &mut RiskConfig| c.max_correlated_exposure_pct = 0.0,
+            |c: &mut RiskConfig| c.correlation_threshold = 0.9,
+            |c: &mut RiskConfig| c.volatility_target_pct = 0.0,
+            |c: &mut RiskConfig| c.volatility_window = 10,
+            |c: &mut RiskConfig| c.min_size_scale = 1.0,
+        ] {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                config_digest("binance", &base),
+                config_digest("binance", &changed),
+                "a looser portfolio limit must stale the arming"
+            );
+        }
     }
 
     #[test]

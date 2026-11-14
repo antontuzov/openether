@@ -626,7 +626,12 @@ Response `200`:
     "max_order_notional_usd": 5000.0,
     "min_order_notional_usd": 10.0,
     "breaker_cooldown_ms": 300000,
-    "hard_halt_on_oversized_order": true
+    "hard_halt_on_oversized_order": true,
+    "max_correlated_exposure_pct": 40.0,
+    "correlation_threshold": 0.7,
+    "volatility_target_pct": 2.0,
+    "volatility_window": 60,
+    "min_size_scale": 0.25
   },
   "allowlists": {
     "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
@@ -650,10 +655,12 @@ Response `200`:
     "reduce_only_violation",
     "position_size_exceeds_max_pct",
     "gross_exposure_exceeded",
+    "correlated_exposure_exceeded",
     "max_open_positions",
     "half_open_probe_too_large"
   ],
   "venue_checks": ["no_position", "reduce_only", "insufficient_cash"],
+  "portfolio_checks": ["correlated_exposure_exceeded"],
   "reasons": [
     "breaker_open",
     "invalid_quantity",
@@ -671,6 +678,7 @@ Response `200`:
     "reduce_only_violation",
     "position_size_exceeds_max_pct",
     "gross_exposure_exceeded",
+    "correlated_exposure_exceeded",
     "max_open_positions",
     "half_open_probe_too_large",
     "no_position",
@@ -683,8 +691,11 @@ Response `200`:
 
 `check_order` is the order the checks run in: the first one that fails is the
 reason the order is refused. `venue_checks` are applied by the venue after the
-risk layer has passed the order. `reasons` is every code an order can end up
-with, `approved` included.
+risk layer has passed the order. `portfolio_checks` judge the whole book rather
+than one order — the correlation cap compares each position's return series —
+so they are not in `check_order`; the engine runs them, the browser simulator
+does not. `reasons` is every code an order can end up with, `approved`
+included.
 
 The same contract, with empty allowlists, is generated for the browser by
 `cargo run -p openether-core --bin openether-rules` and written to
@@ -757,6 +768,10 @@ Guarantees:
   second behaves like a slow live session.
 - **Costs.** Commission (`fee_bps`) and slippage (`slippage_bps`) are charged
   per side; a buy fills above the open and a sell below it.
+- **Volatility sizing.** Each bar's close feeds the volatility model before the
+  next open fills anything, so a signal is sized to the market it lands in: a
+  volatile series fills smaller than a calm one, and the trade's rationale
+  records the multiplier that was applied.
 - **Committed approvals.** Approved orders are counted as positions until
   they fill, so several same-bar approvals cannot each pass the
   position-size check on the same free equity.

@@ -25,7 +25,7 @@ pub const CONTRACT_VERSION: u32 = 1;
 ///
 /// A refusal is reported with the first check that failed, so the order is
 /// part of the contract: the browser simulator walks the same list.
-pub const CHECK_ORDER: [&str; 18] = [
+pub const CHECK_ORDER: [&str; 19] = [
     "breaker_open",
     "invalid_quantity",
     "invalid_price",
@@ -42,9 +42,17 @@ pub const CHECK_ORDER: [&str; 18] = [
     "reduce_only_violation",
     "position_size_exceeds_max_pct",
     "gross_exposure_exceeded",
+    "correlated_exposure_exceeded",
     "max_open_positions",
     "half_open_probe_too_large",
 ];
+
+/// Checks that need per-symbol return history rather than a single order.
+///
+/// The browser simulator has no such history, so it cannot reproduce these;
+/// the engine enforces them and the contract names them separately so the
+/// difference is explicit instead of a silent gap.
+pub const PORTFOLIO_CHECKS: [&str; 1] = ["correlated_exposure_exceeded"];
 
 /// The reason codes the venue can produce, as opposed to the risk layer.
 ///
@@ -70,6 +78,16 @@ pub struct RuleLimits {
     /// An order larger than the position cap halts trading instead of only
     /// refusing that one order.
     pub hard_halt_on_oversized_order: bool,
+    /// Up to this share of equity may sit in positions that move together.
+    pub max_correlated_exposure_pct: f64,
+    /// |Pearson r| at or above this counts two markets as moving together.
+    pub correlation_threshold: f64,
+    /// Per-sample volatility new positions are sized for, in percent.
+    pub volatility_target_pct: f64,
+    /// Recent returns feeding the volatility and correlation estimates.
+    pub volatility_window: usize,
+    /// The smallest multiplier volatility targeting may apply.
+    pub min_size_scale: f64,
 }
 
 /// The symbols, venues and contracts the engine may touch.
@@ -92,6 +110,8 @@ pub struct RiskContract {
     pub check_order: Vec<String>,
     /// The checks a venue applies on top of the risk layer.
     pub venue_checks: Vec<String>,
+    /// Checks that need per-symbol return history and run only in the engine.
+    pub portfolio_checks: Vec<String>,
     /// Every reason code an order can be refused with.
     pub reasons: Vec<String>,
 }
@@ -108,6 +128,11 @@ impl From<&RiskConfig> for RuleLimits {
             min_order_notional_usd: c.min_order_notional_usd,
             breaker_cooldown_ms: c.breaker_cooldown_ms,
             hard_halt_on_oversized_order: c.hard_halt_on_oversized_order,
+            max_correlated_exposure_pct: c.max_correlated_exposure_pct,
+            correlation_threshold: c.correlation_threshold,
+            volatility_target_pct: c.volatility_target_pct,
+            volatility_window: c.volatility_window,
+            min_size_scale: c.min_size_scale,
         }
     }
 }
@@ -130,6 +155,11 @@ impl From<&RiskConfig> for RuleAllowlists {
 /// Every reason code an order can be refused with.
 pub fn reasons() -> Vec<String> {
     let mut all: Vec<String> = CHECK_ORDER.iter().map(|r| (*r).to_string()).collect();
+    for check in PORTFOLIO_CHECKS {
+        if !all.iter().any(|reason| reason == check) {
+            all.push((*check).to_string());
+        }
+    }
     all.extend(VENUE_REASONS.iter().map(|r| (*r).to_string()));
     all.push(APPROVED.to_string());
     all
@@ -144,6 +174,7 @@ pub fn contract(config: &RiskConfig) -> RiskContract {
         allowlists: RuleAllowlists::from(config),
         check_order: CHECK_ORDER.iter().map(|r| (*r).to_string()).collect(),
         venue_checks: VENUE_REASONS.iter().map(|r| (*r).to_string()).collect(),
+        portfolio_checks: PORTFOLIO_CHECKS.iter().map(|r| (*r).to_string()).collect(),
         reasons: reasons(),
     }
 }
@@ -190,6 +221,11 @@ mod tests {
         assert_eq!(contract.limits.max_open_positions, 5);
         assert_eq!(contract.limits.max_order_notional_usd, 5000.0);
         assert_eq!(contract.limits.min_order_notional_usd, 10.0);
+        assert_eq!(contract.limits.max_correlated_exposure_pct, 40.0);
+        assert_eq!(contract.limits.correlation_threshold, 0.7);
+        assert_eq!(contract.limits.volatility_target_pct, 2.0);
+        assert_eq!(contract.limits.volatility_window, 60);
+        assert_eq!(contract.limits.min_size_scale, 0.25);
         assert!(contract.limits.hard_halt_on_oversized_order);
     }
 

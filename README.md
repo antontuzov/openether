@@ -213,7 +213,7 @@ a strategy of your own.
 ### Tests
 
 ```bash
-cargo test --workspace --manifest-path rust/Cargo.toml   # 252 tests
+cargo test --workspace --manifest-path rust/Cargo.toml   # 259 tests
 pnpm --dir ts -r test                                    # 127 tests
 pnpm --dir ts -r typecheck
 pnpm --dir ts -r build
@@ -265,8 +265,9 @@ order is refused:
 | 14 | The sell does not flip the position | `reduce_only_violation` |
 | 15 | The position is under the size cap | `position_size_exceeds_max_pct` |
 | 16 | The book is under the gross cap | `gross_exposure_exceeded` |
-| 17 | There is room for another position | `max_open_positions` |
-| 18 | The probe order is small enough | `half_open_probe_too_large` |
+| 17 | The correlated cluster is under its cap | `correlated_exposure_exceeded` |
+| 18 | There is room for another position | `max_open_positions` |
+| 19 | The probe order is small enough | `half_open_probe_too_large` |
 
 The venue then applies its own rules on top: `no_position` when there is
 nothing to sell, `reduce_only` when the sell would flip the position, and
@@ -279,12 +280,45 @@ everything is `approved`.
 | Minimum order notional | $10 | `notional_too_small` |
 | Position size | 20% of equity | `position_size_exceeds_max_pct` |
 | Gross exposure | 60% of equity | `gross_exposure_exceeded` |
+| Correlated cluster | 40% of equity at \|ρ\| ≥ 0.7 | `correlated_exposure_exceeded` |
 | Open positions | 5 | `max_open_positions` |
 | Free cash | margin-aware | `insufficient_cash` |
 | Daily loss | 3% | trips the breaker |
 | Drawdown from peak | 10% | trips the breaker |
 | Symbol / venue / contract | allowlist | `symbol_not_allowed` |
 | Sells | reduce-only | `no_position`, `reduce_only` |
+
+### Portfolio risk: one bet, and the right size
+
+Two rules look past the single order to the book it lands in.
+
+**The correlation cap** treats markets that move together as one bet. The
+engine keeps the recent closes of every symbol it prices, takes the Pearson
+correlation of simple returns over the volatility window, and if the new order
+and any held position are correlated at `|ρ| ≥ 0.7`, their notionals share a
+40%-of-equity budget. Three tech tokens that each fit under the gross cap can
+still be one concentrated bet; this is the check that notices. It only applies
+to an order that *increases* absolute exposure — an exit is never blocked by
+it — and it stays quiet until there are 20 returns to measure.
+
+**Volatility targeting** sizes an entry to the market, not just to the cap. If
+the realized standard deviation of recent returns is above the 2% target, an
+order that increases exposure is scaled down by `target / realized`, never
+below a floor of 0.25 of the requested size. A calm market keeps full size. The
+rationale records the multiplier when one was applied, so the trade journal
+shows why a 10-unit signal filled as 4.
+
+Both need price history the browser simulator does not keep, so they are
+delivered in the contract as `portfolio_checks` rather than `check_order`. The
+engine runs them on every order; the simulator is documented as per-order only.
+
+| Limit | Default | Environment variable |
+| --- | --- | --- |
+| Correlated cluster cap | 40% of equity | `OPENETHER_MAX_CORRELATED_EXPOSURE_PCT` |
+| Correlation threshold | 0.7 | `OPENETHER_CORRELATION_THRESHOLD` |
+| Volatility target | 2% per bar | `OPENETHER_VOLATILITY_TARGET_PCT` |
+| Volatility window | 60 returns | `OPENETHER_VOLATILITY_WINDOW` |
+| Size-scale floor | 0.25 | `OPENETHER_MIN_SIZE_SCALE` |
 
 **The circuit breaker** opens on a daily-loss or drawdown breach and refuses
 every subsequent order (`breaker_open`) until it is explicitly reset. A reset
@@ -306,6 +340,10 @@ purpose:
 - **The allowlists are cleared.** They describe the engine's own venue — which
   symbols its connectors may trade on a live account. The simulator has no
   exchange account, so it trades every market the free price feed offers.
+- **Portfolio checks stay in the engine.** The correlation cap and volatility
+  targeting need a return series per symbol; the simulator holds one quote.
+  The contract says so in `portfolio_checks`, and the engine enforces them for
+  the real book.
 - **No keys, no orders.** Fills are computed in the browser. Nothing reaches an
   exchange.
 
@@ -481,10 +519,11 @@ The arming is a record, not a permission slip you can copy around:
 
 The digest covers the limits that decide how much money can be lost: position
 cap, gross exposure, daily loss, drawdown, open positions, minimum notional,
-breaker cooldown, the hard-halt flag and the symbol / venue / contract
-allowlists. The per-order cap is not in the digest — the arming tightens that
-one itself, and the effective cap is always the *smaller* of the risk layer's
-cap and the armed cap, so it can only ever tighten.
+breaker cooldown, the hard-halt flag, the correlation cluster cap and its
+threshold, volatility targeting and its size floor, and the symbol / venue /
+contract allowlists. The per-order cap is not in the digest — the arming
+tightens that one itself, and the effective cap is always the *smaller* of the
+risk layer's cap and the armed cap, so it can only ever tighten.
 
 So the full sequence to trade live is: set the risk configuration first, then
 arm, then start the core. Re-order those and the arming is stale on purpose.
@@ -884,6 +923,11 @@ Copy `.env.example` to `.env`. The important defaults:
 | `OPENETHER_EVM_TOKEN_WATCHLIST` | *(empty)* | ERC-20 contracts to value, comma-separated |
 | `OPENETHER_PRICE_FEED_URL` | `https://api.dexscreener.com` | DEX feed used to price wallet holdings |
 | `OPENETHER_SYMBOL_ALLOWLIST` | `SOL/USDT,BTC/USDT,ETH/USDT` | tradable symbols |
+| `OPENETHER_MAX_CORRELATED_EXPOSURE_PCT` | `40` | one correlated cluster's share of equity |
+| `OPENETHER_CORRELATION_THRESHOLD` | `0.7` | \|ρ\| at which positions are one bet |
+| `OPENETHER_VOLATILITY_TARGET_PCT` | `2` | per-bar return stdev an entry is sized to |
+| `OPENETHER_VOLATILITY_WINDOW` | `60` | returns used for volatility and correlation |
+| `OPENETHER_MIN_SIZE_SCALE` | `0.25` | floor a volatility-scaled entry may reach |
 | `OPENETHER_STRATEGY_DIR` | `target/wasm` | where the strategy registry looks for built artifacts |
 | `OPENETHER_WASM_FUEL` / `OPENETHER_WASM_MEMORY_PAGES` | `200000000` / `32` | sandbox budget per tick |
 | `OPENETHER_CONTRACT_ALLOWLIST` | *(empty)* | permitted on-chain contracts |
@@ -914,7 +958,7 @@ Exchange credentials are only read when live trading is armed. `.env`,
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **252 passing**, including the encrypted keystore,
+- `cargo test --workspace` — **259 passing**, including the encrypted keystore,
   EVM and Solana dry-run signing, live signing recovered against the wallet
   address, signature tampering, wrong-passphrase rejection, and the API
   refusing to sign when dry run is off. The broadcaster suite covers EIP-1559
@@ -930,6 +974,15 @@ Checked locally on macOS (arm64):
   trip books its realised PnL; a signal for another symbol never reaches the
   risk layer; the strategy sees only closed bars; malformed bars are refused
   before the strategy runs; and a strategy error names the bar it failed on.
+- The portfolio rules exercised at the risk layer and through a replay: a BTC
+  position and a SOL order that move together (ρ > 0.99) are refused with
+  `correlated_exposure_exceeded` once the cluster passes its cap, while a
+  reduce-only exit is exempt and a series too short to measure does not speak.
+  A ±5% bar series is scaled to 0.4× and a flat one keeps 1.0×, and an exit is
+  never scaled; in a backtest the same buy signal fills 1.0 unit on the flat
+  series and less than 1.0 on the volatile one. Over HTTP, the same rising
+  market filled 9.10 units when calm and 3.60 with `volatility scale 0.45` when
+  turbulent, and the live `GET /api/risk/rules` reports `portfolio_checks`.
 - The strategy registry exercised against built artifacts: all three strategies
   build, `GET /api/strategies` reports each one's path and availability, and
   `POST /api/strategy/select` hot-swaps momentum for breakout and then

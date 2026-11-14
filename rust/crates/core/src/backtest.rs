@@ -168,6 +168,9 @@ where
     let mut pending: Vec<(OrderRequest, String)> = Vec::new();
 
     for (i, bar) in bars.iter().enumerate() {
+        // The close is known at this bar's close, so it may feed the sizing
+        // model before the next open fills anything: no lookahead is gained.
+        risk.observe_price(&params.symbol, bar.close, bar.ts_ms);
         let mut fills = Vec::new();
         for (request, rationale) in pending.drain(..) {
             fills.push(sim.fill(bar.ts_ms, bar.open, &request, &rationale));
@@ -223,18 +226,28 @@ where
                 *sim.rejected.entry("symbol_mismatch".into()).or_insert(0) += 1;
                 continue;
             }
+            let (qty, scale) =
+                risk.scale_for_volatility(signal.side, signal.qty, shadow_qty, &signal.symbol);
+            if qty <= 0.0 {
+                continue;
+            }
+            let rationale = if scale < 1.0 {
+                format!("backtest: {} (volatility scale {scale:.2})", signal.reason)
+            } else {
+                format!("backtest: {}", signal.reason)
+            };
             let request = OrderRequest {
                 venue: Venue::Paper,
                 symbol: signal.symbol.clone(),
                 side: signal.side,
-                qty: signal.qty,
+                qty,
                 order_type: OrderType::Market,
                 limit_price: None,
                 trigger_price: None,
                 oco_group: None,
                 reduce_only: false,
                 client_id: format!("bt-{i}-{}", sim.proposals),
-                rationale: format!("backtest: {}", signal.reason),
+                rationale: rationale.clone(),
                 reduce_only_guard: false,
             };
             sim.proposals += 1;
@@ -252,8 +265,8 @@ where
             }
             breaker_state = verdict.breaker_state;
             if verdict.approved {
-                shadow_qty += signal.side.sign() * signal.qty;
-                pending.push((request, format!("backtest: {}", signal.reason)));
+                shadow_qty += signal.side.sign() * qty;
+                pending.push((request, rationale));
             } else {
                 *sim.rejected.entry(verdict.reason.clone()).or_insert(0) += 1;
             }
@@ -844,5 +857,34 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn a_volatile_series_is_sized_down_and_a_flat_one_is_not() {
+        let signal_at = 12;
+        let script = scripted(vec![(signal_at * HOUR, vec![signal(Side::Buy, 1.0)])]);
+
+        let flat: Vec<Bar> = (0..16).map(|i| bar(i * HOUR, 100.0, 100.0)).collect();
+        let calm = run(&params(), &flat, permissive(), script).unwrap();
+        assert_eq!(calm.trades[0].qty, 1.0);
+
+        let mut volatile = Vec::new();
+        let mut prev = 100.0;
+        for i in 0..16 {
+            let close = if i == 0 {
+                100.0
+            } else if i % 2 == 1 {
+                prev * 1.05
+            } else {
+                prev * 0.95
+            };
+            volatile.push(bar(i * HOUR, prev, close));
+            prev = close;
+        }
+        let mut script = scripted(vec![(signal_at * HOUR, vec![signal(Side::Buy, 1.0)])]);
+        let hot = run(&params(), &volatile, permissive(), &mut script).unwrap();
+
+        assert!(hot.trades[0].qty < 1.0, "qty was {}", hot.trades[0].qty);
+        assert!(hot.trades[0].qty >= 0.25, "qty was {}", hot.trades[0].qty);
     }
 }

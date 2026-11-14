@@ -56,6 +56,19 @@ pub struct RiskConfig {
     /// Per the operating rules: a trade larger than the position cap halts trading
     /// entirely instead of only rejecting that single order.
     pub hard_halt_on_oversized_order: bool,
+    /// Positions whose recent returns move together may not add up to more
+    /// than this share of equity. `0` disables the check.
+    pub max_correlated_exposure_pct: f64,
+    /// |Pearson r| at or above this counts two markets as moving together.
+    pub correlation_threshold: f64,
+    /// The per-sample volatility a position is sized for, in percent. `0`
+    /// disables volatility targeting.
+    pub volatility_target_pct: f64,
+    /// How many recent returns feed the volatility and correlation estimates.
+    pub volatility_window: usize,
+    /// The smallest multiplier volatility targeting may apply. A cap on how
+    /// far a calm target may shrink a high-volatility trade.
+    pub min_size_scale: f64,
 }
 
 impl Default for RiskConfig {
@@ -77,6 +90,11 @@ impl Default for RiskConfig {
             contract_allowlist: HashSet::new(),
             breaker_cooldown_ms: 300_000,
             hard_halt_on_oversized_order: true,
+            max_correlated_exposure_pct: 40.0,
+            correlation_threshold: 0.7,
+            volatility_target_pct: 2.0,
+            volatility_window: 60,
+            min_size_scale: 0.25,
         }
     }
 }
@@ -90,6 +108,11 @@ pub struct RiskLimits {
     pub max_open_positions: usize,
     pub max_order_notional_usd: f64,
     pub min_order_notional_usd: f64,
+    pub max_correlated_exposure_pct: f64,
+    pub correlation_threshold: f64,
+    pub volatility_target_pct: f64,
+    pub volatility_window: usize,
+    pub min_size_scale: f64,
 }
 
 impl From<&RiskConfig> for RiskLimits {
@@ -102,6 +125,11 @@ impl From<&RiskConfig> for RiskLimits {
             max_open_positions: c.max_open_positions,
             max_order_notional_usd: c.max_order_notional_usd,
             min_order_notional_usd: c.min_order_notional_usd,
+            max_correlated_exposure_pct: c.max_correlated_exposure_pct,
+            correlation_threshold: c.correlation_threshold,
+            volatility_target_pct: c.volatility_target_pct,
+            volatility_window: c.volatility_window,
+            min_size_scale: c.min_size_scale,
         }
     }
 }
@@ -228,8 +256,19 @@ struct RiskStateInner {
     gross_exposure_usd: f64,
     position_notional: HashMap<String, f64>,
     position_qty: HashMap<String, f64>,
+    /// Recent prices per symbol, used for the volatility and correlation
+    /// estimates. Kept in the risk layer because both are risk inputs.
+    prices: HashMap<String, VecDeque<f64>>,
     probe_in_flight: bool,
 }
+
+/// How many prices are kept per symbol. Enough for a 60-sample volatility
+/// window with room for a longer configured one, without unbounded growth.
+const PRICE_HISTORY: usize = 512;
+/// Fewer returns than this cannot describe volatility.
+const MIN_VOLATILITY_SAMPLES: usize = 10;
+/// Fewer paired returns than this cannot describe a correlation.
+const MIN_CORRELATION_SAMPLES: usize = 20;
 
 /// The non-bypassable risk layer.
 ///
@@ -260,6 +299,7 @@ impl RiskEngine {
                 gross_exposure_usd: 0.0,
                 position_notional: HashMap::new(),
                 position_qty: HashMap::new(),
+                prices: HashMap::new(),
                 probe_in_flight: false,
             }),
             audit: Mutex::new(VecDeque::with_capacity(512)),
@@ -378,6 +418,96 @@ impl RiskEngine {
 
     pub fn open_positions(&self) -> usize {
         self.lock().open_positions
+    }
+
+    /// Records a market price.
+    ///
+    /// Volatility targeting and the correlation cap both read this history, so
+    /// neither has to guess from a single quote. Non-positive and non-finite
+    /// prices are ignored rather than poisoning the estimates.
+    pub fn observe_price(&self, symbol: &str, price: f64, _ts_ms: i64) {
+        if symbol.trim().is_empty() || !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        let mut state = self.lock();
+        let history = state.prices.entry(symbol.to_string()).or_default();
+        history.push_back(price);
+        if history.len() > PRICE_HISTORY {
+            history.pop_front();
+        }
+    }
+
+    /// Standard deviation of recent simple returns, in percent.
+    pub fn realized_volatility_pct(&self, symbol: &str) -> Option<f64> {
+        let state = self.lock();
+        let window = self.config.volatility_window;
+        let returns = recent_returns(state.prices.get(symbol)?, window);
+        if returns.len() < MIN_VOLATILITY_SAMPLES {
+            return None;
+        }
+        Some(stdev(&returns) * 100.0)
+    }
+
+    /// The multiplier volatility targeting applies to a new position.
+    ///
+    /// `1.0` until there is enough history or when the market is calmer than
+    /// the target. A hot market is sized down towards the target, never below
+    /// `min_size_scale`, so the trade still exists.
+    pub fn volatility_scale(&self, symbol: &str) -> f64 {
+        let target = self.config.volatility_target_pct;
+        if target <= 0.0 {
+            return 1.0;
+        }
+        let Some(volatility) = self.realized_volatility_pct(symbol) else {
+            return 1.0;
+        };
+        if volatility <= target {
+            return 1.0;
+        }
+        (target / volatility).clamp(self.config.min_size_scale.clamp(0.01, 1.0), 1.0)
+    }
+
+    /// The order size after volatility targeting, and the multiplier used.
+    ///
+    /// Only an order that increases absolute exposure is scaled: shrinking an
+    /// exit would leave risk on the book, which is the opposite of the point.
+    pub fn scale_for_volatility(
+        &self,
+        side: Side,
+        qty: f64,
+        current_qty: f64,
+        symbol: &str,
+    ) -> (f64, f64) {
+        let resulting = (current_qty + side.sign() * qty.abs()).abs();
+        if resulting <= current_qty.abs() {
+            return (qty, 1.0);
+        }
+        let scale = self.volatility_scale(symbol);
+        if scale >= 1.0 {
+            return (qty, 1.0);
+        }
+        let scaled = (qty * scale * 10_000.0).floor() / 10_000.0;
+        (scaled, scale)
+    }
+
+    /// Pearson correlation of the two symbols' recent returns.
+    pub fn correlation(&self, a: &str, b: &str) -> Option<f64> {
+        let state = self.lock();
+        pair_correlation(&state, a, b, self.config.volatility_window)
+    }
+
+    /// The exposure an order would add to a cluster of positions that move
+    /// with `symbol`, as `(total_usd, |rho|, other_symbol)`.
+    ///
+    /// `None` when the symbol has no correlated sibling, so the cap only
+    /// speaks once there is a real cluster to measure.
+    pub fn correlated_exposure(
+        &self,
+        symbol: &str,
+        order_notional: f64,
+    ) -> Option<(f64, f64, String)> {
+        let state = self.lock();
+        correlated_exposure_locked(&self.config, &state, symbol, order_notional)
     }
 
     /// The single gate every order must pass.
@@ -584,6 +714,29 @@ impl RiskEngine {
                 ),
                 breaker_state,
             );
+        }
+
+        // Correlation cap: two markets that move together are one bet, so
+        // their notionals share a budget the gross-exposure cap cannot see.
+        if !req.reduce_only
+            && resulting_qty.abs() > current_qty.abs()
+            && self.config.max_correlated_exposure_pct > 0.0
+        {
+            let cap = ctx.equity_usd * self.config.max_correlated_exposure_pct / 100.0;
+            if let Some((exposure, rho, other)) =
+                correlated_exposure_locked(&self.config, state, &req.symbol, notional)
+            {
+                if exposure > cap {
+                    return RiskVerdict::reject(
+                        "correlated_exposure_exceeded",
+                        format!(
+                            "{} moves with {other} (rho {rho:.2}); the correlated cluster would be ${exposure:.2}, cap is ${cap:.2} ({:.1}% of equity)",
+                            req.symbol, self.config.max_correlated_exposure_pct
+                        ),
+                        breaker_state,
+                    );
+                }
+            }
         }
 
         // Open position count cap (a position flip is still one symbol).
@@ -837,6 +990,112 @@ impl RiskEngine {
     fn lock_audit(&self) -> std::sync::MutexGuard<'_, VecDeque<RiskDecision>> {
         self.audit.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// Simple returns from the most recent `window + 1` prices.
+fn recent_returns(prices: &VecDeque<f64>, window: usize) -> Vec<f64> {
+    let take = (window.saturating_add(1)).min(prices.len());
+    if take < 2 {
+        return Vec::new();
+    }
+    let start = prices.len() - take;
+    let sample: Vec<f64> = prices.iter().skip(start).copied().collect();
+    sample
+        .windows(2)
+        .filter(|pair| pair[0] > 0.0)
+        .map(|pair| pair[1] / pair[0] - 1.0)
+        .collect()
+}
+
+fn stdev(values: &[f64]) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / (values.len() - 1) as f64;
+    variance.max(0.0).sqrt()
+}
+
+fn pearson(a: &[f64], b: &[f64]) -> Option<f64> {
+    let n = a.len().min(b.len());
+    if n < 2 {
+        return None;
+    }
+    let a = &a[a.len() - n..];
+    let b = &b[b.len() - n..];
+    let mean_a = a.iter().sum::<f64>() / n as f64;
+    let mean_b = b.iter().sum::<f64>() / n as f64;
+    let mut covariance = 0.0;
+    let mut var_a = 0.0;
+    let mut var_b = 0.0;
+    for (x, y) in a.iter().zip(b) {
+        let dx = x - mean_a;
+        let dy = y - mean_b;
+        covariance += dx * dy;
+        var_a += dx * dx;
+        var_b += dy * dy;
+    }
+    if var_a <= f64::EPSILON || var_b <= f64::EPSILON {
+        return None;
+    }
+    Some((covariance / (var_a.sqrt() * var_b.sqrt())).clamp(-1.0, 1.0))
+}
+
+fn pair_correlation(state: &RiskStateInner, a: &str, b: &str, window: usize) -> Option<f64> {
+    if a == b {
+        return Some(1.0);
+    }
+    let ra = recent_returns(state.prices.get(a)?, window);
+    let rb = recent_returns(state.prices.get(b)?, window);
+    let n = ra.len().min(rb.len()).min(window);
+    if n < MIN_CORRELATION_SAMPLES {
+        return None;
+    }
+    pearson(&ra[ra.len() - n..], &rb[rb.len() - n..])
+}
+
+/// The locked body of [`RiskEngine::correlated_exposure`].
+fn correlated_exposure_locked(
+    config: &RiskConfig,
+    state: &RiskStateInner,
+    symbol: &str,
+    order_notional: f64,
+) -> Option<(f64, f64, String)> {
+    if config.max_correlated_exposure_pct <= 0.0 || config.correlation_threshold <= 0.0 {
+        return None;
+    }
+    let mut total = state
+        .position_notional
+        .get(symbol)
+        .copied()
+        .unwrap_or(0.0)
+        .abs();
+    let mut strongest: Option<(f64, String)> = None;
+    for (other, notional) in &state.position_notional {
+        if other == symbol || notional.abs() <= 0.01 {
+            continue;
+        }
+        let Some(rho) = pair_correlation(state, symbol, other, config.volatility_window) else {
+            continue;
+        };
+        if rho.abs() < config.correlation_threshold {
+            continue;
+        }
+        total += notional.abs();
+        let stronger = strongest
+            .as_ref()
+            .map(|(best, _)| rho.abs() > best.abs())
+            .unwrap_or(true);
+        if stronger {
+            strongest = Some((rho, other.clone()));
+        }
+    }
+    let (rho, other) = strongest?;
+    Some((total + order_notional, rho, other))
 }
 
 fn drawdown_pct(peak: f64, equity: f64) -> f64 {
@@ -1143,5 +1402,137 @@ mod tests {
         assert_eq!(decisions.len(), 2);
         assert!(decisions[0].approved);
         assert!(!decisions[1].approved);
+    }
+
+    /// Feeds `start` and then one price per percentage move.
+    fn observe_series(risk: &RiskEngine, symbol: &str, start: f64, moves: &[f64]) {
+        let mut price = start;
+        risk.observe_price(symbol, price, 0);
+        for mv in moves {
+            price *= 1.0 + mv;
+            risk.observe_price(symbol, price, 0);
+        }
+    }
+
+    fn moves(count: usize) -> Vec<f64> {
+        (0..count).map(|i| (i % 5) as f64 * 0.002 - 0.004).collect()
+    }
+
+    fn two_symbols() -> RiskConfig {
+        let mut config = cfg();
+        config.symbol_allowlist.insert("BTC/USDT".into());
+        config.max_correlated_exposure_pct = 10.0;
+        config
+    }
+
+    fn hold(risk: &RiskEngine, symbol: &str, qty: f64, price: f64) {
+        let fill = OrderFill {
+            venue: Venue::Paper,
+            order_id: "seed".into(),
+            symbol: symbol.into(),
+            side: Side::Buy,
+            qty,
+            price,
+            fee: 0.0,
+            ts_ms: now_ms(),
+        };
+        risk.on_fill(&fill, 10_000.0);
+    }
+
+    fn ctx_with(equity: f64, gross: f64, position: f64, price: f64) -> RiskContext {
+        RiskContext {
+            equity_usd: equity,
+            gross_exposure_usd: gross,
+            open_positions: usize::from(position.abs() > 1e-9),
+            current_position_qty: position,
+            price,
+            contracts: vec![],
+        }
+    }
+
+    #[test]
+    fn a_correlated_cluster_is_capped_as_one_bet() {
+        let (risk, _) = engine(two_symbols());
+        let history = moves(30);
+        observe_series(&risk, "SOL/USDT", 100.0, &history);
+        observe_series(&risk, "BTC/USDT", 100.0, &history);
+        assert!(risk.correlation("SOL/USDT", "BTC/USDT").unwrap() > 0.99);
+        hold(&risk, "BTC/USDT", 8.0, 100.0);
+
+        let req = OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 9.0);
+        let verdict = risk.evaluate(&req, &ctx_with(10_000.0, 800.0, 0.0, 100.0));
+
+        assert!(!verdict.approved, "the cluster must share one budget");
+        assert_eq!(verdict.reason, "correlated_exposure_exceeded");
+    }
+
+    #[test]
+    fn a_reduce_only_exit_is_exempt_from_the_correlation_cap() {
+        let (risk, _) = engine(two_symbols());
+        let history = moves(30);
+        observe_series(&risk, "SOL/USDT", 100.0, &history);
+        observe_series(&risk, "BTC/USDT", 100.0, &history);
+        hold(&risk, "BTC/USDT", 8.0, 100.0);
+
+        let mut req = OrderRequest::market(Venue::Paper, "BTC/USDT", Side::Sell, 2.0);
+        req.reduce_only = true;
+        let verdict = risk.evaluate(&req, &ctx_with(10_000.0, 800.0, 8.0, 100.0));
+
+        assert!(
+            verdict.approved,
+            "shrinking a position is never the risk: {:?}",
+            verdict.detail
+        );
+    }
+
+    #[test]
+    fn without_enough_history_the_correlation_cap_does_not_speak() {
+        let (risk, _) = engine(two_symbols());
+        let short = moves(5);
+        observe_series(&risk, "SOL/USDT", 100.0, &short);
+        observe_series(&risk, "BTC/USDT", 100.0, &short);
+        hold(&risk, "BTC/USDT", 8.0, 100.0);
+        assert!(risk.correlation("SOL/USDT", "BTC/USDT").is_none());
+
+        let req = OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 9.0);
+        let verdict = risk.evaluate(&req, &ctx_with(10_000.0, 800.0, 0.0, 100.0));
+
+        assert!(verdict.approved);
+    }
+
+    #[test]
+    fn a_hot_market_is_sized_down_toward_the_volatility_target() {
+        let (risk, _) = engine(cfg());
+        let hot: Vec<f64> = (0..30)
+            .map(|i| if i % 2 == 0 { 0.05 } else { -0.05 })
+            .collect();
+        observe_series(&risk, "SOL/USDT", 100.0, &hot);
+
+        let scale = risk.volatility_scale("SOL/USDT");
+        assert!(scale < 1.0, "scale was {scale}");
+        assert!(scale >= 0.25, "scale was cut below the floor: {scale}");
+
+        let (qty, applied) = risk.scale_for_volatility(Side::Buy, 10.0, 0.0, "SOL/USDT");
+        assert!(qty < 10.0, "qty was {qty}");
+        assert_eq!(applied, scale);
+    }
+
+    #[test]
+    fn a_calm_market_keeps_full_size_and_exits_are_never_scaled() {
+        let (risk, _) = engine(cfg());
+        let calm: Vec<f64> = (0..30)
+            .map(|i| if i % 2 == 0 { 0.001 } else { -0.001 })
+            .collect();
+        observe_series(&risk, "SOL/USDT", 100.0, &calm);
+        assert_eq!(risk.volatility_scale("SOL/USDT"), 1.0);
+
+        let (hot, _) = engine(cfg());
+        let hot_moves: Vec<f64> = (0..30)
+            .map(|i| if i % 2 == 0 { 0.05 } else { -0.05 })
+            .collect();
+        observe_series(&hot, "SOL/USDT", 100.0, &hot_moves);
+        let (qty, applied) = hot.scale_for_volatility(Side::Sell, 4.0, 10.0, "SOL/USDT");
+        assert_eq!(qty, 4.0);
+        assert_eq!(applied, 1.0);
     }
 }

@@ -154,6 +154,10 @@ export function drawdownPct(state: DemoState): number {
  *
  * A refusal is reported with the first check that failed, so the order of the
  * checks is part of the contract.
+ *
+ * The contract's `portfolio_checks` do not run here. The correlation cap needs
+ * a return series per symbol, and the simulator holds only the latest quote;
+ * the engine keeps that history and enforces it for the real book.
  */
 export function checkOrder(
   state: DemoState,

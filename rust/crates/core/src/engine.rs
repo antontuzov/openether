@@ -1596,6 +1596,10 @@ impl AppState {
     }
 
     pub fn record_tick(&self, tick: MarketTick) {
+        // The risk layer keeps the return history itself: volatility sizing
+        // and the correlation cap are risk inputs, not dashboard data.
+        self.risk
+            .observe_price(&tick.symbol, tick.price, tick.ts_ms);
         let mut data = self.lock_data();
         data.last_prices.insert(tick.symbol.clone(), tick.price);
         if data.ticks.len() >= MAX_TICKS {
@@ -1778,6 +1782,9 @@ impl AppState {
             .cloned()
             .unwrap_or_else(|| "SOL/USDT".to_string());
         let price = self.resolve_price(&symbol).await.unwrap_or(0.0);
+        if price > 0.0 {
+            self.risk.observe_price(&symbol, price, now_ms());
+        }
         let ctx = serde_json::json!({
             "ts_ms": now_ms(),
             "symbol": symbol,
@@ -1936,18 +1943,59 @@ impl AppState {
     }
 
     async fn apply_signal(&self, signal: StrategySignal) {
+        let current_qty = self
+            .portfolio()
+            .positions
+            .iter()
+            .find(|position| position.symbol == signal.symbol)
+            .map(|position| position.qty)
+            .unwrap_or(0.0);
+        let (qty, scale) =
+            self.risk
+                .scale_for_volatility(signal.side, signal.qty, current_qty, &signal.symbol);
+        if qty <= 0.0 {
+            self.log(
+                "strategy",
+                "warn",
+                &format!(
+                    "{} signal skipped: volatility targeting shrank it below the fill size",
+                    signal.symbol
+                ),
+                serde_json::json!({"symbol": signal.symbol, "scale": scale}),
+            );
+            return;
+        }
+        let rationale = if scale < 1.0 {
+            self.log(
+                "strategy",
+                "info",
+                &format!(
+                    "sized {} {} to {:.0}% for volatility",
+                    signal.symbol,
+                    signal.side.as_str(),
+                    scale * 100.0
+                ),
+                serde_json::json!({"symbol": signal.symbol, "requested_qty": signal.qty, "qty": qty, "scale": scale}),
+            );
+            format!(
+                "wasm strategy: {} (volatility scale {scale:.2})",
+                signal.reason
+            )
+        } else {
+            format!("wasm strategy: {}", signal.reason)
+        };
         let req = OrderRequest {
             venue: self.connector.venue(),
             symbol: signal.symbol.clone(),
             side: signal.side,
-            qty: signal.qty,
+            qty,
             order_type: OrderType::Market,
             limit_price: None,
             trigger_price: None,
             oco_group: None,
             reduce_only: false,
             client_id: format!("oe-strategy-{}", uuid::Uuid::new_v4().simple()),
-            rationale: format!("wasm strategy: {}", signal.reason),
+            rationale,
             reduce_only_guard: false,
         };
         let outcome = self.submit_order(req, "strategy").await;

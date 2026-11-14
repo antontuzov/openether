@@ -24,6 +24,11 @@ export interface RuleLimits {
   min_order_notional_usd: number;
   breaker_cooldown_ms: number;
   hard_halt_on_oversized_order: boolean;
+  max_correlated_exposure_pct: number;
+  correlation_threshold: number;
+  volatility_target_pct: number;
+  volatility_window: number;
+  min_size_scale: number;
 }
 
 export interface RuleAllowlists {
@@ -38,6 +43,15 @@ export interface RiskContract {
   allowlists: RuleAllowlists;
   /** The risk-layer checks, in the order they run. */
   check_order: string[];
+  /**
+   * Checks that judge the whole book rather than one order.
+   *
+   * They live outside `check_order` because they need history the browser
+   * simulator does not keep: the correlation cap compares the return series of
+   * every position. The engine runs them; the simulator is documented as
+   * running only the per-order checks.
+   */
+  portfolio_checks: string[];
   /** The checks a venue applies on top of the risk layer. */
   venue_checks: string[];
   /** Every reason code an order can be refused with. */
@@ -68,6 +82,10 @@ export const REASONS: ReadonlySet<string> = new Set(RISK_CONTRACT.reasons);
  * feed prices. Narrowing it to the engine's three live pairs would take the
  * top-50 market list away from the visitor for no safety gain: no exchange
  * account and no keys are involved.
+ *
+ * Portfolio checks stay in the contract, but the simulator does not run them:
+ * the correlation cap compares each position's return series over time, which
+ * the browser does not keep. The engine remains the authority for the book.
  */
 export function toBrowserContract(engine: RiskContract): RiskContract {
   return {
@@ -96,12 +114,18 @@ export function isRiskContract(value: unknown): value is RiskContract {
     'max_open_positions',
     'max_order_notional_usd',
     'min_order_notional_usd',
+    'max_correlated_exposure_pct',
+    'correlation_threshold',
+    'volatility_target_pct',
+    'volatility_window',
+    'min_size_scale',
   ] as const;
   for (const key of numeric) {
     if (typeof limits[key] !== 'number' || !Number.isFinite(limits[key] as number)) return false;
   }
   if (limits.max_open_positions !== undefined && limits.max_open_positions < 0) return false;
   if (!Array.isArray(candidate.check_order)) return false;
+  if (!Array.isArray(candidate.portfolio_checks)) return false;
   if (!Array.isArray(candidate.reasons)) return false;
   const allowlists = candidate.allowlists as Partial<RuleAllowlists> | undefined;
   if (!allowlists) return false;
