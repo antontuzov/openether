@@ -1,7 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/core", "crates/mcp-server"]
-exclude = ["crates/strategies/momentum"]
+exclude = [
+    "crates/strategies/momentum",
+    "crates/strategies/mean-reversion",
+    "crates/strategies/breakout",
+]
 
 [workspace.package]
 version = "0.1.0"

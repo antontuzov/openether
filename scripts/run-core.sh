@@ -30,6 +30,21 @@ if [ -n "${OPENETHER_STRATEGY_WASM:-}" ]; then
   esac
 fi
 
+# The core runs from rust/, so a repo-relative strategy dir in .env has to be
+# made absolute before it is handed to the engine.
+if [ -n "${OPENETHER_STRATEGY_DIR:-}" ]; then
+  case "$OPENETHER_STRATEGY_DIR" in
+    /*) ;;
+    *)
+      # A bare "target/wasm" already means rust/target/wasm from the core's
+      # working directory, so only ".env style" repo-relative paths need help.
+      case "$OPENETHER_STRATEGY_DIR" in
+        ./rust/*) export OPENETHER_STRATEGY_DIR="$root/${OPENETHER_STRATEGY_DIR#./}" ;;
+      esac
+      ;;
+  esac
+fi
+
 # The state database has the same problem: the core runs from rust/, so a
 # repo-relative path would land in rust/data instead of at the repo root.
 if [ -n "${OPENETHER_STATE_DB:-}" ]; then

@@ -126,7 +126,7 @@ sequenceDiagram
 rust/
   crates/core/            engine, bus, risk, wallet, swaps, connectors, HTTP/WS API
   crates/mcp-server/      MCP stdio server exposing core functions as tools
-  crates/strategies/      momentum strategy, compiled to wasm32
+  crates/strategies/      momentum, mean-reversion and breakout, compiled to wasm32
 ts/
   packages/agent/         orchestrator, LLM providers, guard, memory, metrics
   packages/mcp-data/      market + on-chain MCP server (9 tools)
@@ -182,21 +182,38 @@ Or both at once:
 no API key and still exercises the whole tool path and the risk layer. Set
 `LLM_PROVIDER=openai` or `anthropic` with the matching key for a real model.
 
-### 4. The WASM strategy
+### 4. The WASM strategies
 
 ```bash
 ./scripts/build-strategy.sh
 ```
 
-That writes `rust/target/wasm/momentum.wasm`, which is the path `.env.example`
-already points `OPENETHER_STRATEGY_WASM` at. Strategies are sandboxed with fuel
-and memory limits and can be hot-swapped at runtime via
-`POST /api/strategy/reload` — no core rebuild.
+That builds three sandboxed strategies into `rust/target/wasm/`:
+`momentum.wasm`, `mean-reversion.wasm` and `breakout.wasm`. `.env.example`
+points `OPENETHER_STRATEGY_WASM` at the first. Strategies run with fuel and
+memory limits; none of them can touch the network, the clock or the filesystem.
+
+`GET /api/strategies` returns the registry — what each strategy does, where its
+artifact should be, whether it is built and which one is loaded. Swap one in by
+name, no core rebuild and no absolute path:
+
+```bash
+curl -s -X POST localhost:8080/api/strategy/select \
+  -H 'content-type: application/json' \
+  -d '{"name":"mean-reversion","params":{"entry_pct":2.0}}'
+```
+
+The path comes from the registry, not the request, so a selection cannot point
+the sandbox at an arbitrary file. The params are layered over that strategy's
+defaults; the risk-derived keys (`max_position_pct`, `min_notional_usd`) are
+added fresh on every tick and cannot be overridden. `POST
+/api/strategy/reload` still exists for an arbitrary path when you are developing
+a strategy of your own.
 
 ### Tests
 
 ```bash
-cargo test --workspace --manifest-path rust/Cargo.toml   # 247 tests
+cargo test --workspace --manifest-path rust/Cargo.toml   # 252 tests
 pnpm --dir ts -r test                                    # 127 tests
 pnpm --dir ts -r typecheck
 pnpm --dir ts -r build
@@ -867,6 +884,8 @@ Copy `.env.example` to `.env`. The important defaults:
 | `OPENETHER_EVM_TOKEN_WATCHLIST` | *(empty)* | ERC-20 contracts to value, comma-separated |
 | `OPENETHER_PRICE_FEED_URL` | `https://api.dexscreener.com` | DEX feed used to price wallet holdings |
 | `OPENETHER_SYMBOL_ALLOWLIST` | `SOL/USDT,BTC/USDT,ETH/USDT` | tradable symbols |
+| `OPENETHER_STRATEGY_DIR` | `target/wasm` | where the strategy registry looks for built artifacts |
+| `OPENETHER_WASM_FUEL` / `OPENETHER_WASM_MEMORY_PAGES` | `200000000` / `32` | sandbox budget per tick |
 | `OPENETHER_CONTRACT_ALLOWLIST` | *(empty)* | permitted on-chain contracts |
 | `LLM_PROVIDER` | `local` | `local` / `openai` / `anthropic` / `openai-compatible` |
 | `VITE_ADMIN_PASSWORD_HASH` | *(empty)* | build-time admin gate digest |
@@ -878,12 +897,14 @@ Exchange credentials are only read when live trading is armed. `.env`,
 
 `GET /healthz`, `/metrics`, `/api/config`, `/api/portfolio`, `/api/positions`,
 `/api/orders`, `/api/trades`, `/api/logs`, `/api/ticks`, `/api/risk`,
-`/api/risk/decisions`, `/api/risk/rules`, `/api/strategy`, `/api/venues`,
+`/api/risk/decisions`, `/api/risk/rules`, `/api/strategy`, `/api/strategies`,
+`/api/venues`,
 `/api/wallet`, `/api/wallet/holdings`, `/api/wallet/broadcasts`, `/api/live`,
 `/api/swap`;
 `POST /api/orders`, `/api/logs`, `/api/onchain`, `/api/strategy/reload`,
-`/api/breaker/reset`, `/api/wallet/sign-dry-run`, `/api/wallet/broadcast`,
-`/api/swap/quote`, `/api/swap/execute`, `/api/swap/approve`, `/api/backtest`;
+`/api/strategy/select`, `/api/breaker/reset`, `/api/wallet/sign-dry-run`,
+`/api/wallet/broadcast`, `/api/swap/quote`, `/api/swap/execute`,
+`/api/swap/approve`, `/api/backtest`;
 `DELETE /api/orders/{order_id}` to cancel a resting order;
 `GET /ws` for the live stream. Full shapes in [docs/api-contract.md](docs/api-contract.md).
 
@@ -893,7 +914,7 @@ Exchange credentials are only read when live trading is armed. `.env`,
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **247 passing**, including the encrypted keystore,
+- `cargo test --workspace` — **252 passing**, including the encrypted keystore,
   EVM and Solana dry-run signing, live signing recovered against the wallet
   address, signature tampering, wrong-passphrase rejection, and the API
   refusing to sign when dry run is off. The broadcaster suite covers EIP-1559
@@ -909,6 +930,14 @@ Checked locally on macOS (arm64):
   trip books its realised PnL; a signal for another symbol never reaches the
   risk layer; the strategy sees only closed bars; malformed bars are refused
   before the strategy runs; and a strategy error names the bar it failed on.
+- The strategy registry exercised against built artifacts: all three strategies
+  build, `GET /api/strategies` reports each one's path and availability, and
+  `POST /api/strategy/select` hot-swaps momentum for breakout and then
+  mean-reversion without a restart. Both new strategies then trade in a
+  backtest through the real risk layer (breakout: 3 fills, +1.32%; mean
+  reversion: 6 fills, 3 winners, +0.84%). An unknown name is `404
+  strategy_unknown`, non-object params are `400 strategy_params_invalid`, and an
+  empty artifact directory is `409 strategy_artifact_missing`.
 - The live-trading arming ceremony exercised end to end against the real
   binaries: the env var alone arms nothing; arming without the confirmation
   phrase is refused; arming writes a record that flips `GET /api/live` to

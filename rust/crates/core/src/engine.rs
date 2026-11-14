@@ -10,7 +10,7 @@ use crate::metrics::Metrics;
 use crate::onchain::OnchainClient;
 use crate::risk::{RiskContext, RiskEngine, RiskState, RiskVerdict};
 use crate::store::{PortfolioRow, PositionRow, Store};
-use crate::strategy::{StrategyHost, StrategySignal};
+use crate::strategy::{StrategyHost, StrategyInfo, StrategySignal};
 use crate::swap::{encode_approve, HttpQuoter, SwapError, SwapQuote, SwapRequest, SwapService};
 use crate::types::*;
 use crate::wallet::{AccountSelector, WalletError, WalletService};
@@ -98,6 +98,21 @@ pub struct SwapPlan {
     pub approval_required: bool,
 }
 
+/// Why a registry selection was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum StrategySelectError {
+    #[error("unknown strategy: {0}")]
+    Unknown(String),
+    #[error("no strategy is loaded, so there is no sandbox to swap")]
+    NoHost,
+    #[error("the strategy artifact is missing: {0} (run ./scripts/build-strategy.sh)")]
+    MissingArtifact(String),
+    #[error("strategy parameters must be a JSON object")]
+    InvalidParams,
+    #[error("could not load the strategy: {0}")]
+    Load(String),
+}
+
 /// A swap that was signed and sent.
 #[derive(Debug, Clone, Serialize)]
 pub struct SwapReceipt {
@@ -182,6 +197,10 @@ pub struct AppState {
     pub bus: Arc<EventBus>,
     pub risk: Arc<RiskEngine>,
     pub strategy: Arc<std::sync::Mutex<Option<Arc<StrategyHost>>>>,
+    /// The loaded strategy's own knobs. The risk-derived keys are filled in
+    /// from the risk limits on every tick, so selecting a strategy cannot
+    /// widen a limit.
+    pub strategy_params: std::sync::Mutex<serde_json::Value>,
     pub connector: Arc<dyn ExchangeConnector>,
     pub onchain: Arc<OnchainClient>,
     /// The encrypted keystore and its unlock lease. Public metadata only until
@@ -294,6 +313,16 @@ impl AppState {
         }
 
         let equity = config.paper_start_equity;
+        let strategy_params = {
+            let guard = strategy.lock().unwrap_or_else(|e| e.into_inner());
+            match guard
+                .as_ref()
+                .and_then(|host| crate::strategies::find(&host.info().name))
+            {
+                Some(def) => crate::strategies::defaults(def.name),
+                None => serde_json::json!({}),
+            }
+        };
         let store = match config.state_db_path.as_deref() {
             Some(path) => match Store::open(path) {
                 Ok(store) => Some(Arc::new(store)),
@@ -315,6 +344,7 @@ impl AppState {
             bus,
             risk,
             strategy,
+            strategy_params: std::sync::Mutex::new(strategy_params),
             connector,
             onchain,
             wallet,
@@ -1781,13 +1811,98 @@ impl AppState {
         }
     }
 
-    fn strategy_params(&self) -> serde_json::Value {
+    pub fn strategy_params(&self) -> serde_json::Value {
+        let mut params = self
+            .strategy_params
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if !params.is_object() {
+            params = serde_json::json!({});
+        }
+        params["max_position_pct"] = serde_json::json!(self.config.risk.max_position_pct_of_equity);
+        params["min_notional_usd"] = serde_json::json!(self.config.risk.min_order_notional_usd);
+        params
+    }
+
+    /// The registry, resolved against the configured artifact directory.
+    pub fn strategy_list(&self) -> serde_json::Value {
+        let loaded = {
+            let guard = self.strategy.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().map(|host| host.info().name)
+        };
+        let strategies = crate::strategies::STRATEGIES
+            .iter()
+            .map(|def| {
+                let path = crate::strategies::path_for(&self.config.strategy_dir, def);
+                serde_json::json!({
+                    "name": def.name,
+                    "description": def.description,
+                    "wasm": def.wasm,
+                    "path": path.display().to_string(),
+                    "available": path.is_file(),
+                    "loaded": loaded.as_deref() == Some(def.name),
+                    "default_params": crate::strategies::defaults(def.name),
+                })
+            })
+            .collect::<Vec<_>>();
         serde_json::json!({
-            "max_position_pct": self.config.risk.max_position_pct_of_equity,
-            "min_notional_usd": self.config.risk.min_order_notional_usd,
-            "stop_loss_pct": 2.0,
-            "take_profit_pct": 4.0,
+            "strategy_dir": self.config.strategy_dir.display().to_string(),
+            "loaded": loaded,
+            "strategies": strategies,
         })
+    }
+
+    /// Load a built-in strategy by name.
+    ///
+    /// The path comes from the registry, never from the caller, so a selection
+    /// cannot point the sandbox at an arbitrary file. Parameters are validated
+    /// as a JSON object and layered over that strategy's defaults; the
+    /// risk-derived keys are added fresh on every tick.
+    pub fn select_strategy(
+        &self,
+        name: &str,
+        overrides: Option<&serde_json::Value>,
+    ) -> Result<StrategyInfo, StrategySelectError> {
+        let def = crate::strategies::find(name)
+            .ok_or_else(|| StrategySelectError::Unknown(name.trim().to_string()))?;
+        if let Some(overrides) = overrides {
+            if !overrides.is_object() {
+                return Err(StrategySelectError::InvalidParams);
+            }
+        }
+        let path = crate::strategies::path_for(&self.config.strategy_dir, def);
+        if !path.is_file() {
+            return Err(StrategySelectError::MissingArtifact(
+                path.display().to_string(),
+            ));
+        }
+
+        let host = {
+            let guard = self.strategy.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .as_ref()
+                .map(Arc::clone)
+                .ok_or(StrategySelectError::NoHost)?
+        };
+        let info = host
+            .reload(path.display().to_string())
+            .map_err(|e| StrategySelectError::Load(e.to_string()))?;
+        let merged = crate::strategies::merge(
+            crate::strategies::defaults(def.name),
+            overrides.unwrap_or(&serde_json::Value::Null),
+        );
+        *self
+            .strategy_params
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = merged;
+        self.log(
+            "strategy",
+            "info",
+            &format!("selected strategy {}", def.name),
+            serde_json::json!({"name": def.name, "path": path.display().to_string()}),
+        );
+        Ok(info)
     }
 
     /// Replays bars through the loaded strategy and the real risk layer.

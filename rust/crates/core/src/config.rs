@@ -23,6 +23,9 @@ pub struct Config {
     pub risk: RiskConfig,
     /// Starting equity of the paper venue, used as the PnL baseline.
     pub paper_start_equity: f64,
+    /// Where the registry looks for built strategy artifacts. The core runs
+    /// from `rust/`, so the default points at the workspace's target dir.
+    pub strategy_dir: PathBuf,
     pub strategy_wasm: Option<PathBuf>,
     pub wasm_fuel: u64,
     pub wasm_memory_pages: u32,
@@ -148,6 +151,11 @@ impl Config {
             onchain_live,
             risk,
             paper_start_equity: env_f64("OPENETHER_PAPER_CASH", 10_000.0),
+            strategy_dir: std::env::var("OPENETHER_STRATEGY_DIR")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("target/wasm")),
             strategy_wasm: std::env::var("OPENETHER_STRATEGY_WASM")
                 .ok()
                 .map(PathBuf::from),

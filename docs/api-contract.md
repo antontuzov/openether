@@ -19,8 +19,10 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 | GET | `/api/ticks?limit=200` | `MarketTick[]`, newest first |
 | POST | `/api/logs` | Body `LogEntry` (source/level/message/context) — the AI agent pushes its reasoning here |
 | GET | `/api/risk` | `RiskState` (see below) |
-| GET | `/api/strategy` | `{ "name", "loaded_at_ms", "wasm_sha256", "ticks_processed", "fuel_used" }` |
+| GET | `/api/strategy` | `{ "name", "loaded_at_ms", "wasm_sha256", "ticks_processed", "fuel_used", "params" }` |
 | POST | `/api/strategy/reload` | Body `{ "path": "/abs/path/strategy.wasm" }` → reloads the sandboxed strategy |
+| GET | `/api/strategies` | The built-in strategy registry, resolved against `OPENETHER_STRATEGY_DIR` (see below) |
+| POST | `/api/strategy/select` | Body `{ "name", "params"? }` → loads a registered strategy by name (see below) |
 | POST | `/api/orders` | Body `OrderRequest` → runs the risk layer, then submits |
 | GET | `/api/orders` | `TrackedOrder[]`, newest first — order state and venue-confirmed fills |
 | DELETE | `/api/orders/{order_id}` | Cancel a resting order; the venue must confirm |
@@ -38,6 +40,71 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 | GET | `/api/live` | Live-trading arming state (see below) |
 | GET | `/api/risk/rules` | `RiskContract` — the limits, check order and reason codes the engine runs with (see below) |
 | POST | `/api/backtest` | Body `BacktestParams` plus `bars[]` → `BacktestReport`, replayed through the real risk layer (see below) |
+
+### Strategies
+
+Three strategies ship in `rust/crates/strategies/` and are built by
+`./scripts/build-strategy.sh`:
+
+| Name | Behaviour |
+| --- | --- |
+| `momentum` | Fast/slow SMA crossover; stop and take-profit exits. |
+| `mean-reversion` | Buys a set distance below its own average; exits on reversion, stop or target. |
+| `breakout` | Buys a close above the recent high by a buffer; exits on breakdown, stop or target. |
+
+`GET /api/strategies`:
+```json
+{
+  "strategy_dir": "target/wasm",
+  "loaded": "momentum",
+  "strategies": [
+    {
+      "name": "momentum",
+      "description": "Follows a fast/slow moving-average crossover and leaves on a stop or a target.",
+      "wasm": "momentum.wasm",
+      "path": "target/wasm/momentum.wasm",
+      "available": true,
+      "loaded": true,
+      "default_params": {"stop_loss_pct": 2.0, "take_profit_pct": 4.0}
+    }
+  ]
+}
+```
+
+`available` is whether the artifact exists on disk; `loaded` is which strategy
+the sandbox currently runs. `OPENETHER_STRATEGY_DIR` sets the directory
+(default `target/wasm`, relative to the core's working directory, which is
+`rust/`).
+
+`POST /api/strategy/select`:
+```json
+{"name": "mean-reversion", "params": {"entry_pct": 2.0}}
+```
+
+Response `200`:
+```json
+{
+  "ok": true,
+  "strategy": {"name": "mean-reversion", "path": "target/wasm/mean-reversion.wasm", "wasm_sha256": "…", "ticks_processed": 0, "fuel_used": 0, "last_error": null},
+  "params": {"window": 20, "entry_pct": 2.0, "exit_pct": 1.0, "stop_loss_pct": 2.0, "max_position_pct": 20.0, "min_notional_usd": 10.0}
+}
+```
+
+The artifact path comes from the registry, never from the request. `params`
+must be a JSON object and is layered over that strategy's defaults; the
+risk-derived keys `max_position_pct` and `min_notional_usd` are filled in from
+the risk limits on every tick and cannot be overridden. Selecting a strategy
+resets its price history, since the sandbox gets a fresh module instance.
+
+Errors:
+
+| Status | Code | When |
+| --- | --- | --- |
+| 404 | `strategy_unknown` | the name is not in the registry |
+| 409 | `strategy_not_loaded` | no sandbox is running to swap into |
+| 409 | `strategy_artifact_missing` | the registry path has no built artifact |
+| 400 | `strategy_params_invalid` | `params` is not a JSON object |
+| 400 | `strategy_load_failed` | the artifact exists but wasmtime refused it |
 
 ### `POST /api/orders`
 

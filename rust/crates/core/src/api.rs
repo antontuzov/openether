@@ -1,6 +1,6 @@
 use crate::backtest::{BacktestError, BacktestParams, Bar};
 use crate::broadcast::BroadcastError;
-use crate::engine::{AppState, SwapExecutionError, TransferError};
+use crate::engine::{AppState, StrategySelectError, SwapExecutionError, TransferError};
 use crate::holdings::WalletHoldings;
 use crate::swap::{SwapError, SwapRequest};
 use crate::types::*;
@@ -39,6 +39,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/onchain", post(onchain))
         .route("/api/strategy", get(strategy))
         .route("/api/strategy/reload", post(strategy_reload))
+        .route("/api/strategies", get(strategies))
+        .route("/api/strategy/select", post(strategy_select))
         .route("/api/orders", post(place_order))
         .route("/api/orders", get(orders))
         .route("/api/orders/{order_id}", delete(cancel_order))
@@ -256,20 +258,69 @@ async fn risk_decisions(
 }
 
 async fn strategy(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let guard = state.strategy.lock().unwrap_or_else(|e| e.into_inner());
-    let value = match guard.as_ref() {
-        Some(host) => serde_json::to_value(host.info()).unwrap_or_else(|_| serde_json::json!({})),
-        None => serde_json::json!({
-            "name": "none",
-            "path": "",
-            "loaded_at_ms": 0,
-            "wasm_sha256": "",
-            "ticks_processed": 0,
-            "fuel_used": 0,
-            "last_error": "no strategy loaded",
-        }),
+    let mut value = {
+        let guard = state.strategy.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(host) => serde_json::to_value(host.info()).unwrap_or_else(|_| json!({})),
+            None => json!({
+                "name": "none",
+                "path": "",
+                "loaded_at_ms": 0,
+                "wasm_sha256": "",
+                "ticks_processed": 0,
+                "fuel_used": 0,
+                "last_error": "no strategy loaded",
+            }),
+        }
     };
+    value["params"] = state.strategy_params();
     Json(value)
+}
+
+async fn strategies(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(state.strategy_list())
+}
+
+#[derive(Debug, Deserialize)]
+struct SelectRequest {
+    name: String,
+    #[serde(default)]
+    params: Option<serde_json::Value>,
+}
+
+async fn strategy_select(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SelectRequest>,
+) -> Response {
+    match state.select_strategy(&request.name, request.params.as_ref()) {
+        Ok(info) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "strategy": info,
+                "params": state.strategy_params(),
+            })),
+        )
+            .into_response(),
+        Err(error) => strategy_select_error(error),
+    }
+}
+
+fn strategy_select_error(error: StrategySelectError) -> Response {
+    let (status, code) = match &error {
+        StrategySelectError::Unknown(_) => (StatusCode::NOT_FOUND, "strategy_unknown"),
+        StrategySelectError::NoHost => (StatusCode::CONFLICT, "strategy_not_loaded"),
+        StrategySelectError::MissingArtifact(_) => {
+            (StatusCode::CONFLICT, "strategy_artifact_missing")
+        }
+        StrategySelectError::InvalidParams => (StatusCode::BAD_REQUEST, "strategy_params_invalid"),
+        StrategySelectError::Load(_) => (StatusCode::BAD_REQUEST, "strategy_load_failed"),
+    };
+    (
+        status,
+        Json(json!({ "ok": false, "error": error.to_string(), "code": code })),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,6 +387,16 @@ async fn strategy_reload(
     };
     match host.reload(&request.path) {
         Ok(info) => {
+            // A reload can swap in a different strategy, so the knobs go back
+            // to that strategy's defaults instead of lingering from the old one.
+            let params = match crate::strategies::find(&info.name) {
+                Some(def) => crate::strategies::defaults(def.name),
+                None => json!({}),
+            };
+            *state
+                .strategy_params
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = params;
             state.log(
                 "strategy",
                 "info",

@@ -111,7 +111,7 @@ impl StrategyHost {
             metrics,
             state: Mutex::new(None),
         };
-        let loaded = host.instantiate(module, sha256, name)?;
+        let loaded = host.instantiate(module, sha256, name, &host.path.clone())?;
         *host.state.lock().unwrap_or_else(|e| e.into_inner()) = Some(loaded);
         Ok(host)
     }
@@ -121,6 +121,7 @@ impl StrategyHost {
         module: Module,
         sha256: String,
         name: String,
+        path: &Path,
     ) -> Result<Loaded, StrategyError> {
         let mut store = Store::new(
             &self.engine,
@@ -168,7 +169,7 @@ impl StrategyHost {
 
         Ok(Loaded {
             module,
-            path: self.path.display().to_string(),
+            path: path.display().to_string(),
             store,
             instance,
             name,
@@ -283,7 +284,7 @@ impl StrategyHost {
     pub fn reload(&self, path: impl AsRef<Path>) -> Result<StrategyInfo, StrategyError> {
         let path = path.as_ref().to_path_buf();
         let (module, sha256, name) = load_module(&self.engine, &path)?;
-        let loaded = self.instantiate(module, sha256, name)?;
+        let loaded = self.instantiate(module, sha256, name, &path)?;
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             *state = Some(loaded);
@@ -297,25 +298,26 @@ impl StrategyHost {
     /// leaks into the backtest nor gets polluted by it. The fork counts its
     /// own metrics, so ticks inside a backtest never touch the live gauges.
     pub fn fork(&self) -> Result<StrategyHost, StrategyError> {
-        let (module, sha256, name) = {
+        let (module, sha256, name, source) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let loaded = state.as_ref().ok_or(StrategyError::NotLoaded)?;
             (
                 loaded.module.clone(),
                 loaded.sha256.clone(),
                 loaded.name.clone(),
+                PathBuf::from(&loaded.path),
             )
         };
         let host = StrategyHost {
             engine: self.engine.clone(),
-            path: self.path.clone(),
+            path: source.clone(),
             fuel_per_tick: self.fuel_per_tick,
             max_memory_bytes: self.max_memory_bytes,
             logs: Arc::new(Mutex::new(Vec::new())),
             metrics: Arc::new(Metrics::new()),
             state: Mutex::new(None),
         };
-        let loaded = host.instantiate(module, sha256, name)?;
+        let loaded = host.instantiate(module, sha256, name, &source)?;
         *host.state.lock().unwrap_or_else(|e| e.into_inner()) = Some(loaded);
         Ok(host)
     }

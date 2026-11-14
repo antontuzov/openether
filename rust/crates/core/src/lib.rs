@@ -18,5 +18,6 @@ pub mod wallet;
 
 pub mod api;
 pub mod backtest;
+pub mod strategies;
 
 pub use types::*;
