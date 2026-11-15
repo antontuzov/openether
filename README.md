@@ -1020,7 +1020,8 @@ Prometheus rules and is loaded by `deploy/prometheus.yml`.
 
 **Rust core** (`rust/crates/mcp-server`): `execute_trade`, `get_portfolio`,
 `get_positions`, `get_trade_history`, `get_journal`, `get_risk_state`,
-`get_market_data`, `get_agent_logs`, `fetch_onchain_data`, `set_strategy`.
+`get_market_data`, `get_orders`, `cancel_order`, `get_venues`, `get_agent_logs`,
+`fetch_onchain_data`, `set_strategy`.
 
 **Market + on-chain** (`ts/packages/mcp-data`): `list_top_coins`,
 `get_coin_price`, `get_coin_details`, `search_dex_pairs`, `get_dex_liquidity`,

@@ -113,6 +113,22 @@ export interface RiskState {
   ts_ms: number;
 }
 
+/**
+ * One venue the engine may route an order to.
+ *
+ * `tradable` is whether the build can place orders there at all; `live` is
+ * whether it may do so with real money right now. The cap is the effective
+ * per-order limit for this venue, already tightened by its arming record.
+ */
+export interface VenueHealth {
+  venue: string;
+  healthy: boolean;
+  tradable: boolean;
+  live: boolean;
+  active: boolean;
+  max_order_notional_usd: number;
+}
+
 export interface MarketTick {
   venue: string;
   symbol: string;

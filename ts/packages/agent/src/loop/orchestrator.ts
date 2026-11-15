@@ -8,6 +8,7 @@ import type {
   ToolCall,
   ToolSpec,
   TrackedOrder,
+  VenueHealth,
 } from '../types.js';
 import { PLANNING_INSTRUCTIONS, PERSONA } from '../persona.js';
 import { AgentLogger } from '../logger.js';
@@ -38,6 +39,7 @@ export interface OrchestratorOptions {
 export interface CycleSnapshot {
   portfolio: PortfolioSnapshot | null;
   risk: RiskState | null;
+  venues: VenueHealth[];
   ticks: MarketTick[];
   orders: TrackedOrder[];
   journal: JournalPage | null;
@@ -70,11 +72,12 @@ export class Orchestrator {
 
     const portfolio = await this.readPortfolio();
     const risk = await this.readRisk();
+    const venues = await this.readVenues();
     const ticks = await this.readTicks();
     const orders = await this.readOrders();
     const journal = await this.readJournal();
 
-    this.options.onContext?.({ portfolio, risk, ticks, orders, journal });
+    this.options.onContext?.({ portfolio, risk, venues, ticks, orders, journal });
 
     if (risk) {
       metrics.breakerState.set(
@@ -92,6 +95,11 @@ export class Orchestrator {
       symbol: this.options.symbol,
       portfolio,
       risk,
+      // Which venues can actually receive an order right now, and how much the
+      // risk layer will allow each one. Without this a plan can name a venue
+      // that is unarmed or read-only and be refused for a reason it could have
+      // seen coming.
+      venues,
       recent_ticks: ticks.slice(-30),
       // Resting orders are exposure that has not been booked yet. Without them
       // the model would re-submit a trade it already has working.
@@ -104,6 +112,7 @@ export class Orchestrator {
             summary: journal.summary,
             recent_fills: journal.fills.slice(0, 5).map((fill) => ({
               ts_ms: fill.ts_ms,
+              venue: fill.venue,
               side: fill.side,
               qty: fill.qty,
               price: fill.price,
@@ -280,7 +289,7 @@ export class Orchestrator {
   }
 
   private executorFor(name: string): ToolExecutor | null {
-    const coreNames = new Set(['execute_trade', 'get_portfolio', 'get_orders', 'cancel_order', 'get_positions', 'get_market_data', 'get_risk_state', 'get_trade_history', 'fetch_onchain_data', 'set_strategy', 'get_agent_logs']);
+    const coreNames = new Set(['execute_trade', 'get_portfolio', 'get_orders', 'get_venues', 'cancel_order', 'get_positions', 'get_market_data', 'get_risk_state', 'get_trade_history', 'fetch_onchain_data', 'set_strategy', 'get_agent_logs']);
     if (coreNames.has(name)) {
       return this.options.coreTools;
     }
@@ -337,6 +346,12 @@ export class Orchestrator {
     const raw = await this.safeCall('get_risk_state');
     const parsed = safeParse(raw);
     return isObject(parsed) ? (parsed as unknown as RiskState) : null;
+  }
+
+  private async readVenues(): Promise<VenueHealth[]> {
+    const raw = await this.safeCall('get_venues');
+    const parsed = safeParse(raw);
+    return Array.isArray(parsed) ? (parsed as VenueHealth[]) : [];
   }
 
   private async readTicks(): Promise<MarketTick[]> {
@@ -430,6 +445,7 @@ function summarizeOrder(order: TrackedOrder) {
   const filled = order.fills.reduce((total, fill) => total + fill.qty, 0);
   return {
     order_id: order.order_id,
+    venue: order.venue,
     symbol: order.symbol,
     side: order.side,
     order_type: order.order_type,

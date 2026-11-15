@@ -36,7 +36,7 @@ pub fn definitions() -> Vec<Value> {
                     "symbol": {"type": "string", "description": "Trading pair, e.g. SOL/USDT"},
                     "side": {"type": "string", "enum": ["buy", "sell"]},
                     "qty": {"type": "number", "description": "Order size in units of the base asset"},
-                    "venue": {"type": "string", "description": "Optional venue override; defaults to the engine venue"},
+                    "venue": {"type": "string", "description": "Optional venue override. Omit it to let the router choose among the armed venues by fee-adjusted price; naming a venue pins the order to it. A close stays on the venue that holds the position."},
                     "order_type": {"type": "string", "enum": ["market", "limit", "stop", "take_profit"], "description": "market (default) fills now; limit rests at limit_price; stop and take_profit wait for trigger_price"},
                     "limit_price": {"type": "number", "description": "Required for a limit order"},
                     "trigger_price": {"type": "number", "description": "Required for stop and take_profit: the price that fires the exit"},
@@ -55,6 +55,11 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "name": "get_orders",
             "description": "Orders the engine is tracking, newest first, with venue-confirmed fills. An accepted or partially_filled order is still resting and is not yet a position; only the fills in this list are real. Check here to verify an execution instead of assuming it filled.",
+            "inputSchema": {"type": "object", "properties": {}}
+        }),
+        json!({
+            "name": "get_venues",
+            "description": "The venues the engine may route to, each with whether it answers, whether it can place orders in this build, whether it is armed for real money right now, and the per-order cap the risk layer applies to it. An order goes to the venue named in its response, not necessarily the one asked for; a position stays on the venue that holds it until it is closed.",
             "inputSchema": {"type": "object", "properties": {}}
         }),
         json!({
@@ -152,6 +157,7 @@ pub async fn call(ctx: &Context, name: &str, args: Value) -> Result<String, Stri
         "execute_trade" => execute_trade(ctx, args).await,
         "get_portfolio" => get(ctx, "/api/portfolio").await,
         "get_orders" => get(ctx, "/api/orders").await,
+        "get_venues" => get(ctx, "/api/venues").await,
         "cancel_order" => cancel_order(ctx, args).await,
         "get_positions" => get(ctx, "/api/positions").await,
         "get_market_data" => market_data(ctx, args).await,

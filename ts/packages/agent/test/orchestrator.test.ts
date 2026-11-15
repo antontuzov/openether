@@ -19,6 +19,26 @@ import type { LlmProvider, LlmRequest, LlmResponse, ToolCall, TrackedOrder } fro
 
 let directory: string;
 
+/** Two venues as `/api/venues` reports them: one armed, one still gated. */
+const venues = [
+  {
+    venue: 'binance',
+    healthy: true,
+    tradable: true,
+    live: true,
+    active: true,
+    max_order_notional_usd: 500,
+  },
+  {
+    venue: 'kraken',
+    healthy: true,
+    tradable: true,
+    live: false,
+    active: false,
+    max_order_notional_usd: 500,
+  },
+];
+
 beforeEach(async () => {
   directory = await mkdtemp(join(tmpdir(), 'openether-agent-'));
 });
@@ -62,8 +82,13 @@ function fill(qty: number, price: number) {
 
 class ScriptedCore implements ToolExecutor {
   readonly calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  private readonly answers: Record<string, unknown>;
 
-  constructor(private readonly answers: Record<string, unknown>) {}
+  constructor(answers: Record<string, unknown>) {
+    // Every scenario runs against a core that can answer for its venues, the
+    // way the real one does; a test that cares overrides this.
+    this.answers = { get_venues: venues, ...answers };
+  }
 
   async listTools() {
     return Object.keys(this.answers).map((name) => ({
@@ -247,11 +272,14 @@ describe('the verify step', () => {
 
     const prompt = model.requests[0]?.messages[1]?.content ?? '';
     const context = JSON.parse(prompt.slice(prompt.indexOf('{'))) as {
-      working_orders: Array<{ order_id: string; filled_qty: number }>;
+      venues: typeof venues;
+      working_orders: Array<{ order_id: string; venue: string; filled_qty: number }>;
     };
+    expect(context.venues).toEqual(venues);
     expect(context.working_orders).toEqual([
       {
         order_id: 'o-1',
+        venue: 'binance',
         symbol: 'SOL/USDT',
         side: 'buy',
         order_type: 'limit',

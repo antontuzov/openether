@@ -29,7 +29,7 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 | GET | `/api/orders` | `TrackedOrder[]`, newest first — order state and venue-confirmed fills |
 | DELETE | `/api/orders/{order_id}` | Cancel a resting order; the venue must confirm |
 | POST | `/api/breaker/reset` | Body `{ "confirm": true }` → manual breaker reset |
-| GET | `/api/venues` | `[{ "venue": "binance", "healthy": true, "live": true, "active": true, "max_order_notional_usd": 500.0 }]` |
+| GET | `/api/venues` | `[{ "venue": "binance", "healthy": true, "tradable": true, "live": true, "active": true, "max_order_notional_usd": 500.0 }]` |
 | GET | `/api/wallet` | `WalletMetadata` — public wallet metadata, never a secret |
 | GET | `/api/wallet/holdings` | `WalletHoldings` — on-chain balances, valued and never counted as trading equity |
 | POST | `/api/wallet/sign-dry-run` | Body `{ "passphrase", "envelope", "account"? }` → `DryRunSignature` |
@@ -261,6 +261,11 @@ reasons:
 
 Orders and fills are matched on `(order_id, venue)`, so two exchanges numbering
 their orders independently can never be confused for each other.
+
+`/api/venues` separates the two questions a client can ask of a venue:
+`tradable` is whether it can place an order at all in this build (false for
+Hyperliquid), `live` is whether it is armed for real money right now. An armed
+Hyperliquid is neither.
 
 ### `GET /api/orders` and `DELETE /api/orders/{order_id}`
 
@@ -1057,6 +1062,7 @@ Tools:
 | `execute_trade` | `{venue, symbol, side, qty, order_type?, limit_price?, trigger_price?, reduce_only?, oco_group?, rationale?}` | risk verdict + venue acknowledgement (not proof of a fill) |
 | `get_portfolio` | `{}` | portfolio snapshot with positions and PnL |
 | `get_orders` | `{}` | tracked orders with venue-confirmed fills; the Verify step reads this |
+| `get_venues` | `{}` | every configured venue: `healthy`, `tradable`, `live`, `active`, `max_order_notional_usd` |
 | `cancel_order` | `{order_id}` | cancel a resting order; a refusal leaves it live |
 | `get_positions` | `{}` | open positions |
 | `get_market_data` | `{symbol, venue?, lookback?}` | recent ticks + last price |
