@@ -22,8 +22,8 @@
 
 use openether_core::config::Config;
 use openether_core::live_arm::{
-    arm, arm_onchain, arming_path, disarm, evaluate, evaluate_onchain, live_requested, LiveArming,
-    CONFIRMATION_PHRASE, ONCHAIN_TARGET,
+    arm, arm_onchain, arming_dir, arming_path, arming_path_for, disarm, evaluate, evaluate_onchain,
+    live_requested, LiveArming, ARMING_DIR_ENV, ARMING_ENV, CONFIRMATION_PHRASE, ONCHAIN_TARGET,
 };
 use openether_core::types::Venue;
 use std::process::ExitCode;
@@ -32,12 +32,14 @@ const USAGE: &str = "\
 openether-live — arm live trading
 
 usage:
-  openether-live arm    --venue <binance|kraken> [--max-notional <usd>] [--hours <n>] [--note <text>]
+  openether-live arm    --venue <binance|kraken|hyperliquid> [--max-notional <usd>] [--hours <n>] [--note <text>]
   openether-live arm    --target onchain [--max-notional <usd>] [--hours <n>] [--note <text>]
   openether-live status
-  openether-live disarm
+  openether-live disarm [--venue <name> | --target onchain]
 
-The arming record lives at the path in OPENETHER_LIVE_ARMING_FILE.
+Each venue is armed by its own record. With OPENETHER_LIVE_ARMING_DIR set, the
+record for a venue is <dir>/<venue>.json; with only OPENETHER_LIVE_ARMING_FILE
+set, one file names one target.
 Live trading also needs OPENETHER_LIVE_TRADING=1 in the core's environment.
 ";
 
@@ -66,7 +68,7 @@ fn run(args: &[String]) -> Result<(), String> {
     match command.as_str() {
         "arm" => arm_live(&options),
         "status" => status(),
-        "disarm" => disarm_live(),
+        "disarm" => disarm_live(&options),
         other => {
             print!("{USAGE}");
             Err(format!("unknown command: {other}"))
@@ -76,10 +78,6 @@ fn run(args: &[String]) -> Result<(), String> {
 
 /// Writes the arming record.
 fn arm_live(options: &Options) -> Result<(), String> {
-    let path = arming_path().ok_or_else(|| {
-        "OPENETHER_LIVE_ARMING_FILE is not set: the core needs to know where the arming record lives"
-            .to_string()
-    })?;
     let config = Config::from_env();
 
     // `--venue onchain` and `--target onchain` mean the same thing: nothing is
@@ -104,6 +102,15 @@ fn arm_live(options: &Options) -> Result<(), String> {
         }
         Some(venue)
     };
+    let target = match venue {
+        Some(venue) => venue.as_str(),
+        None => ONCHAIN_TARGET,
+    };
+    let path = arming_path_for(target).ok_or_else(|| {
+        format!(
+            "neither {ARMING_DIR_ENV} nor {ARMING_ENV} is set: the core needs to know where the arming record lives"
+        )
+    })?;
 
     let max_notional = match options.get("max-notional") {
         Some(value) => value
@@ -216,25 +223,29 @@ fn arm_live(options: &Options) -> Result<(), String> {
 /// Prints the arming state the core would see.
 fn status() -> Result<(), String> {
     let config = Config::from_env();
-    let state = evaluate(config.venue, &config.risk);
-    let wallet = evaluate_onchain(&config.risk);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?
-    );
-    println!();
-    println!("venue:      {}", config.venue);
     println!(
         "requested:  {}",
         if live_requested() { "yes" } else { "no" }
     );
-    match arming_path() {
-        Some(path) => println!("record:     {}", path.display()),
-        None => println!("record:     (OPENETHER_LIVE_ARMING_FILE is not set)"),
+    match (arming_dir(), arming_path()) {
+        (Some(dir), _) => println!("records:    {}/<target>.json", dir.display()),
+        (None, Some(path)) => println!("record:     {}", path.display()),
+        (None, None) => println!("records:    (neither {ARMING_DIR_ENV} nor {ARMING_ENV} is set)"),
     }
-    if let Some(record) = &state.record {
-        print_record(record);
+    for venue in &config.venues {
+        let state = evaluate(*venue, &config.risk);
+        println!();
+        println!("{venue}:");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?
+        );
+        if let Some(record) = &state.record {
+            print_record(record);
+        }
     }
+
+    let wallet = evaluate_onchain(&config.risk);
     println!();
     println!(
         "wallet:     {}",
@@ -260,13 +271,36 @@ fn print_record(record: &LiveArming) {
     }
 }
 
-/// Removes the arming record.
-fn disarm_live() -> Result<(), String> {
-    let Some(path) = arming_path() else {
-        return Err("OPENETHER_LIVE_ARMING_FILE is not set".into());
-    };
+/// Removes one arming record.
+///
+/// With a record directory, `--venue` (or `--target onchain`) names the record
+/// to remove and only that record is touched: disarming one exchange must not
+/// disarm the other.
+fn disarm_live(options: &Options) -> Result<(), String> {
+    let config = Config::from_env();
+    let target = options
+        .get("target")
+        .or_else(|| options.get("venue"))
+        .unwrap_or_else(|| config.venue.as_str().to_string());
+    if target.trim().eq_ignore_ascii_case(ONCHAIN_TARGET) {
+        let path = arming_path_for(ONCHAIN_TARGET)
+            .ok_or_else(|| format!("neither {ARMING_DIR_ENV} nor {ARMING_ENV} is set"))?;
+        disarm(&path).map_err(|e| e.to_string())?;
+        println!("The wallet arming record {} was removed.", path.display());
+        return Ok(());
+    }
+    let venue = Venue::parse(&target).ok_or_else(|| format!("unknown venue: {target}"))?;
+    let path = arming_path_for(venue.as_str())
+        .ok_or_else(|| format!("neither {ARMING_DIR_ENV} nor {ARMING_ENV} is set"))?;
     disarm(&path).map_err(|e| e.to_string())?;
-    println!("The arming record {} was removed.", path.display());
+    if arming_dir().is_none() && config.venues.len() > 1 {
+        println!(
+            "The record {} was removed. With one shared file, every venue that file named is disarmed.",
+            path.display()
+        );
+    } else {
+        println!("The arming record {} was removed.", path.display());
+    }
     Ok(())
 }
 

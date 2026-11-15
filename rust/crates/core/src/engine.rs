@@ -41,6 +41,24 @@ const FILL_WINDOW_OVERLAP_MS: i64 = 60_000;
 /// would label a real fill as a cancellation.
 const ORDER_RETIRE_GRACE_MS: i64 = 30_000;
 
+/// Why the router refused to name a venue for an order.
+#[derive(Debug, Clone)]
+struct RouteRefusal {
+    reason: &'static str,
+    detail: String,
+}
+
+/// The venue an order goes to, and the price the risk layer sizes it at.
+#[derive(Clone)]
+struct Route {
+    connector: Arc<dyn ExchangeConnector>,
+    venue: Venue,
+    price: f64,
+    /// Every venue that quoted, fee-adjusted, for the log line. Empty when
+    /// there was nothing to compare.
+    compared: Vec<(Venue, f64)>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SubmitOutcome {
     pub approved: bool,
@@ -48,6 +66,9 @@ pub struct SubmitOutcome {
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order_id: Option<String>,
+    /// The venue the router sent the order to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub venue: Option<Venue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<OrderStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -220,6 +241,15 @@ struct DataStore {
     last_prices: HashMap<String, f64>,
     position_qty: HashMap<String, f64>,
     avg_entry: HashMap<String, f64>,
+    /// The venue that holds each symbol's inventory.
+    ///
+    /// The engine keeps one book per symbol. A symbol therefore lives on at
+    /// most one venue at a time: routing may choose any venue to open it, but
+    /// every later order for that symbol — above all the closing order — stays
+    /// on the venue that actually holds it. That is what keeps a long on one
+    /// exchange from being netted against a short on another, which would look
+    /// flat to the risk layer while leaving a naked position on each venue.
+    position_venue: HashMap<String, Venue>,
     /// Open lots per symbol, oldest first.
     lots: HashMap<String, Vec<Lot>>,
     realized_pnl: f64,
@@ -253,6 +283,10 @@ pub struct AppState {
     /// from the risk limits on every tick, so selecting a strategy cannot
     /// widen a limit.
     pub strategy_params: std::sync::Mutex<serde_json::Value>,
+    /// Every venue this process may route to, in preference order.
+    pub connectors: Vec<Arc<dyn ExchangeConnector>>,
+    /// The primary venue: the book is reported under it and its account is the
+    /// one restored on restart.
     pub connector: Arc<dyn ExchangeConnector>,
     pub onchain: Arc<OnchainClient>,
     /// The encrypted keystore and its unlock lease. Public metadata only until
@@ -281,8 +315,8 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> anyhow::Result<Arc<Self>> {
-        let connector = build_connector(&config)?;
-        Self::build(config, connector)
+        let connectors = build_connectors(&config)?;
+        Self::build(config, connectors)
     }
 
     /// Build an engine around a venue the caller supplies. Tests use this to
@@ -292,10 +326,26 @@ impl AppState {
         config: Config,
         connector: Arc<dyn ExchangeConnector>,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::build(config, connector)
+        Self::build(config, vec![connector])
     }
 
-    fn build(config: Config, connector: Arc<dyn ExchangeConnector>) -> anyhow::Result<Arc<Self>> {
+    /// Build an engine around several venues, in preference order.
+    #[cfg(test)]
+    pub fn with_connectors(
+        config: Config,
+        connectors: Vec<Arc<dyn ExchangeConnector>>,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::build(config, connectors)
+    }
+
+    fn build(
+        config: Config,
+        connectors: Vec<Arc<dyn ExchangeConnector>>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let connector = connectors
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no exchange connector was configured"))?;
         let metrics = Arc::new(Metrics::new());
         let bus = Arc::new(EventBus::new(4_096, Arc::clone(&metrics)));
         let risk = Arc::new(RiskEngine::new(config.risk.clone(), Arc::clone(&metrics)));
@@ -403,6 +453,7 @@ impl AppState {
             risk,
             strategy,
             strategy_params: std::sync::Mutex::new(strategy_params),
+            connectors,
             connector,
             onchain,
             wallet,
@@ -469,6 +520,7 @@ impl AppState {
             for p in &positions {
                 data.position_qty.insert(p.symbol.clone(), p.qty);
                 data.avg_entry.insert(p.symbol.clone(), p.avg_entry);
+                data.position_venue.insert(p.symbol.clone(), p.venue);
                 let lots: Vec<Lot> = if p.lots.is_empty() {
                     if p.qty.abs() > LOT_EPSILON {
                         vec![Lot {
@@ -499,11 +551,17 @@ impl AppState {
         // Only when something was persisted: a fresh run must keep the
         // venue's starting balance.
         if let Some(p) = portfolio.as_ref() {
+            let primary = self.connector.venue();
             let restored_account = AccountRestore {
                 cash_usd: p.cash_usd,
                 realized_pnl: p.realized_pnl,
+                // A venue only restores its own inventory. With one book per
+                // symbol this is the whole book in every run that has a
+                // restorable venue, but filtering keeps the two accounts from
+                // ever disagreeing.
                 positions: positions
                     .iter()
+                    .filter(|p| p.venue == primary)
                     .map(|p| RestoredPosition {
                         symbol: p.symbol.clone(),
                         qty: p.qty,
@@ -596,6 +654,9 @@ impl AppState {
                     .iter()
                     .map(|p| PositionRow {
                         symbol: p.symbol.clone(),
+                        // The account that is captured here is the primary
+                        // venue's, so its positions belong to it.
+                        venue: self.connector.venue(),
                         qty: p.qty,
                         avg_entry: p.avg_entry,
                         // A venue that reports lots keeps their FIFO order. One
@@ -625,6 +686,11 @@ impl AppState {
                     .filter(|(_, qty)| qty.abs() > 0.000_001)
                     .map(|(symbol, qty)| PositionRow {
                         symbol: symbol.clone(),
+                        venue: data
+                            .position_venue
+                            .get(symbol)
+                            .copied()
+                            .unwrap_or_else(|| self.connector.venue()),
                         qty: *qty,
                         avg_entry: data.avg_entry.get(symbol).copied().unwrap_or(0.0),
                         lots: data
@@ -731,7 +797,11 @@ impl AppState {
                 let mark = data.last_prices.get(symbol).copied().unwrap_or(0.0);
                 let avg = data.avg_entry.get(symbol).copied().unwrap_or(0.0);
                 Position {
-                    venue: self.venue(),
+                    venue: data
+                        .position_venue
+                        .get(symbol)
+                        .copied()
+                        .unwrap_or_else(|| self.venue()),
                     symbol: symbol.clone(),
                     qty: *qty,
                     avg_entry: avg,
@@ -1357,30 +1427,196 @@ impl AppState {
         self.alerts.send(self.alerts.breaker_reset(now_ms()));
     }
 
+    /// The connector for a venue, when the venue is configured.
+    pub fn connector_for(&self, venue: Venue) -> Option<Arc<dyn ExchangeConnector>> {
+        self.connectors
+            .iter()
+            .find(|connector| connector.venue() == venue)
+            .cloned()
+    }
+
+    /// Pick the venue an order goes to.
+    ///
+    /// Four rules, in order:
+    ///
+    /// * **An explicit venue is a constraint.** When the request names a venue
+    ///   — and it is not the neutral `paper` placeholder the simulated book
+    ///   uses — only that venue is considered. Asking for a venue that cannot
+    ///   trade the symbol is refused, never quietly rerouted.
+    /// * **Inventory pins the venue.** A symbol that already has a position
+    ///   stays on the venue that holds it. That venue is where the position can
+    ///   be closed and where its balances live; opening the other side on a
+    ///   different exchange would make the engine's one book look flat while
+    ///   leaving a naked position on each venue.
+    /// * **Only a venue that can place the order is a candidate.** A live venue
+    ///   without a valid arming record is skipped, and when nothing is left the
+    ///   order is refused rather than quietly simulated. The paper venue is a
+    ///   simulation and needs no arming; a venue with no order flow in this
+    ///   build (Hyperliquid) is never chosen at all.
+    /// * **The fee-adjusted price decides.** A buy wants the lowest cost after
+    ///   the venue's taker fee, a sell the highest proceeds. A tie keeps the
+    ///   configured preference order.
+    ///
+    /// One candidate is not quoted twice: it is simply used, at the engine's
+    /// usual price for the symbol.
+    async fn route(
+        &self,
+        symbol: &str,
+        side: Side,
+        requested: Option<Venue>,
+    ) -> Result<Route, RouteRefusal> {
+        let holder = {
+            let data = self.lock_data();
+            let held = data.position_qty.get(symbol).copied().unwrap_or(0.0).abs() > LOT_EPSILON;
+            if held {
+                data.position_venue.get(symbol).copied()
+            } else {
+                None
+            }
+        };
+
+        let candidates: Vec<Arc<dyn ExchangeConnector>> = self
+            .connectors
+            .iter()
+            .filter(|connector| holder.is_none_or(|venue| connector.venue() == venue))
+            .filter(|connector| requested.is_none_or(|venue| connector.venue() == venue))
+            // A venue that cannot place an order in this build (Hyperliquid)
+            // is not a candidate: routing to it would only turn an approved
+            // order into a `venue_error` after the risk layer said yes.
+            .filter(|connector| {
+                let venue = connector.venue();
+                venue == Venue::Paper || venue.trades_live()
+            })
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            let detail = match (holder, requested) {
+                (Some(held), Some(asked)) => format!(
+                    "the position in {symbol} is held on {held}; its orders must go there, not to {asked}"
+                ),
+                (None, Some(asked)) => format!(
+                    "{asked} cannot receive an order for {symbol}: it is not a venue that places orders in this build"
+                ),
+                (Some(held), None) => format!(
+                    "the position in {symbol} is held on {held}, which is not configured"
+                ),
+                (None, None) => format!("no venue can trade {symbol}"),
+            };
+            return Err(RouteRefusal {
+                reason: "venue_unavailable",
+                detail,
+            });
+        }
+
+        let armed: Vec<Arc<dyn ExchangeConnector>> = candidates
+            .into_iter()
+            .filter(|connector| self.config.is_live(connector.venue()))
+            .collect();
+        if armed.is_empty() {
+            return Err(RouteRefusal {
+                reason: "venue_not_armed",
+                detail: match requested {
+                    Some(venue) => format!(
+                        "{venue} may not trade {symbol}: its arming record is not valid. Run `openether-live arm --venue {venue}`."
+                    ),
+                    None => format!(
+                        "no venue that may trade {symbol} is armed: {}. Run `openether-live arm`.",
+                        holder
+                            .map(|venue| format!(
+                                "{venue} holds it and its arming record is not valid"
+                            ))
+                            .unwrap_or_else(|| "every configured live venue is unarmed".to_string())
+                    ),
+                },
+            });
+        }
+
+        if armed.len() == 1 {
+            let connector = armed[0].clone();
+            let venue = connector.venue();
+            let price = match connector.last_price(symbol).await {
+                Ok(price) if price > 0.0 => price,
+                _ => self
+                    .resolve_price(symbol)
+                    .await
+                    .ok_or_else(|| RouteRefusal {
+                        reason: "price_unavailable",
+                        detail: format!("no market price available for {symbol}"),
+                    })?,
+            };
+            return Ok(Route {
+                connector,
+                venue,
+                price,
+                compared: Vec::new(),
+            });
+        }
+
+        let mut quotes: Vec<(Venue, f64, f64, Arc<dyn ExchangeConnector>)> = Vec::new();
+        for connector in &armed {
+            let venue = connector.venue();
+            match connector.last_price(symbol).await {
+                Ok(price) if price > 0.0 => {
+                    let fee = connector.taker_fee_bps() / 10_000.0;
+                    let net = match side {
+                        Side::Buy => price * (1.0 + fee),
+                        Side::Sell => price * (1.0 - fee),
+                    };
+                    quotes.push((venue, price, net, connector.clone()));
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    venue = venue.as_str(),
+                    symbol,
+                    error = %error,
+                    "venue could not quote; excluded from routing"
+                ),
+            }
+        }
+        if quotes.is_empty() {
+            return Err(RouteRefusal {
+                reason: "price_unavailable",
+                detail: format!("no configured venue quoted {symbol}"),
+            });
+        }
+        quotes.sort_by(|a, b| match side {
+            Side::Buy => a.2.total_cmp(&b.2),
+            Side::Sell => b.2.total_cmp(&a.2),
+        });
+        let compared: Vec<(Venue, f64)> = quotes.iter().map(|quote| (quote.0, quote.2)).collect();
+        let (venue, price, _, connector) = quotes.remove(0);
+        Ok(Route {
+            connector,
+            venue,
+            price,
+            compared,
+        })
+    }
+
     /// The single entry point for placing an order.
     ///
     /// Every path — the agent through MCP, the WASM strategy, the HTTP API —
     /// funnels through here, and the risk layer is evaluated before the venue is
     /// ever contacted. There is no bypass.
     pub async fn submit_order(&self, mut req: OrderRequest, source: &str) -> SubmitOutcome {
-        if req.venue != self.connector.venue() {
-            req.venue = self.connector.venue();
-        }
         let symbol = req.symbol.clone();
-        let price = match self.resolve_price(&symbol).await {
-            Some(p) => p,
-            None => {
+        // `paper` is the neutral placeholder of the simulated book, so it does
+        // not constrain the router; naming a live venue does.
+        let requested = (req.venue != Venue::Paper).then_some(req.venue);
+        let route = match self.route(&symbol, req.side, requested).await {
+            Ok(route) => route,
+            Err(refusal) => {
                 let verdict = RiskVerdict {
                     approved: false,
-                    reason: "price_unavailable".into(),
-                    detail: format!("no market price available for {symbol}"),
+                    reason: refusal.reason.into(),
+                    detail: refusal.detail.clone(),
                     breaker_state: self.risk.breaker_state(),
                     checked_at_ms: now_ms(),
                 };
                 self.log(
                     source,
                     "warn",
-                    &format!("order rejected: no price for {symbol}"),
+                    &format!("order rejected: {}", verdict.detail),
                     serde_json::json!({"symbol": symbol, "reason": verdict.reason}),
                 );
                 return SubmitOutcome {
@@ -1388,6 +1624,7 @@ impl AppState {
                     reason: verdict.reason.clone(),
                     detail: verdict.detail.clone(),
                     order_id: None,
+                    venue: None,
                     status: None,
                     fill_price: None,
                     fee: None,
@@ -1395,6 +1632,10 @@ impl AppState {
                 };
             }
         };
+        // The connector never decides which venue it is: the router does. The
+        // risk layer then judges the order against the venue it would reach.
+        req.venue = route.venue;
+        let price = route.price;
 
         let context = RiskContext {
             equity_usd: self.equity(),
@@ -1403,6 +1644,10 @@ impl AppState {
             current_position_qty: self.risk.position_qty(&symbol),
             price,
             contracts: Vec::new(),
+            // The armed cap belongs to the venue the order was routed to, not
+            // to the process: a tight Kraken arming must not size a Binance
+            // order, and a loose one must not widen Binance's.
+            max_order_notional_usd: Some(self.config.armed_cap(route.venue)),
         };
 
         let verdict = self.risk.evaluate(&req, &context);
@@ -1425,6 +1670,7 @@ impl AppState {
                 reason: verdict.reason.clone(),
                 detail: verdict.detail.clone(),
                 order_id: None,
+                venue: Some(route.venue),
                 status: None,
                 fill_price: None,
                 fee: None,
@@ -1433,7 +1679,7 @@ impl AppState {
         }
 
         let before = now_ms();
-        let ack = match self.connector.place_order(&req).await {
+        let ack = match route.connector.place_order(&req).await {
             Ok(ack) => ack,
             Err(e) => {
                 let detail = e.to_string();
@@ -1458,6 +1704,7 @@ impl AppState {
                     reason: verdict.reason.clone(),
                     detail,
                     order_id: None,
+                    venue: Some(route.venue),
                     status: None,
                     fill_price: None,
                     fee: None,
@@ -1506,7 +1753,7 @@ impl AppState {
         // resting limit order has filled nothing, so it must not become a
         // position: the risk layer would then measure exposure that does not
         // exist, and the journal would record a trade that never happened.
-        let fills = self
+        let fills = route
             .connector
             .fills_since(before - 1)
             .await
@@ -1543,6 +1790,15 @@ impl AppState {
                 "price": fill_price,
                 "rationale": req.rationale,
                 "order_id": ack.order_id,
+                "venue": route.venue.as_str(),
+                "compared": route
+                    .compared
+                    .iter()
+                    .map(|(venue, net)| serde_json::json!({
+                        "venue": venue.as_str(),
+                        "net_price": net,
+                    }))
+                    .collect::<Vec<_>>(),
             }),
         );
 
@@ -1551,6 +1807,7 @@ impl AppState {
             reason: verdict.reason.clone(),
             detail: verdict.detail.clone(),
             order_id: Some(ack.order_id),
+            venue: Some(route.venue),
             status: Some(status),
             fill_price,
             fee,
@@ -1629,7 +1886,13 @@ impl AppState {
                 order.status.as_str()
             ));
         }
-        self.connector
+        let connector = self.connector_for(order.venue).ok_or_else(|| {
+            format!(
+                "order {order_id} lives on {}, which is not a configured venue",
+                order.venue
+            )
+        })?;
+        connector
             .cancel_order(order_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -1700,7 +1963,15 @@ impl AppState {
         data.realized_pnl += realized;
         data.position_qty.insert(symbol.clone(), new_qty);
         data.avg_entry.insert(symbol.clone(), new_avg);
-        data.lots.insert(symbol, lots);
+        data.lots.insert(symbol.clone(), lots);
+        // The venue that filled the opening order holds the position until it
+        // is flat again. Routing reads this to keep every later order — above
+        // all the close — on that venue.
+        if new_qty.abs() > LOT_EPSILON {
+            data.position_venue.insert(symbol.clone(), fill.venue);
+        } else {
+            data.position_venue.remove(&symbol);
+        }
         // A first fill has no mark to keep; it seeds one.
         data.last_prices
             .entry(fill.symbol.clone())
@@ -1761,61 +2032,100 @@ impl AppState {
     }
 
     pub fn record_tick(&self, tick: MarketTick) {
-        // The risk layer keeps the return history itself: volatility sizing
-        // and the correlation cap are risk inputs, not dashboard data.
-        self.risk
-            .observe_price(&tick.symbol, tick.price, tick.ts_ms);
-        let (equity, anchored) = {
+        // The book is marked by the venue that holds the position it belongs
+        // to. With several venues streaming, the same symbol arrives at two
+        // prices; only the holder's is the price that position could be
+        // closed at, and mixing both into the return history would corrupt
+        // the volatility and correlation estimates.
+        let (equity, anchored, governs) = {
             let mut data = self.lock_data();
-            let previous = data.last_prices.insert(tick.symbol.clone(), tick.price);
-            // The snapshot renders the position rows at this mark, so the
-            // headline equity has to move with them. Without this, one
-            // response shows a position up $20 next to an unchanged equity.
-            if let Some(previous) = previous {
-                if previous > 0.0 && previous != tick.price {
-                    let qty = data.position_qty.get(&tick.symbol).copied().unwrap_or(0.0);
-                    data.equity_usd += (tick.price - previous) * qty;
+            let qty = data
+                .position_qty
+                .get(&tick.symbol)
+                .copied()
+                .unwrap_or(0.0)
+                .abs();
+            let holder = data.position_venue.get(&tick.symbol).copied();
+            let governs = qty <= LOT_EPSILON || holder.is_none() || holder == Some(tick.venue);
+            if governs {
+                let previous = data.last_prices.insert(tick.symbol.clone(), tick.price);
+                // The snapshot renders the position rows at this mark, so the
+                // headline equity has to move with them. Without this, one
+                // response shows a position up $20 next to an unchanged equity.
+                if let Some(previous) = previous {
+                    if previous > 0.0 && previous != tick.price {
+                        let held = data.position_qty.get(&tick.symbol).copied().unwrap_or(0.0);
+                        data.equity_usd += (tick.price - previous) * held;
+                    }
                 }
             }
             if data.ticks.len() >= MAX_TICKS {
                 data.ticks.pop_front();
             }
             data.ticks.push_back(tick.clone());
-            (data.equity_usd, data.equity_anchored)
+            (data.equity_usd, data.equity_anchored, governs)
         };
+        if governs {
+            // The risk layer keeps the return history itself: volatility sizing
+            // and the correlation cap are risk inputs, not dashboard data.
+            self.risk
+                .observe_price(&tick.symbol, tick.price, tick.ts_ms);
+        }
         // The breaker watches the marked book, not only the periodic account
         // refresh: a mark that halves between refreshes is exactly the
         // drawdown the halt exists for. Before the venue has been heard from,
         // the starting balance is a guess and must not anchor a peak.
-        if anchored {
+        if anchored && governs {
             self.risk.update_equity(equity, tick.ts_ms);
             self.note_breaker(self.risk.breaker_state());
         }
         self.bus.publish(Event::Tick(tick));
     }
 
+    /// Re-anchor the account from every connected venue.
+    ///
+    /// The sum is only taken when every venue answered. A partial sum would
+    /// understate equity — and an equity that is wrong by a whole exchange is
+    /// worse than one that is a few seconds stale.
     pub async fn refresh_account(&self) {
-        match self.connector.account().await {
-            Ok(account) => {
-                {
-                    let mut data = self.lock_data();
-                    data.equity_usd = account.equity_usd;
-                    data.cash_usd = account.free_usd;
-                    data.equity_anchored = true;
+        let mut equity = 0.0;
+        let mut cash = 0.0;
+        let mut ts_ms = 0;
+        let mut complete = true;
+        for connector in &self.connectors {
+            match connector.account().await {
+                Ok(account) => {
+                    equity += account.equity_usd;
+                    cash += account.free_usd;
+                    ts_ms = ts_ms.max(account.ts_ms);
                 }
-                self.risk.update_equity(account.equity_usd, account.ts_ms);
-                self.note_breaker(self.risk.breaker_state());
-                self.metrics
-                    .gauge_set("openether_pnl_usd", &[], self.risk.daily_realized_pnl());
-                let portfolio = self.portfolio();
-                self.bus.publish(Event::Portfolio(portfolio));
-                let risk_state = self.risk_state();
-                self.bus.publish(Event::Risk(risk_state));
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "account refresh failed");
+                Err(error) => {
+                    complete = false;
+                    tracing::warn!(
+                        venue = connector.venue().as_str(),
+                        error = %error,
+                        "account refresh failed for one venue; keeping the marked book"
+                    );
+                }
             }
         }
+        if !complete {
+            return;
+        }
+        {
+            let mut data = self.lock_data();
+            data.equity_usd = equity;
+            data.cash_usd = cash;
+            data.equity_anchored = true;
+        }
+        self.risk.update_equity(equity, ts_ms);
+        self.note_breaker(self.risk.breaker_state());
+        self.metrics
+            .gauge_set("openether_pnl_usd", &[], self.risk.daily_realized_pnl());
+        let portfolio = self.portfolio();
+        self.bus.publish(Event::Portfolio(portfolio));
+        let risk_state = self.risk_state();
+        self.bus.publish(Event::Risk(risk_state));
     }
 
     /// Join the venue's two truths: the fills it reports and the orders it
@@ -1842,13 +2152,38 @@ impl AppState {
         };
 
         // A venue that cannot list its open orders must not retire anything:
-        // "no answer" is not "no orders".
-        let open = self.connector.open_orders().await.ok();
-        let fills = if watching {
-            self.connector.fills_since(since).await.unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        // "no answer" is not "no orders". With several venues that means one
+        // silent venue suspends retirement for all of them — retiring an order
+        // that is still resting is how a fill later appears out of nowhere.
+        let mut open: Option<Vec<OpenOrder>> = Some(Vec::new());
+        let mut fills: Vec<OrderFill> = Vec::new();
+        for connector in &self.connectors {
+            match connector.open_orders().await {
+                Ok(orders) => {
+                    if let Some(all) = open.as_mut() {
+                        all.extend(orders);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        venue = connector.venue().as_str(),
+                        error = %error,
+                        "a venue did not list its open orders; retiring nothing this pass"
+                    );
+                    open = None;
+                }
+            }
+            if watching {
+                match connector.fills_since(since).await {
+                    Ok(mut reported) => fills.append(&mut reported),
+                    Err(error) => tracing::warn!(
+                        venue = connector.venue().as_str(),
+                        error = %error,
+                        "a venue did not report its fills"
+                    ),
+                }
+            }
+        }
 
         // A fill the venue confirms is booked even when the order was already
         // labelled retired. The label is the engine's inference; the fill is
@@ -1861,7 +2196,7 @@ impl AppState {
                 .filter(|fill| {
                     data.orders
                         .iter()
-                        .find(|order| order.order_id == fill.order_id)
+                        .find(|order| order.order_id == fill.order_id && order.venue == fill.venue)
                         .is_some_and(|order| !order.knows_fill(fill))
                 })
                 .cloned()
@@ -1874,7 +2209,7 @@ impl AppState {
                 .lock_data()
                 .orders
                 .iter()
-                .find(|order| order.order_id == fill.order_id)
+                .find(|order| order.order_id == fill.order_id && order.venue == fill.venue)
                 .cloned()
             else {
                 continue;
@@ -1884,7 +2219,7 @@ impl AppState {
             if let Some(slot) = data
                 .orders
                 .iter_mut()
-                .find(|known| known.order_id == order.order_id)
+                .find(|known| known.order_id == order.order_id && known.venue == order.venue)
             {
                 *slot = order;
             }
@@ -1901,7 +2236,10 @@ impl AppState {
                     if !order.is_active() {
                         continue;
                     }
-                    if open.iter().any(|o| o.order_id == order.order_id) {
+                    if open
+                        .iter()
+                        .any(|o| o.order_id == order.order_id && o.venue == order.venue)
+                    {
                         order.missing_since_ms = None;
                         continue;
                     }
@@ -2286,18 +2624,24 @@ impl TxSigner for WalletSigner<'_> {
     }
 }
 
-fn build_connector(config: &Config) -> anyhow::Result<Arc<dyn ExchangeConnector>> {
-    // The arming ceremony decides whether this connector may place real
-    // orders. The connector never decides that for itself.
-    let live = config.live_trading;
-    Ok(match config.venue {
-        Venue::Paper => Arc::new(crate::exchange::paper::PaperConnector::new()),
-        Venue::Binance => Arc::new(crate::exchange::binance::BinanceConnector::from_env(live)?),
-        Venue::Kraken => Arc::new(crate::exchange::kraken::KrakenConnector::from_env(live)?),
-        Venue::Hyperliquid => {
-            Arc::new(crate::exchange::hyperliquid::HyperliquidConnector::from_env(live)?)
-        }
-    })
+fn build_connectors(config: &Config) -> anyhow::Result<Vec<Arc<dyn ExchangeConnector>>> {
+    // The arming ceremony decides whether a connector may place real orders.
+    // The connector never decides that for itself, and each venue is decided
+    // from its own record.
+    let mut connectors: Vec<Arc<dyn ExchangeConnector>> = Vec::new();
+    for venue in &config.venues {
+        let live = config.is_live(*venue);
+        let connector: Arc<dyn ExchangeConnector> = match venue {
+            Venue::Paper => Arc::new(crate::exchange::paper::PaperConnector::new()),
+            Venue::Binance => Arc::new(crate::exchange::binance::BinanceConnector::from_env(live)?),
+            Venue::Kraken => Arc::new(crate::exchange::kraken::KrakenConnector::from_env(live)?),
+            Venue::Hyperliquid => {
+                Arc::new(crate::exchange::hyperliquid::HyperliquidConnector::from_env(live)?)
+            }
+        };
+        connectors.push(connector);
+    }
+    Ok(connectors)
 }
 
 /// Background loops: market data, strategy evaluation and account refresh.
@@ -2306,14 +2650,28 @@ pub async fn run_background_tasks(state: Arc<AppState>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MarketTick>();
 
     let sink: TickSink = tx;
-    if let Err(e) = state.connector.subscribe_trades(&symbols, sink).await {
-        tracing::warn!(error = %e, "market data subscription failed");
-        state.log(
-            "engine",
-            "warn",
-            &format!("market data subscription failed: {e}"),
-            serde_json::json!({"error": e.to_string()}),
-        );
+    // Every venue streams into one sink. Ticks carry their venue, so the book
+    // can mark a position from the venue that actually holds it.
+    for connector in &state.connectors {
+        if let Err(e) = connector.subscribe_trades(&symbols, sink.clone()).await {
+            tracing::warn!(
+                venue = connector.venue().as_str(),
+                error = %e,
+                "market data subscription failed"
+            );
+            state.log(
+                "engine",
+                "warn",
+                &format!(
+                    "market data subscription failed for {}: {e}",
+                    connector.venue()
+                ),
+                serde_json::json!({
+                    "venue": connector.venue().as_str(),
+                    "error": e.to_string(),
+                }),
+            );
+        }
     }
 
     let tick_state = Arc::clone(&state);
@@ -2796,6 +3154,7 @@ mod tests {
     /// rests, a fill that arrives in pieces, a fill reported only after the
     /// order left the open list, and an open-orders call that fails.
     struct ScriptedVenue {
+        venue: Venue,
         open: std::sync::Mutex<Vec<OpenOrder>>,
         fills: std::sync::Mutex<Vec<OrderFill>>,
         open_orders_fail: std::sync::atomic::AtomicBool,
@@ -2804,7 +3163,12 @@ mod tests {
 
     impl ScriptedVenue {
         fn new() -> Arc<Self> {
+            Self::on(Venue::Paper)
+        }
+
+        fn on(venue: Venue) -> Arc<Self> {
             Arc::new(Self {
+                venue,
                 open: std::sync::Mutex::new(Vec::new()),
                 fills: std::sync::Mutex::new(Vec::new()),
                 open_orders_fail: std::sync::atomic::AtomicBool::new(false),
@@ -2814,7 +3178,7 @@ mod tests {
 
         fn report_fill(&self, order_id: &str, qty: f64, price: f64, ts_ms: i64) {
             self.fills.lock().unwrap().push(OrderFill {
-                venue: Venue::Paper,
+                venue: self.venue,
                 order_id: order_id.to_string(),
                 symbol: "SOL/USDT".to_string(),
                 side: Side::Buy,
@@ -2833,7 +3197,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ExchangeConnector for ScriptedVenue {
         fn venue(&self) -> Venue {
-            Venue::Paper
+            self.venue
         }
 
         async fn health(&self) -> ExchangeResult<()> {
@@ -2842,7 +3206,7 @@ mod tests {
 
         async fn account(&self) -> ExchangeResult<AccountSnapshot> {
             Ok(AccountSnapshot {
-                venue: Venue::Paper,
+                venue: self.venue,
                 equity_usd: 10_000.0,
                 free_usd: 10_000.0,
                 balances: Vec::new(),
@@ -2857,7 +3221,7 @@ mod tests {
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             );
             self.open.lock().unwrap().push(OpenOrder {
-                venue: Venue::Paper,
+                venue: self.venue,
                 order_id: id.clone(),
                 symbol: req.symbol.clone(),
                 side: req.side,
@@ -2866,7 +3230,7 @@ mod tests {
                 ts_ms: now_ms(),
             });
             Ok(OrderAck {
-                venue: Venue::Paper,
+                venue: self.venue,
                 order_id: id,
                 client_id: req.client_id.clone(),
                 status: OrderStatus::Accepted,
@@ -2922,6 +3286,461 @@ mod tests {
         req.order_type = OrderType::Limit;
         req.limit_price = Some(price);
         req
+    }
+
+    /// A venue that quotes a price the test sets and fills immediately.
+    ///
+    /// Routing compares quotes and fees, and a fill has to come back from the
+    /// venue the order actually reached, so the fake records what it filled.
+    struct QuotedVenue {
+        venue: Venue,
+        fee_bps: f64,
+        price: std::sync::Mutex<f64>,
+        equity: f64,
+        fills: std::sync::Mutex<Vec<OrderFill>>,
+        next_id: std::sync::atomic::AtomicU64,
+    }
+
+    impl QuotedVenue {
+        fn new(venue: Venue, price: f64, fee_bps: f64, equity: f64) -> Arc<Self> {
+            Arc::new(Self {
+                venue,
+                fee_bps,
+                price: std::sync::Mutex::new(price),
+                equity,
+                fills: std::sync::Mutex::new(Vec::new()),
+                next_id: std::sync::atomic::AtomicU64::new(1),
+            })
+        }
+
+        fn set_price(&self, price: f64) {
+            *self.price.lock().unwrap() = price;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExchangeConnector for QuotedVenue {
+        fn venue(&self) -> Venue {
+            self.venue
+        }
+
+        fn taker_fee_bps(&self) -> f64 {
+            self.fee_bps
+        }
+
+        async fn health(&self) -> ExchangeResult<()> {
+            Ok(())
+        }
+
+        async fn account(&self) -> ExchangeResult<AccountSnapshot> {
+            Ok(AccountSnapshot {
+                venue: self.venue,
+                equity_usd: self.equity,
+                free_usd: self.equity,
+                balances: Vec::new(),
+                ts_ms: now_ms(),
+            })
+        }
+
+        async fn place_order(&self, req: &OrderRequest) -> ExchangeResult<OrderAck> {
+            let price = *self.price.lock().unwrap();
+            let id = format!(
+                "{}-{}",
+                self.venue.as_str(),
+                self.next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            );
+            self.fills.lock().unwrap().push(OrderFill {
+                venue: self.venue,
+                order_id: id.clone(),
+                symbol: req.symbol.clone(),
+                side: req.side,
+                qty: req.qty,
+                price,
+                fee: req.qty * price * self.fee_bps / 10_000.0,
+                ts_ms: now_ms(),
+            });
+            Ok(OrderAck {
+                venue: self.venue,
+                order_id: id,
+                client_id: req.client_id.clone(),
+                status: OrderStatus::Filled,
+                accepted_ts_ms: now_ms(),
+                message: "filled".into(),
+            })
+        }
+
+        async fn cancel_order(&self, _order_id: &str) -> ExchangeResult<()> {
+            Ok(())
+        }
+
+        async fn open_orders(&self) -> ExchangeResult<Vec<OpenOrder>> {
+            Ok(Vec::new())
+        }
+
+        async fn fills_since(&self, since_ms: i64) -> ExchangeResult<Vec<OrderFill>> {
+            Ok(self
+                .fills
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|fill| fill.ts_ms >= since_ms)
+                .cloned()
+                .collect())
+        }
+
+        async fn subscribe_trades(
+            &self,
+            _symbols: &[String],
+            _sink: TickSink,
+        ) -> ExchangeResult<()> {
+            Ok(())
+        }
+
+        async fn last_price(&self, _symbol: &str) -> ExchangeResult<f64> {
+            Ok(*self.price.lock().unwrap())
+        }
+    }
+
+    fn armed_state(cap: f64) -> crate::live_arm::LiveArmingState {
+        let mut state = crate::live_arm::LiveArmingState::not_armed("test", "armed by the test");
+        state.live_enabled = true;
+        state.reason = None;
+        state.detail = None;
+        state.effective_max_order_notional_usd = cap;
+        state
+    }
+
+    /// A config listing `venues`, each armed with `cap`.
+    fn routed_config(db: &Path, venues: &[(Venue, f64)]) -> Config {
+        let mut config = config_with_db(db);
+        config.venues = venues.iter().map(|(venue, _)| *venue).collect();
+        config.venue = config.venues[0];
+        config.live_armings = venues
+            .iter()
+            .map(|(venue, cap)| crate::config::VenueArming {
+                venue: *venue,
+                state: armed_state(*cap),
+            })
+            .collect();
+        config.live_trading = true;
+        config.risk.venue_allowlist = config.venues.iter().copied().collect();
+        config.risk.symbol_allowlist.insert("SOL/USDT".into());
+        config.risk.max_order_notional_usd = 5_000.0;
+        config
+    }
+
+    #[tokio::test]
+    async fn a_buy_goes_to_the_cheaper_venue_after_its_fee() {
+        let (dir, db) = temp_db();
+        // Kraken quotes a lower price, but its taker fee is 26 bps against
+        // Binance's 10: 99.90 * 1.0026 = 100.16 against 100 * 1.001 = 100.10.
+        let binance = QuotedVenue::new(Venue::Binance, 100.0, 10.0, 10_000.0);
+        let kraken = QuotedVenue::new(Venue::Kraken, 99.9, 26.0, 10_000.0);
+        let state = AppState::with_connectors(
+            routed_config(&db, &[(Venue::Binance, 500.0), (Venue::Kraken, 500.0)]),
+            vec![binance.clone(), kraken.clone()],
+        )
+        .unwrap();
+
+        let outcome = state
+            .submit_order(
+                OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 1.0),
+                "test",
+            )
+            .await;
+        assert!(outcome.approved, "{outcome:?}");
+        assert_eq!(outcome.venue, Some(Venue::Binance));
+        assert!(binance.fills.lock().unwrap().len() == 1);
+        assert!(kraken.fills.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_sell_goes_to_the_venue_that_pays_more_after_its_fee() {
+        let (dir, db) = temp_db();
+        // Mirrored quotes: Kraken is cheaper to buy, and therefore worse to
+        // sell. Binance nets 99.90 against Kraken's 99.64.
+        let binance = QuotedVenue::new(Venue::Binance, 100.0, 10.0, 10_000.0);
+        let kraken = QuotedVenue::new(Venue::Kraken, 99.9, 26.0, 10_000.0);
+        let state = AppState::with_connectors(
+            routed_config(&db, &[(Venue::Binance, 500.0), (Venue::Kraken, 500.0)]),
+            vec![binance.clone(), kraken.clone()],
+        )
+        .unwrap();
+
+        let outcome = state
+            .submit_order(
+                OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Sell, 1.0),
+                "test",
+            )
+            .await;
+        assert!(outcome.approved, "{outcome:?}");
+        assert_eq!(outcome.venue, Some(Venue::Binance));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn inventory_pins_the_close_to_the_venue_that_holds_it() {
+        let (dir, db) = temp_db();
+        let binance = QuotedVenue::new(Venue::Binance, 100.0, 10.0, 10_000.0);
+        let kraken = QuotedVenue::new(Venue::Kraken, 101.0, 26.0, 10_000.0);
+        let state = AppState::with_connectors(
+            routed_config(&db, &[(Venue::Binance, 500.0), (Venue::Kraken, 500.0)]),
+            vec![binance.clone(), kraken.clone()],
+        )
+        .unwrap();
+
+        let opened = state
+            .submit_order(
+                OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 1.0),
+                "test",
+            )
+            .await;
+        assert!(opened.approved, "{opened:?}");
+        assert_eq!(opened.venue, Some(Venue::Binance));
+        assert_eq!(state.portfolio().positions[0].venue, Venue::Binance);
+
+        // Kraken now pays more for the coin. The close still has to land where
+        // the coin is, otherwise Binance keeps the long and Kraken opens a
+        // short — two positions where the book shows none.
+        kraken.set_price(200.0);
+        let closed = state
+            .submit_order(
+                OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Sell, 1.0),
+                "test",
+            )
+            .await;
+        assert!(closed.approved, "{closed:?}");
+        assert_eq!(closed.venue, Some(Venue::Binance));
+        assert_eq!(kraken.fills.lock().unwrap().len(), 0);
+        assert!(state.portfolio().positions.is_empty(), "the book is flat");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unarmed_venue_is_never_routed_to() {
+        let (dir, db) = temp_db();
+        let binance = QuotedVenue::new(Venue::Binance, 105.0, 10.0, 10_000.0);
+        let kraken = QuotedVenue::new(Venue::Kraken, 100.0, 26.0, 10_000.0);
+        let mut config = routed_config(&db, &[(Venue::Binance, 500.0)]);
+        // Kraken is configured and quotes better, but nothing armed it.
+        config.venues = vec![Venue::Binance, Venue::Kraken];
+        config.risk.venue_allowlist = config.venues.iter().copied().collect();
+        let state =
+            AppState::with_connectors(config, vec![binance.clone(), kraken.clone()]).unwrap();
+
+        let outcome = state
+            .submit_order(
+                OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 1.0),
+                "test",
+            )
+            .await;
+        assert!(outcome.approved, "{outcome:?}");
+        assert_eq!(outcome.venue, Some(Venue::Binance));
+        assert_eq!(kraken.fills.lock().unwrap().len(), 0);
+
+        // With nothing armed at all, the order is refused rather than quietly
+        // simulated. The database is fresh so the position booked above is not
+        // restored onto a venue this state does not connect to.
+        let (dir2, db2) = temp_db();
+        let mut config = routed_config(&db2, &[(Venue::Kraken, 500.0)]);
+        config.live_armings = vec![crate::config::VenueArming {
+            venue: Venue::Kraken,
+            state: crate::live_arm::LiveArmingState::not_armed("test", "not armed"),
+        }];
+        config.risk.venue_allowlist = config.venues.iter().copied().collect();
+        let state = AppState::with_connectors(config, vec![kraken]).unwrap();
+        let refused = state
+            .submit_order(
+                OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 1.0),
+                "test",
+            )
+            .await;
+        assert!(!refused.approved);
+        assert_eq!(refused.reason, "venue_not_armed");
+        assert_eq!(refused.venue, None);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[tokio::test]
+    async fn an_explicit_venue_is_a_constraint_not_a_suggestion() {
+        let (dir, db) = temp_db();
+        let binance = QuotedVenue::new(Venue::Binance, 100.0, 10.0, 10_000.0);
+        // Kraken is cheaper after its fee, so a free choice would pick it.
+        let kraken = QuotedVenue::new(Venue::Kraken, 99.0, 26.0, 10_000.0);
+        let config = routed_config(&db, &[(Venue::Binance, 500.0), (Venue::Kraken, 500.0)]);
+        let state =
+            AppState::with_connectors(config, vec![binance.clone(), kraken.clone()]).unwrap();
+
+        let pinned = state
+            .submit_order(
+                OrderRequest::market(Venue::Binance, "SOL/USDT", Side::Buy, 1.0),
+                "test",
+            )
+            .await;
+        assert!(pinned.approved, "{pinned:?}");
+        assert_eq!(pinned.venue, Some(Venue::Binance));
+        assert_eq!(binance.fills.lock().unwrap().len(), 1);
+        assert_eq!(kraken.fills.lock().unwrap().len(), 0);
+
+        // The position is now held on Binance, so asking for Kraken would open
+        // a second book. That is refused, not quietly rerouted.
+        let refused = state
+            .submit_order(
+                OrderRequest::market(Venue::Kraken, "SOL/USDT", Side::Sell, 1.0),
+                "test",
+            )
+            .await;
+        assert!(!refused.approved);
+        assert_eq!(refused.reason, "venue_unavailable");
+        assert!(
+            refused.detail.contains("held on binance"),
+            "{}",
+            refused.detail
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_read_only_venue_is_never_routed_to() {
+        let (dir, db) = temp_db();
+        let binance = QuotedVenue::new(Venue::Binance, 100.0, 10.0, 10_000.0);
+        // Hyperliquid quotes far cheaper, but it does not place orders in this
+        // build, so routing must not hand it an approved order to fail later.
+        let hyperliquid = QuotedVenue::new(Venue::Hyperliquid, 50.0, 4.5, 10_000.0);
+        let config = routed_config(&db, &[(Venue::Binance, 500.0), (Venue::Hyperliquid, 500.0)]);
+        let state =
+            AppState::with_connectors(config, vec![binance.clone(), hyperliquid.clone()]).unwrap();
+
+        let refused = state
+            .submit_order(
+                OrderRequest::market(Venue::Hyperliquid, "SOL/USDT", Side::Buy, 1.0),
+                "test",
+            )
+            .await;
+        assert!(!refused.approved);
+        assert_eq!(refused.reason, "venue_unavailable");
+
+        let outcome = state
+            .submit_order(
+                OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 1.0),
+                "test",
+            )
+            .await;
+        assert!(outcome.approved, "{outcome:?}");
+        assert_eq!(outcome.venue, Some(Venue::Binance));
+        assert_eq!(hyperliquid.fills.lock().unwrap().len(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_armed_cap_binds_only_its_own_venue() {
+        let (dir, db) = temp_db();
+        let binance = QuotedVenue::new(Venue::Binance, 100.0, 10.0, 10_000.0);
+        let kraken = QuotedVenue::new(Venue::Kraken, 100.0, 10.0, 10_000.0);
+        // Binance was armed with a $150 cap; Kraken with the risk layer's cap.
+        let state = AppState::with_connectors(
+            routed_config(&db, &[(Venue::Binance, 150.0), (Venue::Kraken, 5_000.0)]),
+            vec![binance, kraken.clone()],
+        )
+        .unwrap();
+
+        // 2 SOL at 100 is $200: above Binance's armed cap, and Binance is the
+        // venue the tie routes to.
+        let refused = state
+            .submit_order(
+                OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 2.0),
+                "test",
+            )
+            .await;
+        assert!(!refused.approved, "{refused:?}");
+        assert_eq!(refused.reason, "notional_too_large");
+        assert!(refused.detail.contains("150.00"), "{}", refused.detail);
+
+        // The same order is fine once Binance is not in the picture.
+        let mut config = routed_config(&db, &[(Venue::Kraken, 5_000.0)]);
+        config.venues = vec![Venue::Kraken];
+        config.venue = Venue::Kraken;
+        config.risk.venue_allowlist = config.venues.iter().copied().collect();
+        let state = AppState::with_connectors(config, vec![kraken]).unwrap();
+        let approved = state
+            .submit_order(
+                OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 2.0),
+                "test",
+            )
+            .await;
+        assert!(approved.approved, "{approved:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn every_venue_account_is_summed_into_equity() {
+        let (dir, db) = temp_db();
+        let binance = QuotedVenue::new(Venue::Binance, 100.0, 10.0, 7_000.0);
+        let kraken = QuotedVenue::new(Venue::Kraken, 100.0, 10.0, 4_000.0);
+        let state = AppState::with_connectors(
+            routed_config(&db, &[(Venue::Binance, 500.0), (Venue::Kraken, 500.0)]),
+            vec![binance, kraken],
+        )
+        .unwrap();
+
+        state.refresh_account().await;
+        assert!(
+            (state.equity() - 11_000.0).abs() < 1e-9,
+            "{}",
+            state.equity()
+        );
+        assert!((state.portfolio().cash_usd - 11_000.0).abs() < 1e-9);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_position_is_marked_by_the_venue_that_holds_it() {
+        let (dir, db) = temp_db();
+        let binance = QuotedVenue::new(Venue::Binance, 100.0, 0.0, 10_000.0);
+        let kraken = QuotedVenue::new(Venue::Kraken, 300.0, 0.0, 10_000.0);
+        let state = AppState::with_connectors(
+            routed_config(&db, &[(Venue::Binance, 500.0), (Venue::Kraken, 500.0)]),
+            vec![binance, kraken],
+        )
+        .unwrap();
+
+        let opened = state
+            .submit_order(
+                OrderRequest::market(Venue::Paper, "SOL/USDT", Side::Buy, 1.0),
+                "test",
+            )
+            .await;
+        assert!(opened.approved, "{opened:?}");
+        state.refresh_account().await;
+        let equity_before = state.equity();
+
+        // Kraken's book is empty, so its price says nothing about this
+        // position; a tick from it must not mark the long.
+        state.record_tick(MarketTick {
+            venue: Venue::Kraken,
+            symbol: "SOL/USDT".into(),
+            price: 300.0,
+            size: 1.0,
+            ts_ms: now_ms(),
+        });
+        assert_eq!(state.last_price("SOL/USDT"), Some(100.0));
+        assert!((state.equity() - equity_before).abs() < 1e-9);
+
+        // The holder's tick does.
+        state.record_tick(MarketTick {
+            venue: Venue::Binance,
+            symbol: "SOL/USDT".into(),
+            price: 110.0,
+            size: 1.0,
+            ts_ms: now_ms(),
+        });
+        assert_eq!(state.last_price("SOL/USDT"), Some(110.0));
+        assert!((state.equity() - (equity_before + 10.0)).abs() < 1e-9);
+        assert_eq!(state.portfolio().positions[0].venue, Venue::Binance);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The bug this whole task exists to fix: the engine used to invent a full
@@ -3131,6 +3950,48 @@ mod tests {
         state.reconcile_orders().await;
 
         assert!(state.orders()[0].is_active(), "no answer is not no orders");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two venues number their orders independently, so the same id can name
+    /// two different orders. A fill must be matched by venue as well, or a fill
+    /// on one exchange would book against — and retire — the other's order.
+    #[tokio::test]
+    async fn a_fill_is_matched_to_its_venue_not_just_its_order_id() {
+        let (dir, db) = temp_db();
+        let binance = ScriptedVenue::on(Venue::Binance);
+        let kraken = ScriptedVenue::on(Venue::Kraken);
+        let config = routed_config(&db, &[(Venue::Binance, 500.0), (Venue::Kraken, 500.0)]);
+        let state =
+            AppState::with_connectors(config, vec![binance.clone(), kraken.clone()]).unwrap();
+
+        // Both venues would number their first order "scripted-1"; the order
+        // under test rests on Binance, which is first in preference on a tie.
+        let order_id = state
+            .submit_order(limit_order(2.0, 100.0), "test")
+            .await
+            .order_id
+            .unwrap();
+        assert_eq!(order_id, "scripted-1");
+        assert_eq!(state.orders()[0].venue, Venue::Binance);
+
+        // Kraken reports a fill for its own order of that same id.
+        kraken.report_fill("scripted-1", 1.0, 100.0, now_ms());
+        state.reconcile_orders().await;
+
+        assert!(
+            state.trades(10).is_empty(),
+            "a fill on another venue is not a fill of this order"
+        );
+        assert!(state.portfolio().positions.is_empty());
+        let orders = state.orders();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].venue, Venue::Binance);
+        assert_eq!(
+            orders[0].status,
+            OrderStatus::Accepted,
+            "the Binance order is still resting"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

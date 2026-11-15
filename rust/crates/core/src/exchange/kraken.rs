@@ -616,6 +616,11 @@ impl ExchangeConnector for KrakenConnector {
         Venue::Kraken
     }
 
+    fn taker_fee_bps(&self) -> f64 {
+        // Base-tier taker fee.
+        26.0
+    }
+
     async fn health(&self) -> ExchangeResult<()> {
         self.public_get("/api/0/public/Time", &[]).await.map(|_| ())
     }

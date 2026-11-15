@@ -55,6 +55,8 @@ pub struct PositionLot {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PositionRow {
     pub symbol: String,
+    /// The venue that holds the inventory. Routing pins a symbol to it.
+    pub venue: Venue,
     pub qty: f64,
     pub avg_entry: f64,
     /// Open lots, oldest first.
@@ -261,6 +263,7 @@ CREATE TABLE IF NOT EXISTS portfolio (
 
 CREATE TABLE IF NOT EXISTS positions (
     symbol     TEXT PRIMARY KEY,
+    venue      TEXT NOT NULL DEFAULT 'paper',
     qty        REAL NOT NULL,
     avg_entry  REAL NOT NULL
 );
@@ -361,9 +364,38 @@ impl Store {
 
     fn init(conn: Connection) -> anyhow::Result<Self> {
         conn.execute_batch(SCHEMA)?;
+        Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Bring a database written by an older build up to the current schema.
+    ///
+    /// Existing position rows predate per-venue books, so they are stamped
+    /// `paper`: a database from a single-venue paper run is exactly that, and a
+    /// live single-venue database that is later opened in a multi-venue run has
+    /// its positions re-anchored from the exchange on the next account refresh.
+    fn migrate(conn: &Connection) -> anyhow::Result<()> {
+        let mut has_venue = false;
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(positions)")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                if name == "venue" {
+                    has_venue = true;
+                    break;
+                }
+            }
+        }
+        if !has_venue {
+            conn.execute(
+                "ALTER TABLE positions ADD COLUMN venue TEXT NOT NULL DEFAULT 'paper'",
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     fn lock(&self) -> anyhow::Result<std::sync::MutexGuard<'_, Connection>> {
@@ -422,8 +454,8 @@ impl Store {
         tx.execute("DELETE FROM position_lots", [])?;
         for p in positions {
             tx.execute(
-                "INSERT INTO positions (symbol, qty, avg_entry) VALUES (?1, ?2, ?3)",
-                params![p.symbol, p.qty, p.avg_entry],
+                "INSERT INTO positions (symbol, venue, qty, avg_entry) VALUES (?1, ?2, ?3, ?4)",
+                params![p.symbol, p.venue.as_str(), p.qty, p.avg_entry],
             )?;
             for (seq, lot) in p.lots.iter().enumerate() {
                 tx.execute(
@@ -459,14 +491,16 @@ impl Store {
             }
         }
         let mut stmt =
-            conn.prepare("SELECT symbol, qty, avg_entry FROM positions ORDER BY symbol")?;
+            conn.prepare("SELECT symbol, venue, qty, avg_entry FROM positions ORDER BY symbol")?;
         let rows = stmt
             .query_map([], |r| {
                 let symbol: String = r.get(0)?;
+                let venue: String = r.get(1)?;
                 Ok(PositionRow {
                     symbol: symbol.clone(),
-                    qty: r.get(1)?,
-                    avg_entry: r.get(2)?,
+                    venue: Venue::parse(&venue).unwrap_or(Venue::Paper),
+                    qty: r.get(2)?,
+                    avg_entry: r.get(3)?,
                     lots: lots.remove(&symbol).unwrap_or_default(),
                 })
             })?
@@ -961,6 +995,7 @@ mod tests {
         s.save_positions(&[
             PositionRow {
                 symbol: "SOL/USDT".into(),
+                venue: Venue::Paper,
                 qty: 2.0,
                 avg_entry: 140.0,
                 lots: vec![
@@ -976,6 +1011,7 @@ mod tests {
             },
             PositionRow {
                 symbol: "BTC/USDT".into(),
+                venue: Venue::Kraken,
                 qty: -0.5,
                 avg_entry: 60_000.0,
                 lots: vec![PositionLot {
@@ -989,6 +1025,12 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].symbol, "BTC/USDT");
         assert_eq!(loaded[0].qty, -0.5);
+        assert_eq!(
+            loaded[0].venue,
+            Venue::Kraken,
+            "the holding venue round-trips"
+        );
+        assert_eq!(loaded[1].venue, Venue::Paper);
         assert_eq!(loaded[1].lots.len(), 2);
         assert_eq!(loaded[1].lots[0].price, 130.0, "oldest lot comes first");
         assert_eq!(loaded[1].lots[1].price, 150.0);
@@ -997,6 +1039,7 @@ mod tests {
         // or leave its lots behind.
         s.save_positions(&[PositionRow {
             symbol: "SOL/USDT".into(),
+            venue: Venue::Paper,
             qty: 2.0,
             avg_entry: 140.0,
             lots: vec![PositionLot {

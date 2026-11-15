@@ -911,6 +911,10 @@ impl ExchangeConnector for PaperConnector {
         Venue::Paper
     }
 
+    fn taker_fee_bps(&self) -> f64 {
+        self.config().taker_fee_bps
+    }
+
     async fn health(&self) -> ExchangeResult<()> {
         Ok(())
     }

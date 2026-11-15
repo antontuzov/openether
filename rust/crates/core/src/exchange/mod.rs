@@ -108,6 +108,15 @@ pub trait ExchangeConnector: Send + Sync {
         ))
     }
 
+    /// The taker fee this venue charges, in basis points of the fill notional.
+    ///
+    /// Routing compares fee-adjusted prices, so each venue states its own fee
+    /// rather than sharing one guess. The default is the paper venue's default;
+    /// a connector with a published taker fee overrides it.
+    fn taker_fee_bps(&self) -> f64 {
+        5.0
+    }
+
     /// Fills the venue has confirmed since the given timestamp.
     ///
     /// The engine books only what this returns. An empty answer means nothing

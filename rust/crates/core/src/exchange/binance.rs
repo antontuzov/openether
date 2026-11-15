@@ -617,6 +617,11 @@ impl ExchangeConnector for BinanceConnector {
         Venue::Binance
     }
 
+    fn taker_fee_bps(&self) -> f64 {
+        // Base-tier spot taker fee, before any BNB discount.
+        10.0
+    }
+
     async fn health(&self) -> ExchangeResult<()> {
         self.public_request("/api/v3/ping", &[]).await.map(|_| ())
     }

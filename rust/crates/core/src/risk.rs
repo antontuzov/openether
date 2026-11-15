@@ -220,6 +220,12 @@ pub struct RiskContext {
     pub price: f64,
     /// Contracts / protocols the order would touch (on-chain venues).
     pub contracts: Vec<String>,
+    /// The per-order cap in force for the venue this order was routed to.
+    ///
+    /// An arming record may tighten the configured cap for its own venue, and
+    /// the router picks the venue before the risk check. `None` means "use the
+    /// configured cap", which is what a single-venue or unarmed run does.
+    pub max_order_notional_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -654,13 +660,14 @@ impl RiskEngine {
                 breaker_state,
             );
         }
-        if notional > self.config.max_order_notional_usd {
+        let order_cap = ctx
+            .max_order_notional_usd
+            .unwrap_or(self.config.max_order_notional_usd)
+            .min(self.config.max_order_notional_usd);
+        if notional > order_cap {
             return RiskVerdict::reject(
                 "notional_too_large",
-                format!(
-                    "notional ${notional:.2} exceeds the ${:.2} per-order cap",
-                    self.config.max_order_notional_usd
-                ),
+                format!("notional ${notional:.2} exceeds the ${order_cap:.2} per-order cap"),
                 breaker_state,
             );
         }
@@ -1134,6 +1141,7 @@ mod tests {
             current_position_qty: 0.0,
             price: 100.0,
             contracts: vec![],
+            max_order_notional_usd: None,
         }
     }
 
@@ -1447,6 +1455,7 @@ mod tests {
             current_position_qty: position,
             price,
             contracts: vec![],
+            max_order_notional_usd: None,
         }
     }
 

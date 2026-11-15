@@ -33,6 +33,14 @@ use std::path::{Path, PathBuf};
 pub const ARMING_VERSION: u16 = 1;
 /// The environment variable that points at the arming record.
 pub const ARMING_ENV: &str = "OPENETHER_LIVE_ARMING_FILE";
+/// The environment variable that points at a directory of arming records,
+/// one `<target>.json` per venue.
+///
+/// This is how several venues are armed at once. A single record file can only
+/// ever name one target, so a process that trades more than one venue needs one
+/// record per venue — and the directory is the only layout in which each venue
+/// gets its own confirmation, its own cap and its own expiry.
+pub const ARMING_DIR_ENV: &str = "OPENETHER_LIVE_ARMING_DIR";
 /// The environment variable that asks for live trading.
 pub const LIVE_ENV: &str = "OPENETHER_LIVE_TRADING";
 /// The phrase the operator has to confirm before anything is armed.
@@ -106,6 +114,8 @@ pub enum LiveArmError {
     Json(String),
     #[error("the arming record is missing")]
     Missing,
+    #[error("neither {ARMING_DIR_ENV} nor {ARMING_ENV} is set")]
+    NoArmingPath,
     #[error("the venue {0} does not trade live")]
     UnsupportedVenue(String),
     #[error("the confirmation phrase did not match")]
@@ -124,6 +134,31 @@ pub fn arming_path() -> Option<PathBuf> {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from)
+}
+
+/// The directory of arming records, when one is configured.
+pub fn arming_dir() -> Option<PathBuf> {
+    std::env::var(ARMING_DIR_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// The record that arms `target`.
+///
+/// A directory wins over the single file: when it is configured every target
+/// has its own record, and falling back to one shared file would let a record
+/// written for one venue be read as another venue's.
+pub fn arming_path_for(target: &str) -> Option<PathBuf> {
+    match arming_dir() {
+        Some(dir) => Some(dir.join(format!("{target}.json"))),
+        None => arming_path(),
+    }
+}
+
+/// Where the arming ceremony should write, with the error already worded.
+pub fn arming_target_path(target: &str) -> Result<PathBuf, LiveArmError> {
+    arming_path_for(target).ok_or(LiveArmError::NoArmingPath)
 }
 
 /// `true` when the environment asks for live trading at all.
@@ -356,9 +391,15 @@ pub fn disarm(path: &Path) -> Result<(), LiveArmError> {
 /// Decides whether live trading may run, and why not when it may not.
 ///
 /// This is the only place the decision is made: the core, the connectors and
-/// the API all read the outcome of this function.
+/// the API all read the outcome of this function. Each venue is decided
+/// separately, from its own record.
 pub fn evaluate(venue: Venue, risk: &RiskConfig) -> LiveArmingState {
-    evaluate_at(arming_path().as_deref(), venue, risk, live_requested())
+    evaluate_at(
+        arming_path_for(venue.as_str()).as_deref(),
+        venue,
+        risk,
+        live_requested(),
+    )
 }
 
 /// The decision for a venue, with every input spelled out.
@@ -376,7 +417,11 @@ pub fn evaluate_at(
 
 /// The decision for the on-chain wallet.
 pub fn evaluate_onchain(risk: &RiskConfig) -> LiveArmingState {
-    evaluate_onchain_at(arming_path().as_deref(), risk, live_requested())
+    evaluate_onchain_at(
+        arming_path_for(ONCHAIN_TARGET).as_deref(),
+        risk,
+        live_requested(),
+    )
 }
 
 /// The on-chain decision, with the path and the request supplied.
@@ -405,7 +450,7 @@ fn evaluate_target_at(
         let mut state = LiveArmingState::not_armed(
             "arming_file_unset",
             format!(
-                "live {noun} is off: {ARMING_ENV} is not set. Run `openether-live arm` to arm it."
+                "live {noun} is off: neither {ARMING_DIR_ENV} nor {ARMING_ENV} is set. Run `openether-live arm` to arm it."
             ),
         );
         state.effective_max_order_notional_usd = effective_cap;
@@ -772,6 +817,82 @@ mod tests {
         assert!(!state.live_enabled);
         assert_eq!(state.reason, Some("arming_target_mismatch"));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_record_directory_arms_each_venue_with_its_own_record() {
+        // Two venues, two records in one directory. This is the layout
+        // `arming_path_for` names when OPENETHER_LIVE_ARMING_DIR is set.
+        let dir = temp_path("dir").parent().unwrap().to_path_buf();
+        let binance = dir.join("binance.json");
+        let kraken = dir.join("kraken.json");
+        assert_ne!(binance, kraken);
+
+        arm(
+            &binance,
+            Venue::Binance,
+            &risk(),
+            100.0,
+            60_000,
+            CONFIRMATION_PHRASE,
+            "",
+        )
+        .unwrap();
+
+        let armed = evaluate_at(Some(&binance), Venue::Binance, &risk(), true);
+        assert!(armed.live_enabled);
+        assert_eq!(armed.effective_max_order_notional_usd, 100.0);
+
+        // Kraken has no record of its own, so it stays off even though its
+        // sibling file sits in the same directory.
+        let unarmed = evaluate_at(Some(&kraken), Venue::Kraken, &risk(), true);
+        assert!(!unarmed.live_enabled);
+        assert_eq!(unarmed.reason, Some("arming_file_missing"));
+
+        // And one record cannot be read as the other's even when it is named.
+        let crossed = evaluate_at(Some(&binance), Venue::Kraken, &risk(), true);
+        assert!(!crossed.live_enabled);
+        assert_eq!(crossed.reason, Some("arming_target_mismatch"));
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn each_record_keeps_its_own_cap_and_expiry() {
+        let dir = temp_path("dir-caps").parent().unwrap().to_path_buf();
+        let tight = dir.join("binance.json");
+        let loose = dir.join("kraken.json");
+        arm(
+            &tight,
+            Venue::Binance,
+            &risk(),
+            100.0,
+            60_000,
+            CONFIRMATION_PHRASE,
+            "",
+        )
+        .unwrap();
+        arm(
+            &loose,
+            Venue::Kraken,
+            &risk(),
+            400.0,
+            120_000,
+            CONFIRMATION_PHRASE,
+            "",
+        )
+        .unwrap();
+
+        let binance = evaluate_at(Some(&tight), Venue::Binance, &risk(), true);
+        let kraken = evaluate_at(Some(&loose), Venue::Kraken, &risk(), true);
+        assert_eq!(binance.effective_max_order_notional_usd, 100.0);
+        assert_eq!(kraken.effective_max_order_notional_usd, 400.0);
+        assert_ne!(
+            binance.record.as_ref().unwrap().expires_at_ms,
+            kraken.record.as_ref().unwrap().expires_at_ms
+        );
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

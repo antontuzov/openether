@@ -29,7 +29,7 @@ Base URL for the core: `http://localhost:8080` (override with `CORE_URL`).
 | GET | `/api/orders` | `TrackedOrder[]`, newest first — order state and venue-confirmed fills |
 | DELETE | `/api/orders/{order_id}` | Cancel a resting order; the venue must confirm |
 | POST | `/api/breaker/reset` | Body `{ "confirm": true }` → manual breaker reset |
-| GET | `/api/venues` | `[{ "venue": "paper", "healthy": true, "live": false }]` |
+| GET | `/api/venues` | `[{ "venue": "binance", "healthy": true, "live": true, "active": true, "max_order_notional_usd": 500.0 }]` |
 | GET | `/api/wallet` | `WalletMetadata` — public wallet metadata, never a secret |
 | GET | `/api/wallet/holdings` | `WalletHoldings` — on-chain balances, valued and never counted as trading equity |
 | POST | `/api/wallet/sign-dry-run` | Body `{ "passphrase", "envelope", "account"? }` → `DryRunSignature` |
@@ -213,16 +213,54 @@ Errors:
 - `oco_group` links orders one-cancels-the-other. It is enforced by the paper
   venue; the live venues refuse a group they cannot honour instead of pretending
   both orders are protected.
+- `venue` is optional. `paper` (the default) is the neutral placeholder and
+  lets the router choose; naming a live venue pins the order to it.
 
 Response `200`:
 ```json
-{ "approved": true, "order_id": "…", "status": "filled", "fill_price": 142.31, "fee": 0.02, "risk": { … } }
+{ "approved": true, "venue": "paper", "order_id": "…", "status": "filled", "fill_price": 142.31, "fee": 0.02, "risk": { … } }
 ```
+
+`venue` is the venue the router chose. It is `null` only when routing refused
+the order before any venue was selected.
 
 Response `403` (rejected by the risk layer — never overridable):
 ```json
-{ "approved": false, "reason": "position_size_exceeds_max_pct", "detail": "…", "breaker_state": "closed" }
+{ "approved": false, "venue": "binance", "reason": "position_size_exceeds_max_pct", "detail": "…", "risk": { "breaker_state": "closed" } }
 ```
+
+### Multi-venue routing
+
+With `OPENETHER_VENUES=binance,kraken` the engine routes each order across the
+configured venues. The rules, in order:
+
+1. **An explicit venue pins the order.** If the request names a live venue,
+   only that venue is considered.
+2. **Inventory pins the venue.** A symbol that already has a position stays on
+   the venue that holds it — closing on a different exchange would make the
+   one book look flat while leaving a naked position on each venue.
+3. **Only a venue that can place the order is a candidate.** A live venue
+   without a valid arming record is skipped, and so is a venue with no order
+   flow in this build (Hyperliquid); with nothing left, the order is refused
+   rather than simulated.
+4. **The fee-adjusted price decides.** A buy takes the lowest cost after the
+   venue's taker fee, a sell the highest proceeds. A tie keeps the configured
+   order.
+
+The armed per-order cap is applied per venue: a tight Kraken arming does not
+size a Binance order, and a loose one does not widen Binance's.
+
+Routing refusals are ordinary risk rejections (`approved: false`) with these
+reasons:
+
+| Reason | Meaning |
+| --- | --- |
+| `venue_unavailable` | The requested venue is not configured, or the position is held on another venue. |
+| `venue_not_armed` | No venue that could trade the symbol has a valid arming record. |
+| `price_unavailable` | No quote could be obtained for the symbol. |
+
+Orders and fills are matched on `(order_id, venue)`, so two exchanges numbering
+their orders independently can never be confused for each other.
 
 ### `GET /api/orders` and `DELETE /api/orders/{order_id}`
 
@@ -268,10 +306,11 @@ Rules the engine holds itself to:
   cancelled sibling leaves the open list and is retired to `cancelled` after the
   same grace window; the engine cannot see *why* an order left the list, so it
   reports the one fact it has.
-- **Only venue-reported fills are booked.** A fill is matched by `order_id` and
-  deduped by `(ts_ms, qty, price)`, so reconciliation can re-read an overlapping
-  window without double-counting. There is no synthetic-fill fallback: an empty
-  answer means nothing filled.
+- **Only venue-reported fills are booked.** A fill is matched by `order_id`
+  *and* `venue`, and deduped by `(ts_ms, qty, price)`, so reconciliation can
+  re-read an overlapping window without double-counting, and two exchanges that
+  number their orders independently cannot be confused. There is no
+  synthetic-fill fallback: an empty answer means nothing filled.
 - **`status` is an inference, `fills` is a fact.** A fill the venue confirms is
   booked even if the engine had already labelled the order cancelled or filled.
   Dropping it would under-report the exposure the risk layer measures.
@@ -688,25 +727,33 @@ broadcast and wallet code above.
 
 Reports whether the engine is allowed to place real orders, and why not when
 it is not. Live trading needs **both** `OPENETHER_LIVE_TRADING=1` and a valid
-arming record at `OPENETHER_LIVE_ARMING_FILE`. The record is written by the
-`openether-live` CLI; there is no HTTP endpoint that can arm the engine.
+arming record: with `OPENETHER_LIVE_ARMING_DIR` set it is one `<venue>.json`
+per venue, otherwise the single `OPENETHER_LIVE_ARMING_FILE`. The record is
+written by the `openether-live` CLI; there is no HTTP endpoint that can arm the
+engine.
 
 Response `200`:
 ```json
 {
   "live_trading": false,
-  "venue": "paper",
+  "venue": "binance",
   "arming": {
     "live_enabled": false,
     "reason": "live_not_requested",
     "detail": "live trading is off: OPENETHER_LIVE_TRADING is not set. The arming record is valid, but live trading was not requested.",
-    "effective_max_order_notional_usd": 5000.0,
+    "effective_max_order_notional_usd": 500.0,
     "venue": "binance",
     "armed_at_ms": 1700000000000,
     "expires_at_ms": 1700014400000,
     "max_order_notional_usd": 500.0,
     "operator_note": "morning session"
   },
+  "venues": [
+    { "venue": "binance", "live_enabled": false, "reason": "live_not_requested",
+      "detail": "…", "effective_max_order_notional_usd": 500.0 },
+    { "venue": "kraken", "live_enabled": false, "reason": "arming_file_missing",
+      "detail": "…", "effective_max_order_notional_usd": 250.0 }
+  ],
   "onchain": {
     "live_enabled": false,
     "dry_run": true,
@@ -741,9 +788,11 @@ with an RPC url, and `dry_run` must be `false` before a transfer can be signed.
 `effective_max_order_notional_usd` is the per-order cap the risk layer
 enforces: the smaller of the configured cap and the armed cap. While live
 trading is on it is what an oversized order is measured against
-(`notional_too_large`).
+(`notional_too_large`). `venues` reports that same decision for every
+configured venue, each with its own record and cap.
 
-`GET /api/config` carries the same object under `live_arming`.
+`GET /api/config` carries the same object under `live_arming`, and the venue
+list under `venues`.
 
 ### `GET /api/risk/rules`
 
@@ -943,11 +992,18 @@ Errors:
 same amount. `GET /api/risk` reports that same `equity_usd`, and the breaker
 evaluates it on every tick, not only on the periodic account refresh — a mark
 that breaches the drawdown or daily-loss limit halts trading immediately. The
-venue's own account snapshot re-anchors equity every few seconds.
+venues' account snapshots re-anchor equity every few seconds.
 
-`cash_usd` is the venue's **free** balance. On a margin venue that is equity
-minus locked margin minus unrealized PnL, so `cash_usd + unrealized_pnl_usd` is
-not equity.
+With more than one venue, `equity_usd` and `cash_usd` are the sums of every
+venue's account and only re-anchor when **every** venue answered; a silent
+venue keeps the marked book instead of pretending its account is zero. Each
+position carries the `venue` that holds it, and its mark comes from that venue's
+ticks alone — a quote from an exchange that holds none of the position cannot
+move its value.
+
+`cash_usd` is the venues' combined **free** balance. On a margin venue that is
+equity minus locked margin minus unrealized PnL, so `cash_usd +
+unrealized_pnl_usd` is not equity.
 
 ## Risk state
 

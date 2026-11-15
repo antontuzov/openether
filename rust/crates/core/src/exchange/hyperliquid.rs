@@ -501,6 +501,11 @@ impl ExchangeConnector for HyperliquidConnector {
         Venue::Hyperliquid
     }
 
+    fn taker_fee_bps(&self) -> f64 {
+        // Base-tier perp taker fee.
+        4.5
+    }
+
     async fn health(&self) -> ExchangeResult<()> {
         self.post_info(json!({ "type": "allMids" }))
             .await

@@ -258,6 +258,7 @@ where
                 current_position_qty: shadow_qty,
                 price: bar.close,
                 contracts: Vec::new(),
+                max_order_notional_usd: None,
             };
             let verdict = risk.evaluate_at(&request, &risk_ctx, bar.ts_ms);
             if verdict.breaker_state == BreakerState::Open && breaker_state != BreakerState::Open {

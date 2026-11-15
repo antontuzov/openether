@@ -542,17 +542,20 @@ to trade live"* — on its own it arms nothing and the core stays on paper.
 Two things are needed, and the core refuses to trade unless **both** are true:
 
 1. `OPENETHER_LIVE_TRADING=1` — the operator asks for live trading.
-2. A valid **arming record** at `OPENETHER_LIVE_ARMING_FILE` — the operator
-   proves they meant it.
+2. A valid **arming record** — the operator proves they meant it. Point
+   `OPENETHER_LIVE_ARMING_DIR` at a directory and each venue gets its own
+   `<venue>.json`; the older single-file `OPENETHER_LIVE_ARMING_FILE` still
+   works for one venue.
 
 The record is written by the `openether-live` CLI, never over HTTP. Run this
-from the repository root and use an absolute path for the record, so the CLI
-and the core agree on where it is:
+from the repository root and use absolute paths for the records, so the CLI
+and the core agree on where they are:
 
 ```bash
 cargo build --release --manifest-path rust/Cargo.toml
 
-export OPENETHER_LIVE_ARMING_FILE="$PWD/data/live-arming.json"
+mkdir -p "$PWD/data/arming"
+export OPENETHER_LIVE_ARMING_DIR="$PWD/data/arming"
 
 # See what the core would do right now.
 ./rust/target/release/openether-live status
@@ -576,7 +579,7 @@ The arming is a record, not a permission slip you can copy around:
 
 | Property | Rule |
 | --- | --- |
-| Venue | The record names one venue. The core must run on that venue. |
+| Venue | The record names one venue, and lives in that venue's own file. A record written for Kraken cannot arm Binance. |
 | Expiry | It expires (default 4 hours, maximum 30 days). |
 | Config binding | It carries a SHA-256 digest of the risk configuration it was written against. Change a limit and the arming is stale. |
 | Direction | It may only *tighten* the per-order cap. Raising it above the risk layer's cap is refused. |
@@ -594,13 +597,63 @@ risk layer's cap and the armed cap, so it can only ever tighten.
 So the full sequence to trade live is: set the risk configuration first, then
 arm, then start the core. Re-order those and the arming is stale on purpose.
 
+### Trading on more than one venue
+
+`OPENETHER_VENUES=binance,kraken` lets one engine route orders across several
+venues. `OPENETHER_VENUE` still configures a single one; the first venue in
+the list is the book's headline venue.
+
+Arming stays per venue — one record per venue in the same directory — and only
+the venues you arm can receive an order:
+
+```bash
+export OPENETHER_VENUES=binance,kraken
+printf 'I UNDERSTAND THIS SENDS REAL ORDERS\n' | \
+  ./rust/target/release/openether-live arm --venue binance --max-notional 500 --hours 4
+printf 'I UNDERSTAND THIS SENDS REAL ORDERS\n' | \
+  ./rust/target/release/openether-live arm --venue kraken --max-notional 250 --hours 4
+```
+
+The router then decides where each order goes:
+
+- **An explicit venue pins the order.** A request that names a live venue goes
+  there; `paper` is the neutral placeholder and lets the router choose.
+- **The fee-adjusted price wins.** A buy goes to the venue with the lowest
+  price after its taker fee, a sell to the venue that pays the most after it.
+  A tie keeps the configured order.
+- **Inventory is pinned.** The first fill on a symbol remembers which venue
+  holds it, and every later order for that symbol — above all the close — goes
+  back to the same venue. The engine keeps one book per symbol, so netting a
+  long on one exchange against a short on another would look flat while leaving
+  two naked positions.
+- **An unarmed venue is never routed to**, however good its quote. If nothing
+  that can trade the symbol is armed, the order is refused
+  (`venue_not_armed`) rather than quietly simulated. Hyperliquid is never
+  routed to either — it has no order flow in this build.
+- **The armed cap is per venue.** Kraken's $250 cap does not loosen Binance's
+  $500, and both are applied by the risk layer before the order leaves.
+- **Equity is the sum.** `equity_usd` and `cash_usd` add up every venue's
+  account; the headline number only moves when every venue answered, and a
+  position is marked by the venue that holds it.
+- **Reconciliation is per venue.** Orders and fills are matched on
+  `(order_id, venue)`, so two exchanges numbering their orders independently
+  can never confuse one order for the other.
+- **Paper cannot be combined with a live venue.** The paper venue fills
+  instantly from its own feed, and booking a simulated fill into the same
+  position as a real one would be a lie the risk layer cannot see. The core
+  refuses to start with `paper` in a multi-venue list.
+
+The book is still one book: `GET /api/portfolio` shows each position under the
+venue that holds it, and `GET /api/venues` reports each venue's health, whether
+it is armed, and its effective cap.
+
 ### When the core refuses
 
 `GET /api/live` reports the decision and the reason:
 
 | Reason | Meaning |
 | --- | --- |
-| `arming_file_unset` | `OPENETHER_LIVE_ARMING_FILE` is not set. |
+| `arming_file_unset` | Neither `OPENETHER_LIVE_ARMING_DIR` nor `OPENETHER_LIVE_ARMING_FILE` is set. |
 | `arming_file_missing` | The path is set but there is no record. |
 | `arming_file_unreadable` | The record cannot be read or parsed. |
 | `arming_version_unsupported` | The record was written by a different build. |
@@ -609,6 +662,12 @@ arm, then start the core. Re-order those and the arming is stale on purpose.
 | `arming_expired` | The record ran out. |
 | `arming_config_changed` | A risk limit changed after the arming was written. |
 | `live_not_requested` | The record is valid but `OPENETHER_LIVE_TRADING` is not set. |
+
+`/api/live` reports this per venue under `venues`. Routing refusals are a
+verdict on one order instead (`SubmitOutcome.reason`): `venue_not_armed` (no
+venue that can trade the symbol is armed), `venue_unavailable` (the position is
+held on a venue the core does not connect to) and `price_unavailable` (no quote
+for the symbol).
 
 While live trading is armed, the armed cap is what the risk layer enforces — it
 is not an advisory number. An order above it is refused with
@@ -1050,10 +1109,12 @@ Copy `.env.example` to `.env`. The important defaults:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `OPENETHER_LIVE_TRADING` | `0` | asks for real orders; needs an arming record too |
-| `OPENETHER_LIVE_ARMING_FILE` | *(empty)* | path to the arming record written by `openether-live arm` |
+| `OPENETHER_LIVE_ARMING_DIR` | *(empty)* | directory holding one `<venue>.json` arming record per venue |
+| `OPENETHER_LIVE_ARMING_FILE` | *(empty)* | a single arming record; used when no directory is set |
 | `OPENETHER_ADMIN_TOKEN` | *(empty)* | bearer token for the mutation endpoints; required once armed |
 | `OPENETHER_ALERT_WEBHOOK` | *(empty)* | URL that receives breaker open/reset alerts |
 | `OPENETHER_VENUE` | `paper` | `paper` / `binance` / `kraken` / `hyperliquid` (read-only) |
+| `OPENETHER_VENUES` | *(unset)* | comma list of venues to route across; supersedes `OPENETHER_VENUE` |
 | `OPENETHER_WALLET_DRY_RUN` | `1` | `0` allows live signing; still needs the on-chain arming |
 | `OPENETHER_BROADCAST_MAX_FEE_PER_GAS_WEI` | `200000000000` | most wei per gas the core will ever pay |
 | `SOLANA_RPC_URL` / `ETHEREUM_RPC_URL` / `BASE_RPC_URL` | public nodes | the networks a live transfer can reach |

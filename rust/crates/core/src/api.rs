@@ -152,6 +152,7 @@ async fn config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let cfg = &state.config;
     Json(serde_json::json!({
         "venue": cfg.venue.as_str(),
+        "venues": venue_armings_json(cfg),
         "live_trading": cfg.live_trading,
         "live_arming": live_arming_json(&cfg.live_arming),
         "onchain_live": cfg.onchain_live,
@@ -189,6 +190,9 @@ async fn live_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
         "live_trading": cfg.live_trading,
         "venue": cfg.venue.as_str(),
         "arming": live_arming_json(&cfg.live_arming),
+        // One record per venue: a venue's arming says nothing about another's,
+        // so each is reported with its own cap and refusal reason.
+        "venues": venue_armings_json(cfg),
         // The wallet is armed separately: a venue record does not move coins.
         "onchain": {
             "live_enabled": cfg.onchain_live,
@@ -202,6 +206,26 @@ async fn live_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
             "gas_ceiling_wei": cfg.broadcast_max_fee_per_gas_wei.to_string(),
         },
     }))
+}
+
+/// Every configured venue with its own arming state.
+///
+/// The connector's quote is what routing compares; the arming decides whether
+/// a routed order may actually leave the process.
+fn venue_armings_json(cfg: &crate::config::Config) -> Vec<serde_json::Value> {
+    cfg.venues
+        .iter()
+        .map(|venue| {
+            let state = cfg.venue_arming(*venue);
+            serde_json::json!({
+                "venue": venue.as_str(),
+                "live_enabled": state.is_some_and(|s| s.live_enabled),
+                "reason": state.and_then(|s| s.reason),
+                "detail": state.and_then(|s| s.detail.clone()),
+                "effective_max_order_notional_usd": cfg.armed_cap(*venue),
+            })
+        })
+        .collect()
 }
 
 /// The arming state as plain JSON.
@@ -639,17 +663,18 @@ async fn reset_breaker(
 
 async fn venues(State(state): State<Arc<AppState>>) -> Json<Vec<serde_json::Value>> {
     let mut out = Vec::new();
-    for venue in Venue::ALL {
-        let healthy = if venue == state.venue() {
-            state.connector.health().await.is_ok()
-        } else {
-            false
+    for venue in &state.config.venues {
+        let connector = state.connector_for(*venue);
+        let healthy = match connector.as_ref() {
+            Some(connector) => connector.health().await.is_ok(),
+            None => false,
         };
         out.push(serde_json::json!({
             "venue": venue.as_str(),
             "healthy": healthy,
-            "live": state.config.live_trading && venue != Venue::Paper,
-            "active": venue == state.venue(),
+            "live": state.config.is_live(*venue) && *venue != Venue::Paper,
+            "active": *venue == state.venue(),
+            "max_order_notional_usd": state.config.armed_cap(*venue),
         }));
     }
     Json(out)

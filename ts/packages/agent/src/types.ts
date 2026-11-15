@@ -65,6 +65,8 @@ export interface SubmitOutcome {
   reason: string;
   detail: string;
   order_id?: string;
+  /** The venue the router chose; absent when routing refused the order. */
+  venue?: string;
   status?: string;
   fill_price?: number;
   fee?: number;
@@ -78,6 +80,8 @@ export interface PortfolioPosition {
   mark_price: number;
   unrealized_pnl: number;
   notional_usd: number;
+  /** The venue that holds the inventory. */
+  venue: string;
 }
 
 export interface PortfolioSnapshot {

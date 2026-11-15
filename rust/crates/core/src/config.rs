@@ -9,12 +9,23 @@ use std::path::PathBuf;
 pub struct Config {
     pub host: String,
     pub port: u16,
+    /// The venue the book is reported under: the first configured venue.
     pub venue: Venue,
+    /// Every venue this process may route an order to, in preference order.
+    ///
+    /// Routing picks the better price, not the list order; the order only
+    /// decides a tie. The paper venue cannot be mixed with live venues.
+    pub venues: Vec<Venue>,
     pub symbols: Vec<String>,
     pub live_trading: bool,
     /// Why live trading is on or off. The core refuses to trade live unless
     /// the arming ceremony succeeded.
     pub live_arming: LiveArmingState,
+    /// The arming state of every configured venue.
+    ///
+    /// Arming is per venue: a record that arms Binance does not arm Kraken, and
+    /// the router will not send Kraken an order until its own record exists.
+    pub live_armings: Vec<VenueArming>,
     /// Why on-chain transfers are on or off. The wallet has its own arming
     /// record: arming a venue does not arm the wallet.
     pub onchain_arming: LiveArmingState,
@@ -53,6 +64,13 @@ pub struct Config {
     pub admin_auth: AdminAuth,
     /// Where breaker events are pushed. `None` disables the webhook.
     pub alert_webhook: Option<String>,
+}
+
+/// The arming state of one venue.
+#[derive(Debug, Clone)]
+pub struct VenueArming {
+    pub venue: Venue,
+    pub state: LiveArmingState,
 }
 
 /// Wallet configuration.
@@ -99,22 +117,29 @@ impl Default for WalletConfig {
 
 impl Config {
     pub fn from_env() -> Self {
-        let venue = std::env::var("OPENETHER_VENUE")
-            .ok()
-            .and_then(|v| Venue::parse(&v))
-            .unwrap_or(Venue::Paper);
+        let venues = configured_venues();
+        // The book is reported under the primary venue: the first one asked
+        // for. `OPENETHER_VENUE` on its own is a one-venue process.
+        let venue = venues[0];
 
         let symbols = env_list("OPENETHER_SYMBOLS", &["SOL/USDT", "BTC/USDT", "ETH/USDT"]);
         let allowlist = env_list(
             "OPENETHER_SYMBOL_ALLOWLIST",
             &["SOL/USDT", "BTC/USDT", "ETH/USDT"],
         );
-        let venue_allowlist = env_list("OPENETHER_VENUE_ALLOWLIST", &["paper"])
-            .iter()
-            .filter_map(|v| Venue::parse(v))
-            .collect();
+        // A configured venue is intended to be tradable: default the risk
+        // layer's allowlist to the configured venues so a two-venue setup does
+        // not have half its orders refused as `venue_not_allowed`. An explicit
+        // list still wins, and then it must name the venue.
+        let venue_allowlist = match std::env::var("OPENETHER_VENUE_ALLOWLIST") {
+            Ok(raw) if !raw.trim().is_empty() => raw
+                .split(',')
+                .filter_map(|v| Venue::parse(v.trim()))
+                .collect(),
+            _ => venues.iter().copied().collect(),
+        };
 
-        let mut risk = RiskConfig {
+        let risk = RiskConfig {
             max_position_pct_of_equity: env_f64("OPENETHER_MAX_POSITION_PCT", 20.0),
             max_gross_exposure_pct: env_f64("OPENETHER_MAX_GROSS_EXPOSURE_PCT", 60.0),
             max_daily_loss_pct: env_f64("OPENETHER_MAX_DAILY_LOSS_PCT", 3.0),
@@ -141,12 +166,20 @@ impl Config {
 
         // The arming record decides whether live trading may run. The
         // environment variable only asks for it; the record is the proof.
-        let live_arming = crate::live_arm::evaluate(venue, &risk);
-        if live_arming.live_enabled {
-            // An arming may only tighten the per-order cap, never raise it.
-            risk.max_order_notional_usd = live_arming.effective_max_order_notional_usd;
-        }
-        let live_trading = live_arming.live_enabled;
+        // Each venue is decided from its own record, so one record can never
+        // arm two exchanges.
+        let live_armings: Vec<VenueArming> = venues
+            .iter()
+            .map(|venue| VenueArming {
+                venue: *venue,
+                state: crate::live_arm::evaluate(*venue, &risk),
+            })
+            .collect();
+        let live_arming = live_armings
+            .first()
+            .map(|arming| arming.state.clone())
+            .unwrap_or_else(|| crate::live_arm::evaluate(Venue::Paper, &risk));
+        let live_trading = live_armings.iter().any(|arming| arming.state.live_enabled);
         // Separate record, separate decision. The wallet's cap is measured in
         // dollars of the coin being moved, priced at broadcast time.
         let onchain_arming = crate::live_arm::evaluate_onchain(&risk);
@@ -156,9 +189,11 @@ impl Config {
             host: std::env::var("CORE_HOST").unwrap_or_else(|_| "0.0.0.0".into()),
             port: env_u16("CORE_PORT", 8080),
             venue,
+            venues,
             symbols,
             live_trading,
             live_arming,
+            live_armings,
             onchain_arming,
             onchain_live,
             risk,
@@ -233,6 +268,38 @@ impl Config {
         format!("{}:{}", self.host, self.port)
     }
 
+    /// The arming state of one venue, when the venue is configured.
+    pub fn venue_arming(&self, venue: Venue) -> Option<&LiveArmingState> {
+        self.live_armings
+            .iter()
+            .find(|arming| arming.venue == venue)
+            .map(|arming| &arming.state)
+    }
+
+    /// Whether an order routed to `venue` may reach a real exchange.
+    ///
+    /// The paper venue is always allowed: it is simulated, so there is nothing
+    /// to arm.
+    pub fn is_live(&self, venue: Venue) -> bool {
+        venue == Venue::Paper
+            || self
+                .venue_arming(venue)
+                .is_some_and(|state| state.live_enabled)
+    }
+
+    /// The largest single order the risk layer may approve at `venue`.
+    ///
+    /// The configured cap is global; an arming may tighten it for its own
+    /// venue and can never raise it.
+    pub fn armed_cap(&self, venue: Venue) -> f64 {
+        match self.venue_arming(venue) {
+            Some(state) if state.live_enabled => state
+                .effective_max_order_notional_usd
+                .min(self.risk.max_order_notional_usd),
+            _ => self.risk.max_order_notional_usd,
+        }
+    }
+
     /// Refuse to serve real money without a token guarding the routes that can
     /// loosen the risk layer.
     ///
@@ -241,6 +308,13 @@ impl Config {
     /// `POST /api/breaker/reset` would undo the halt that protects capital, so
     /// the safe configuration becomes mandatory instead of advisory.
     pub fn check_serve_safety(&self) -> Result<(), String> {
+        if self.venues.len() > 1 && self.venues.contains(&Venue::Paper) {
+            return Err(
+                "the paper venue cannot be combined with live venues: a simulated \
+                 fill would be booked into the same position as a real one"
+                    .into(),
+            );
+        }
         let armed = self.live_trading || self.onchain_live;
         if armed && !self.admin_auth.enabled() {
             return Err(
@@ -252,6 +326,33 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// The venues this process may trade, in preference order.
+///
+/// `OPENETHER_VENUES` is a comma-separated list and supersedes
+/// `OPENETHER_VENUE`; on its own, `OPENETHER_VENUE` names the single venue.
+/// Unknown names are dropped, duplicates collapse, and a process always has at
+/// least one venue.
+fn configured_venues() -> Vec<Venue> {
+    let raw = std::env::var("OPENETHER_VENUES").unwrap_or_default();
+    let mut venues: Vec<Venue> = if raw.trim().is_empty() {
+        let venue = std::env::var("OPENETHER_VENUE")
+            .ok()
+            .and_then(|v| Venue::parse(&v))
+            .unwrap_or(Venue::Paper);
+        vec![venue]
+    } else {
+        raw.split(',')
+            .filter_map(|v| Venue::parse(v.trim()))
+            .collect()
+    };
+    let mut seen = HashSet::new();
+    venues.retain(|venue| seen.insert(*venue));
+    if venues.is_empty() {
+        venues.push(Venue::Paper);
+    }
+    venues
 }
 
 fn env_flag(key: &str) -> bool {
@@ -354,5 +455,58 @@ mod tests {
             config.check_serve_safety().is_err(),
             "an armed wallet is real money too"
         );
+    }
+
+    #[test]
+    fn the_paper_venue_cannot_share_a_book_with_a_live_venue() {
+        let mut config = Config::from_env();
+        config.admin_auth = AdminAuth::new(Some("operator-token".into()));
+        config.venues = vec![Venue::Paper, Venue::Kraken];
+        let refused = config.check_serve_safety().unwrap_err();
+        assert!(refused.contains("paper venue"), "{refused}");
+
+        // Either venue on its own is fine.
+        config.venues = vec![Venue::Kraken];
+        assert!(config.check_serve_safety().is_ok());
+        config.venues = vec![Venue::Paper];
+        assert!(config.check_serve_safety().is_ok());
+    }
+
+    #[test]
+    fn only_an_armed_venue_is_live_and_its_cap_tightens() {
+        let mut config = Config::from_env();
+        let mut armed = crate::live_arm::LiveArmingState::not_armed("test", "armed for the test");
+        armed.live_enabled = true;
+        armed.reason = None;
+        armed.detail = None;
+        armed.effective_max_order_notional_usd = 50.0;
+        config.live_armings = vec![
+            VenueArming {
+                venue: Venue::Binance,
+                state: armed,
+            },
+            VenueArming {
+                venue: Venue::Kraken,
+                state: crate::live_arm::LiveArmingState::not_armed("test", "not armed"),
+            },
+        ];
+        config.risk.max_order_notional_usd = 5_000.0;
+
+        assert!(config.is_live(Venue::Binance));
+        assert!(!config.is_live(Venue::Kraken));
+        assert!(
+            config.is_live(Venue::Paper),
+            "the simulated venue has nothing to arm"
+        );
+        assert_eq!(config.armed_cap(Venue::Binance), 50.0);
+        assert_eq!(
+            config.armed_cap(Venue::Kraken),
+            5_000.0,
+            "an unarmed venue falls back to the configured cap"
+        );
+
+        // The armed cap can only ever tighten the configured one.
+        config.risk.max_order_notional_usd = 20.0;
+        assert_eq!(config.armed_cap(Venue::Binance), 20.0);
     }
 }
