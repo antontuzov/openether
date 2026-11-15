@@ -935,6 +935,20 @@ Errors:
 | 409 | `backtest_strategy_not_loaded` | no WASM strategy is loaded |
 | 500 | `backtest_strategy_error` | the strategy failed on a bar; the message names the bar and timestamp |
 
+## Portfolio state
+
+`GET /api/portfolio` returns one snapshot whose numbers agree with each other:
+`equity_usd` is marked with the same prices that set each position's
+`mark_price`, so a tick that moves `unrealized_pnl` moves the headline by the
+same amount. `GET /api/risk` reports that same `equity_usd`, and the breaker
+evaluates it on every tick, not only on the periodic account refresh — a mark
+that breaches the drawdown or daily-loss limit halts trading immediately. The
+venue's own account snapshot re-anchors equity every few seconds.
+
+`cash_usd` is the venue's **free** balance. On a margin venue that is equity
+minus locked margin minus unrealized PnL, so `cash_usd + unrealized_pnl_usd` is
+not equity.
+
 ## Risk state
 
 ```json

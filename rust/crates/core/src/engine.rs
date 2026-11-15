@@ -224,6 +224,10 @@ struct DataStore {
     lots: HashMap<String, Vec<Lot>>,
     realized_pnl: f64,
     equity_usd: f64,
+    /// Whether `equity_usd` came from the venue or a persisted run rather than
+    /// the configured starting balance. Until it does, marks must not feed the
+    /// risk layer: anchoring its peak to a guess would invent a drawdown.
+    equity_anchored: bool,
     cash_usd: f64,
     open_orders: Vec<OpenOrder>,
     /// Orders the engine submitted, with the fills the venue has confirmed.
@@ -460,6 +464,7 @@ impl AppState {
                 data.equity_usd = p.equity_usd;
                 data.cash_usd = p.cash_usd;
                 data.realized_pnl = p.realized_pnl;
+                data.equity_anchored = true;
             }
             for p in &positions {
                 data.position_qty.insert(p.symbol.clone(), p.qty);
@@ -1659,6 +1664,10 @@ impl AppState {
         let mut data = self.lock_data();
         let symbol = fill.symbol.clone();
         let prev_qty = data.position_qty.get(&symbol).copied().unwrap_or(0.0);
+        let prev_avg = data.avg_entry.get(&symbol).copied().unwrap_or(0.0);
+        // The mark stays the market's, not the fill's: the venue values the
+        // position at the market price, and slippage is a cost, not a mark.
+        let prev_mark = data.last_prices.get(&symbol).copied().unwrap_or(fill.price);
         let new_qty = prev_qty + signed_qty;
 
         // FIFO: the part of the fill that closes the old side consumes the
@@ -1692,8 +1701,17 @@ impl AppState {
         data.position_qty.insert(symbol.clone(), new_qty);
         data.avg_entry.insert(symbol.clone(), new_avg);
         data.lots.insert(symbol, lots);
-        data.last_prices.insert(fill.symbol.clone(), fill.price);
-        data.equity_usd -= fill.fee;
+        // A first fill has no mark to keep; it seeds one.
+        data.last_prices
+            .entry(fill.symbol.clone())
+            .or_insert(fill.price);
+        // Equity is cash plus the book at its marks. A fill realizes PnL that
+        // was already marked in, charges a fee, and re-bases the position, so
+        // the snapshot only moves by the fee and by any gap between the mark
+        // and the fill.
+        let old_unrealized = prev_qty * (prev_mark - prev_avg);
+        let new_unrealized = new_qty * (prev_mark - new_avg);
+        data.equity_usd += realized - fill.fee + new_unrealized - old_unrealized;
 
         let record = TradeRecord {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1747,13 +1765,32 @@ impl AppState {
         // and the correlation cap are risk inputs, not dashboard data.
         self.risk
             .observe_price(&tick.symbol, tick.price, tick.ts_ms);
-        let mut data = self.lock_data();
-        data.last_prices.insert(tick.symbol.clone(), tick.price);
-        if data.ticks.len() >= MAX_TICKS {
-            data.ticks.pop_front();
+        let (equity, anchored) = {
+            let mut data = self.lock_data();
+            let previous = data.last_prices.insert(tick.symbol.clone(), tick.price);
+            // The snapshot renders the position rows at this mark, so the
+            // headline equity has to move with them. Without this, one
+            // response shows a position up $20 next to an unchanged equity.
+            if let Some(previous) = previous {
+                if previous > 0.0 && previous != tick.price {
+                    let qty = data.position_qty.get(&tick.symbol).copied().unwrap_or(0.0);
+                    data.equity_usd += (tick.price - previous) * qty;
+                }
+            }
+            if data.ticks.len() >= MAX_TICKS {
+                data.ticks.pop_front();
+            }
+            data.ticks.push_back(tick.clone());
+            (data.equity_usd, data.equity_anchored)
+        };
+        // The breaker watches the marked book, not only the periodic account
+        // refresh: a mark that halves between refreshes is exactly the
+        // drawdown the halt exists for. Before the venue has been heard from,
+        // the starting balance is a guess and must not anchor a peak.
+        if anchored {
+            self.risk.update_equity(equity, tick.ts_ms);
+            self.note_breaker(self.risk.breaker_state());
         }
-        data.ticks.push_back(tick.clone());
-        drop(data);
         self.bus.publish(Event::Tick(tick));
     }
 
@@ -1764,6 +1801,7 @@ impl AppState {
                     let mut data = self.lock_data();
                     data.equity_usd = account.equity_usd;
                     data.cash_usd = account.free_usd;
+                    data.equity_anchored = true;
                 }
                 self.risk.update_equity(account.equity_usd, account.ts_ms);
                 self.note_breaker(self.risk.breaker_state());
@@ -2507,6 +2545,77 @@ mod tests {
             (position.avg_entry - 120.0).abs() < 1e-9,
             "{}",
             position.avg_entry
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_tick_moves_the_headline_equity_with_its_position_rows() {
+        let (dir, db) = temp_db();
+        let paper = quiet_paper();
+        paper.set_price("SOL/USDT", 100.0);
+        let state = AppState::with_connector(config_with_db(&db), paper.clone()).unwrap();
+        state.refresh_account().await;
+        fill(&state, "SOL/USDT", Side::Buy, 2.0).await;
+
+        let before = state.portfolio();
+        state.record_tick(MarketTick {
+            venue: Venue::Paper,
+            symbol: "SOL/USDT".into(),
+            price: 110.0,
+            size: 0.0,
+            ts_ms: now_ms(),
+        });
+        let after = state.portfolio();
+
+        assert!((after.positions[0].mark_price - 110.0).abs() < 1e-9);
+        let gain = after.unrealized_pnl_usd - before.unrealized_pnl_usd;
+        assert!((gain - 20.0).abs() < 1e-9, "{gain}");
+        assert!(
+            (after.equity_usd - before.equity_usd - gain).abs() < 1e-9,
+            "one snapshot cannot show a ${gain} position gain next to \
+             equity moving by {}",
+            after.equity_usd - before.equity_usd
+        );
+        assert!(
+            (state.risk_state().equity_usd - after.equity_usd).abs() < 1e-9,
+            "the risk panel must read the same equity as the portfolio"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_crashing_mark_trips_the_breaker_between_account_refreshes() {
+        let (dir, db) = temp_db();
+        let paper = quiet_paper();
+        paper.set_price("SOL/USDT", 100.0);
+        let state = AppState::with_connector(config_with_db(&db), paper.clone()).unwrap();
+        state.refresh_account().await;
+        fill(&state, "SOL/USDT", Side::Buy, 19.0).await;
+        assert_eq!(
+            state.risk_state().breaker_state,
+            BreakerState::Closed,
+            "19% of equity is inside the position cap and must not trip"
+        );
+
+        // No account refresh in between: the halt has to come from the mark.
+        state.record_tick(MarketTick {
+            venue: Venue::Paper,
+            symbol: "SOL/USDT".into(),
+            price: 1.0,
+            size: 0.0,
+            ts_ms: now_ms(),
+        });
+
+        let risk = state.risk_state();
+        assert_eq!(risk.breaker_state, BreakerState::Open);
+        assert!(
+            risk.breaker_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("drawdown"),
+            "{}",
+            risk.breaker_reason.unwrap_or_default()
         );
         std::fs::remove_dir_all(&dir).ok();
     }

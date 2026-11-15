@@ -213,7 +213,7 @@ a strategy of your own.
 ### Tests
 
 ```bash
-cargo test --workspace --manifest-path rust/Cargo.toml   # 280 tests
+cargo test --workspace --manifest-path rust/Cargo.toml   # 282 tests
 pnpm --dir ts -r test                                    # 133 tests
 pnpm --dir ts -r typecheck
 pnpm --dir ts -r build
@@ -340,6 +340,15 @@ ring buffer exposed at `GET /api/risk/decisions`.
 
 An order that breaks the position cap also opens the breaker, so a single
 oversized order halts trading instead of being refused once.
+
+The breaker watches the **marked** book, not only the periodic account refresh.
+Every tick moves the headline equity by the same amount it moves the position
+rows it is computed from, and feeds that equity to the risk layer, so one
+`/api/portfolio` response cannot show a position up $20 next to an unchanged
+equity. A mark that halves between two refreshes is exactly the drawdown the
+halt exists for. The venue's own account snapshot re-anchors both numbers every
+few seconds, and until the first one arrives the configured starting balance
+does not anchor a peak.
 
 ### The browser simulation
 
@@ -1092,7 +1101,7 @@ require it; the reads stay open.
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **280 passing**, including the encrypted keystore,
+- `cargo test --workspace` — **282 passing**, including the encrypted keystore,
   EVM and Solana dry-run signing, live signing recovered against the wallet
   address, signature tampering, wrong-passphrase rejection, and the API
   refusing to sign when dry run is off. The broadcaster suite covers EIP-1559
@@ -1154,6 +1163,12 @@ Checked locally on macOS (arm64):
   `breaker_opened` alert and no repeat while open, a tokened reset closing the
   breaker and alerting it, a restart restoring the position, basis, equity and
   journal, and a post-restart round trip costing exactly two fees.
+- The portfolio snapshot proved consistent with itself: a tick from 100 to 110
+  on a 2 SOL position moved the position's unrealized by exactly 20 and the
+  headline equity by exactly the same 20, with `GET /api/risk` reporting the
+  same equity; a 99% mark crash on a 19%-of-equity position between two account
+  refreshes opened the breaker with a drawdown reason, so the halt does not
+  wait for the five-second refresh.
 - The risk contract proven to be shared: the Rust risk layer and the browser
   simulator were driven side by side and refused the same orders with the same
   reason codes — `notional_too_small`, `notional_too_large`,
