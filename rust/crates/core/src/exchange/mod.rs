@@ -46,6 +46,19 @@ pub struct OpenOrder {
     pub ts_ms: i64,
 }
 
+/// A position a venue can hand back after a restart.
+///
+/// `lots` is the FIFO queue of open purchases, oldest first, each entry
+/// `(qty, price)`. A venue that only knows its average entry hands back an
+/// empty queue and the engine rebuilds one lot from `avg_entry`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoredPosition {
+    pub symbol: String,
+    pub qty: f64,
+    pub avg_entry: f64,
+    pub lots: Vec<(f64, f64)>,
+}
+
 /// A venue account captured for persistence and handed back after a restart.
 ///
 /// A live venue keeps its balances on the exchange and re-reports them on
@@ -57,8 +70,7 @@ pub struct AccountRestore {
     /// against open positions.
     pub cash_usd: f64,
     pub realized_pnl: f64,
-    /// Symbol, signed quantity and average entry price.
-    pub positions: Vec<(String, f64, f64)>,
+    pub positions: Vec<RestoredPosition>,
 }
 
 /// Unified connector surface for every venue (CEX spot/perps and the paper simulator).

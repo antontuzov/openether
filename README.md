@@ -213,8 +213,8 @@ a strategy of your own.
 ### Tests
 
 ```bash
-cargo test --workspace --manifest-path rust/Cargo.toml   # 275 tests
-pnpm --dir ts -r test                                    # 129 tests
+cargo test --workspace --manifest-path rust/Cargo.toml   # 280 tests
+pnpm --dir ts -r test                                    # 133 tests
 pnpm --dir ts -r typecheck
 pnpm --dir ts -r build
 ```
@@ -355,6 +355,14 @@ rather than spending cash. Only fees and realised PnL move the wallet balance.
 The browser engine mirrors this exactly — buying $1,000 of SOL costs you the
 fee, not $1,000 of equity.
 
+Closing fills consume **FIFO tax lots**. Each fill adds a lot; a sell closes
+the oldest lots first and books `qty × (fill − lot price)` per lot, so realised
+PnL and the remaining cost basis use the actual prices that were paid, not an
+average. The engine, the paper venue and the browser simulator all run the
+same rule, and the lots survive a restart in SQLite (`position_lots`). A book
+restored from a venue that reports only an average entry gets one synthetic
+lot at that average — the only honest reconstruction of its basis.
+
 ### Durable state
 
 The core keeps its risk-relevant state in a SQLite database so a restart is not
@@ -365,9 +373,9 @@ writes there:
 OPENETHER_STATE_DB=./data/openether.db
 ```
 
-It stores the portfolio (equity, cash, realised P&L), the open positions, the
-full trade journal, the open orders, the client-order-id → venue-order-id
-mapping, and the circuit-breaker state.
+It stores the portfolio (equity, cash, realised P&L), the open positions with
+their FIFO lots, the full trade journal, the open orders, the client-order-id →
+venue-order-id mapping, and the circuit-breaker state.
 
 Three details matter:
 
@@ -1055,7 +1063,7 @@ require it; the reads stay open.
 
 Checked locally on macOS (arm64):
 
-- `cargo test --workspace` — **275 passing**, including the encrypted keystore,
+- `cargo test --workspace` — **280 passing**, including the encrypted keystore,
   EVM and Solana dry-run signing, live signing recovered against the wallet
   address, signature tampering, wrong-passphrase rejection, and the API
   refusing to sign when dry run is off. The broadcaster suite covers EIP-1559
@@ -1104,7 +1112,7 @@ Checked locally on macOS (arm64):
   same accounts.
 - `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings`
   — clean, so the CI gate passes as written.
-- `pnpm -r test` — **129 passing** across the agent guard and verify loop, the
+- `pnpm -r test` — **133 passing** across the agent guard and verify loop, the
   data server, the browser trading engine and the order accounting.
 - `pnpm -r typecheck` and `pnpm -r build` — clean.
 - The risk contract proven to be shared: the Rust risk layer and the browser
@@ -1158,6 +1166,14 @@ Checked locally on macOS (arm64):
   position, the fee-charged equity, the locked margin, the trade journal, the
   client-order-id mapping and the risk anchors all came back. A second run
   against the same file refused an order that the position cap had to refuse.
+- FIFO tax lots exercised through all three books: the paper venue closed the
+  oldest lot first and a fill that crossed zero re-opened at the fill price;
+  the engine bought 1 SOL at 100 and 1 at 120, then selling 1 at 130 realised
+  **30** (a blended average would say 20) and left the 120 lot as the basis;
+  a restart against the same SQLite file still realised 30, so the lot order
+  survives; and the browser simulator reproduced the 60/120 result, migrated
+  a pre-lots saved book to a single lot at its average, and cleared every lot
+  on a full close.
 - The order lifecycle driven through a scripted venue that answers the way a
   real exchange does: a resting limit order books **nothing**; a paper limit
   order fills only when the price crosses it, at the limit price; a partial

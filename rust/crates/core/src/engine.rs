@@ -5,12 +5,14 @@ use crate::broadcast::{
 };
 use crate::bus::{Event, EventBus, StatusEvent};
 use crate::config::Config;
-use crate::exchange::{AccountRestore, ExchangeConnector, ExchangeError, OpenOrder, TickSink};
+use crate::exchange::{
+    AccountRestore, ExchangeConnector, ExchangeError, OpenOrder, RestoredPosition, TickSink,
+};
 use crate::holdings::{self, HoldingsService, WalletHoldings};
 use crate::metrics::Metrics;
 use crate::onchain::OnchainClient;
 use crate::risk::{RiskContext, RiskEngine, RiskState, RiskVerdict};
-use crate::store::{PortfolioRow, PositionRow, Store};
+use crate::store::{PortfolioRow, PositionLot, PositionRow, Store};
 use crate::strategy::{StrategyHost, StrategyInfo, StrategySignal};
 use crate::swap::{encode_approve, HttpQuoter, SwapError, SwapQuote, SwapRequest, SwapService};
 use crate::types::*;
@@ -167,6 +169,49 @@ pub enum SwapExecutionError {
     Broadcast(#[from] BroadcastError),
 }
 
+/// A FIFO lot: an open purchase (or short sale) at a price.
+///
+/// Closing a position consumes the oldest lots first, so realized PnL and the
+/// remaining cost basis match a first-in-first-out tax report instead of a
+/// running average that hides which units were sold.
+#[derive(Debug, Clone, Copy)]
+struct Lot {
+    qty: f64,
+    price: f64,
+}
+
+const LOT_EPSILON: f64 = 1e-12;
+
+/// Consume `qty` from the front of `lots`, returning the realized PnL.
+///
+/// `direction` is the side of the position being closed: `1.0` for a long,
+/// `-1.0` for a short. The caller separates the closing part of a fill from
+/// any remainder that flips the position.
+fn consume_lots(lots: &mut Vec<Lot>, qty: f64, price: f64, direction: f64) -> f64 {
+    let mut remaining = qty;
+    let mut realized = 0.0;
+    while remaining > LOT_EPSILON && !lots.is_empty() {
+        let lot = &mut lots[0];
+        let take = lot.qty.min(remaining);
+        realized += (price - lot.price) * take * direction;
+        lot.qty -= take;
+        remaining -= take;
+        if lot.qty <= LOT_EPSILON {
+            lots.remove(0);
+        }
+    }
+    realized
+}
+
+fn lots_average(lots: &[Lot]) -> f64 {
+    let total: f64 = lots.iter().map(|lot| lot.qty).sum();
+    if total > LOT_EPSILON {
+        lots.iter().map(|lot| lot.qty * lot.price).sum::<f64>() / total
+    } else {
+        0.0
+    }
+}
+
 #[derive(Debug, Default)]
 struct DataStore {
     ticks: VecDeque<MarketTick>,
@@ -175,6 +220,8 @@ struct DataStore {
     last_prices: HashMap<String, f64>,
     position_qty: HashMap<String, f64>,
     avg_entry: HashMap<String, f64>,
+    /// Open lots per symbol, oldest first.
+    lots: HashMap<String, Vec<Lot>>,
     realized_pnl: f64,
     equity_usd: f64,
     cash_usd: f64,
@@ -417,6 +464,25 @@ impl AppState {
             for p in &positions {
                 data.position_qty.insert(p.symbol.clone(), p.qty);
                 data.avg_entry.insert(p.symbol.clone(), p.avg_entry);
+                let lots: Vec<Lot> = if p.lots.is_empty() {
+                    if p.qty.abs() > LOT_EPSILON {
+                        vec![Lot {
+                            qty: p.qty.abs(),
+                            price: p.avg_entry,
+                        }]
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    p.lots
+                        .iter()
+                        .map(|lot| Lot {
+                            qty: lot.qty,
+                            price: lot.price,
+                        })
+                        .collect()
+                };
+                data.lots.insert(p.symbol.clone(), lots);
             }
         }
 
@@ -433,7 +499,12 @@ impl AppState {
                 realized_pnl: p.realized_pnl,
                 positions: positions
                     .iter()
-                    .map(|p| (p.symbol.clone(), p.qty, p.avg_entry))
+                    .map(|p| RestoredPosition {
+                        symbol: p.symbol.clone(),
+                        qty: p.qty,
+                        avg_entry: p.avg_entry,
+                        lots: p.lots.iter().map(|lot| (lot.qty, lot.price)).collect(),
+                    })
                     .collect(),
             };
             if let Err(e) = self.connector.restore_account(&restored_account) {
@@ -518,10 +589,29 @@ impl AppState {
                 Some(a) if !a.positions.is_empty() => a
                     .positions
                     .iter()
-                    .map(|(symbol, qty, avg_entry)| PositionRow {
-                        symbol: symbol.clone(),
-                        qty: *qty,
-                        avg_entry: *avg_entry,
+                    .map(|p| PositionRow {
+                        symbol: p.symbol.clone(),
+                        qty: p.qty,
+                        avg_entry: p.avg_entry,
+                        // A venue that reports lots keeps their FIFO order. One
+                        // that only reports an average comes back as a single
+                        // lot: accurate cost basis, no history to invent.
+                        lots: if !p.lots.is_empty() {
+                            p.lots
+                                .iter()
+                                .map(|(qty, price)| PositionLot {
+                                    qty: *qty,
+                                    price: *price,
+                                })
+                                .collect()
+                        } else if p.qty.abs() > LOT_EPSILON {
+                            vec![PositionLot {
+                                qty: p.qty.abs(),
+                                price: p.avg_entry,
+                            }]
+                        } else {
+                            Vec::new()
+                        },
                     })
                     .collect(),
                 _ => data
@@ -532,6 +622,18 @@ impl AppState {
                         symbol: symbol.clone(),
                         qty: *qty,
                         avg_entry: data.avg_entry.get(symbol).copied().unwrap_or(0.0),
+                        lots: data
+                            .lots
+                            .get(symbol)
+                            .map(|lots| {
+                                lots.iter()
+                                    .map(|lot| PositionLot {
+                                        qty: lot.qty,
+                                        price: lot.price,
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                     })
                     .collect(),
             };
@@ -1557,30 +1659,39 @@ impl AppState {
         let mut data = self.lock_data();
         let symbol = fill.symbol.clone();
         let prev_qty = data.position_qty.get(&symbol).copied().unwrap_or(0.0);
-        let prev_avg = data.avg_entry.get(&symbol).copied().unwrap_or(0.0);
         let new_qty = prev_qty + signed_qty;
 
-        // Realized PnL when reducing an existing position.
+        // FIFO: the part of the fill that closes the old side consumes the
+        // oldest lots; anything left over opens at this fill's price. A fill
+        // that crosses zero does both.
+        let mut lots = data.lots.remove(&symbol).unwrap_or_default();
         let mut realized = 0.0;
         if prev_qty != 0.0 && (prev_qty > 0.0) != (signed_qty > 0.0) {
-            let closed = prev_qty.abs().min(fill.qty.abs());
+            let closing = prev_qty.abs().min(fill.qty.abs());
             let direction = if prev_qty > 0.0 { 1.0 } else { -1.0 };
-            realized = (fill.price - prev_avg) * closed * direction;
-            data.realized_pnl += realized;
-        }
-        let new_avg = if prev_qty == 0.0 || (prev_qty > 0.0) == (signed_qty > 0.0) {
-            let total = prev_qty.abs() * prev_avg + signed_qty.abs() * fill.price;
-            let qty_sum = prev_qty.abs() + signed_qty.abs();
-            if qty_sum > 0.0 {
-                total / qty_sum
-            } else {
-                0.0
+            realized = consume_lots(&mut lots, closing, fill.price, direction);
+            let opening = fill.qty.abs() - closing;
+            if opening > LOT_EPSILON {
+                lots.clear();
+                lots.push(Lot {
+                    qty: opening,
+                    price: fill.price,
+                });
             }
         } else {
-            prev_avg
-        };
+            lots.push(Lot {
+                qty: fill.qty.abs(),
+                price: fill.price,
+            });
+        }
+        if new_qty.abs() <= LOT_EPSILON {
+            lots.clear();
+        }
+        let new_avg = lots_average(&lots);
+        data.realized_pnl += realized;
         data.position_qty.insert(symbol.clone(), new_qty);
-        data.avg_entry.insert(symbol, new_avg);
+        data.avg_entry.insert(symbol.clone(), new_avg);
+        data.lots.insert(symbol, lots);
         data.last_prices.insert(fill.symbol.clone(), fill.price);
         data.equity_usd -= fill.fee;
 
@@ -2237,6 +2348,7 @@ pub fn error_reason(error: &ExchangeError) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::exchange::paper::{PaperConfig, PaperConnector};
     use crate::exchange::ExchangeResult;
     use crate::risk::BreakerState;
     use std::path::{Path, PathBuf};
@@ -2332,6 +2444,101 @@ mod tests {
         assert_eq!(venue_positions.len(), 1, "the venue must hold the position");
         assert_eq!(venue_positions[0].symbol, "SOL/USDT");
         assert!((venue_positions[0].qty - 5.0).abs() < 1e-9);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A quiet simulator: fills at the last mark, no slippage, so a test can
+    /// assert exact cost basis and FIFO order.
+    fn quiet_paper() -> Arc<PaperConnector> {
+        Arc::new(PaperConnector::with_config(PaperConfig {
+            seed: 7,
+            starting_cash: 10_000.0,
+            slippage_bps: 0.0,
+            taker_fee_bps: 5.0,
+            vol_bps: 0.0,
+            ..PaperConfig::default()
+        }))
+    }
+
+    async fn fill(state: &AppState, symbol: &str, side: Side, qty: f64) {
+        let outcome = state
+            .submit_order(
+                OrderRequest::market(Venue::Paper, symbol, side, qty),
+                "test",
+            )
+            .await;
+        assert!(outcome.approved, "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn realized_pnl_closes_the_oldest_lot_first() {
+        let (dir, db) = temp_db();
+        let paper = quiet_paper();
+        paper.set_price("SOL/USDT", 100.0);
+        let state = AppState::with_connector(config_with_db(&db), paper.clone()).unwrap();
+
+        fill(&state, "SOL/USDT", Side::Buy, 1.0).await;
+        paper.set_price("SOL/USDT", 120.0);
+        fill(&state, "SOL/USDT", Side::Buy, 1.0).await;
+        let position = &state.portfolio().positions[0];
+        assert!(
+            (position.avg_entry - 110.0).abs() < 1e-9,
+            "{}",
+            position.avg_entry
+        );
+
+        paper.set_price("SOL/USDT", 130.0);
+        fill(&state, "SOL/USDT", Side::Sell, 1.0).await;
+
+        // Selling the oldest lot (100) is +30; a blended average would say +20.
+        let sell = state
+            .trades(5)
+            .into_iter()
+            .find(|t| t.side == Side::Sell)
+            .unwrap();
+        assert!(
+            (sell.realized_pnl - 30.0).abs() < 1e-9,
+            "{}",
+            sell.realized_pnl
+        );
+        let position = &state.portfolio().positions[0];
+        assert!((position.qty - 1.0).abs() < 1e-9);
+        assert!(
+            (position.avg_entry - 120.0).abs() < 1e-9,
+            "{}",
+            position.avg_entry
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_restart_keeps_the_fifo_lot_order() {
+        let (dir, db) = temp_db();
+        {
+            let paper = quiet_paper();
+            paper.set_price("SOL/USDT", 100.0);
+            let state = AppState::with_connector(config_with_db(&db), paper.clone()).unwrap();
+            fill(&state, "SOL/USDT", Side::Buy, 1.0).await;
+            paper.set_price("SOL/USDT", 120.0);
+            fill(&state, "SOL/USDT", Side::Buy, 1.0).await;
+        }
+
+        let paper = quiet_paper();
+        let state = AppState::with_connector(config_with_db(&db), paper.clone()).unwrap();
+        paper.set_price("SOL/USDT", 130.0);
+        fill(&state, "SOL/USDT", Side::Sell, 1.0).await;
+
+        let sell = state
+            .trades(5)
+            .into_iter()
+            .find(|t| t.side == Side::Sell)
+            .unwrap();
+        assert!(
+            (sell.realized_pnl - 30.0).abs() < 1e-9,
+            "a restart must not forget which lot was bought first, got {}",
+            sell.realized_pnl
+        );
+        assert!((state.portfolio().positions[0].avg_entry - 120.0).abs() < 1e-9);
         std::fs::remove_dir_all(&dir).ok();
     }
 

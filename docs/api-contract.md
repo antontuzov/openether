@@ -343,7 +343,10 @@ is `null` when nothing in the range lost money, because the ratio is undefined
 rather than infinite.
 
 `realized_pnl_usd` sums the per-fill `realized_pnl`; it is the booked result of
-closing fills, not a mark on open positions.
+closing fills, not a mark on open positions. A closing fill consumes the
+position's FIFO lots, oldest first, so each fill's `realized_pnl` is booked
+against the prices actually paid for the units it closed — not against a
+blended average entry.
 
 Errors are JSON with `"ok": false` and a stable `code`:
 

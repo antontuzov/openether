@@ -9,6 +9,7 @@ import {
   freshState,
   grossExposure,
   markToMarket,
+  normalizeLots,
   pricesFromCoins,
   type DemoPosition,
   type DemoState,
@@ -49,7 +50,7 @@ function loadPersisted(): DemoState | null {
     if (!parsed || typeof parsed.cash !== 'number' || !parsed.positions) {
       return null;
     }
-    return parsed;
+    return normalizeLots(parsed);
   } catch {
     return null;
   }
@@ -66,7 +67,12 @@ function persist(state: DemoState): void {
 function cloneState(state: DemoState): DemoState {
   return {
     ...state,
-    positions: { ...state.positions },
+    positions: Object.fromEntries(
+      Object.entries(state.positions).map(([symbol, position]) => [
+        symbol,
+        { ...position, lots: position.lots.map((lot) => ({ ...lot })) },
+      ]),
+    ),
     trades: [...state.trades],
     prices: { ...state.prices },
     equityHistory: [...state.equityHistory],

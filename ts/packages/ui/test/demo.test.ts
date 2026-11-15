@@ -10,6 +10,8 @@ import {
   freshState,
   lockedMargin,
   markToMarket,
+  normalizeLots,
+  type DemoPosition,
   type DemoState,
 } from '../src/lib/demo';
 import { DEFAULT_LIMITS, RISK_CONTRACT, toBrowserContract, type RiskContract } from '../src/lib/riskRules';
@@ -78,6 +80,74 @@ describe('accounting', () => {
     expect(add.approved).toBe(true);
     expect(state.positions[SOL].avgEntry).toBeCloseTo(150, 6);
     expect(state.positions[SOL].qty).toBe(4);
+  });
+});
+
+describe('tax lots', () => {
+  it('closes the oldest lot first and realises that lot price', () => {
+    const state = priced();
+    executeOrder(state, { symbol: SOL, side: 'buy', qty: 2 });
+    state.prices[SOL] = 120;
+    executeOrder(state, { symbol: SOL, side: 'buy', qty: 2 });
+
+    state.prices[SOL] = 130;
+    const close = executeOrder(state, { symbol: SOL, side: 'sell', qty: 2 });
+
+    expect(close.approved).toBe(true);
+    // The 2 SOL sold at 130 came from the 100 lot, not the average of 110.
+    expect(state.trades[0].realizedPnl).toBeCloseTo(2 * (130 - 100), 6);
+    expect(state.positions[SOL].qty).toBe(2);
+    expect(state.positions[SOL].avgEntry).toBeCloseTo(120, 6);
+    expect(state.positions[SOL].lots).toHaveLength(1);
+    // +60 realised, +20 unrealised on the lot still held, minus three fees:
+    // 0.1, 0.12 and 0.13.
+    expect(equityOf(state)).toBeCloseTo(STARTING_CASH + 80 - 0.1 - 0.12 - 0.13, 6);
+  });
+
+  it('leaves a partly consumed lot at the front of the queue', () => {
+    const state = priced();
+    executeOrder(state, { symbol: SOL, side: 'buy', qty: 1 });
+    state.prices[SOL] = 120;
+    executeOrder(state, { symbol: SOL, side: 'buy', qty: 1 });
+
+    state.prices[SOL] = 130;
+    executeOrder(state, { symbol: SOL, side: 'sell', qty: 0.5 });
+
+    expect(state.trades[0].realizedPnl).toBeCloseTo(0.5 * (130 - 100), 6);
+    expect(state.positions[SOL].qty).toBeCloseTo(1.5, 9);
+    expect(state.positions[SOL].avgEntry).toBeCloseTo((0.5 * 100 + 120) / 1.5, 6);
+    expect(state.positions[SOL].lots[0]).toEqual({ qty: 0.5, price: 100 });
+  });
+
+  it('backfills one lot at the average for a book saved without lots', () => {
+    const state = priced();
+    // A book saved before lots existed: it held an average entry only.
+    state.positions[SOL] = {
+      symbol: SOL,
+      qty: 3,
+      avgEntry: 100,
+      markPrice: 100,
+      unrealizedPnl: 0,
+      notionalUsd: 300,
+    } as DemoPosition;
+
+    expect(normalizeLots(state).positions[SOL].lots).toEqual([{ qty: 3, price: 100 }]);
+
+    state.prices[SOL] = 110;
+    executeOrder(state, { symbol: SOL, side: 'sell', qty: 2 });
+    expect(state.trades[0].realizedPnl).toBeCloseTo(2 * (110 - 100), 6);
+    expect(state.positions[SOL].qty).toBe(1);
+  });
+
+  it('drops every lot when the position is fully closed', () => {
+    const state = priced();
+    executeOrder(state, { symbol: SOL, side: 'buy', qty: 1 });
+    state.prices[SOL] = 120;
+    executeOrder(state, { symbol: SOL, side: 'buy', qty: 1 });
+    executeOrder(state, { symbol: SOL, side: 'sell', qty: 2 });
+
+    expect(state.positions[SOL]).toBeUndefined();
+    expect(lockedMargin(state)).toBe(0);
   });
 });
 
@@ -181,6 +251,7 @@ describe('risk limits', () => {
         markPrice: 100,
         unrealizedPnl: 0,
         notionalUsd: 1500,
+        lots: [{ qty: 15, price: 100 }],
       };
     }
     expect(equityOf(state)).toBe(STARTING_CASH);

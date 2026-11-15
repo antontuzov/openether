@@ -31,6 +31,18 @@ export type { RuleLimits as DemoLimits } from './riskRules';
 
 export const STARTING_CASH = 10_000;
 
+/**
+ * One fill still held in the book, oldest first.
+ *
+ * Closes consume the oldest lot first, exactly like the Rust engine and the
+ * paper venue, so the simulator's realised PnL and remaining cost basis match
+ * what the real book reports for the same fills.
+ */
+export interface DemoLot {
+  qty: number;
+  price: number;
+}
+
 export interface DemoPosition {
   symbol: string;
   qty: number;
@@ -38,6 +50,7 @@ export interface DemoPosition {
   markPrice: number;
   unrealizedPnl: number;
   notionalUsd: number;
+  lots: DemoLot[];
 }
 
 export interface DemoTrade {
@@ -316,6 +329,45 @@ export function checkOrder(
 }
 
 const FEE_RATE = 0.0005;
+const LOT_EPSILON = 1e-12;
+
+/**
+ * Backfill lots on a book saved before lots existed.
+ *
+ * A book that has been traded has no other record of its cost basis, so one
+ * lot at the average entry is the only honest reconstruction.
+ */
+export function normalizeLots(state: DemoState): DemoState {
+  for (const position of Object.values(state.positions)) {
+    if (!Array.isArray(position.lots) || position.lots.length === 0) {
+      position.lots =
+        position.qty === 0 ? [] : [{ qty: position.qty, price: position.avgEntry }];
+    }
+  }
+  return state;
+}
+
+function lotsAverage(lots: DemoLot[]): number {
+  let qty = 0;
+  let cost = 0;
+  for (const lot of lots) {
+    qty += lot.qty;
+    cost += lot.qty * lot.price;
+  }
+  return qty === 0 ? 0 : cost / qty;
+}
+
+/** Derive the position's cached fields from its remaining lots. */
+function applyLots(position: DemoPosition, markPrice: number): void {
+  position.qty = position.lots.reduce((sum, lot) => sum + lot.qty, 0);
+  position.avgEntry = lotsAverage(position.lots);
+  position.markPrice = markPrice;
+  position.unrealizedPnl = position.lots.reduce(
+    (sum, lot) => sum + lot.qty * (markPrice - lot.price),
+    0,
+  );
+  position.notionalUsd = position.qty * markPrice;
+}
 
 /** Execute an approved order against the simulated book. */
 export function executeOrder(
@@ -344,34 +396,39 @@ export function executeOrder(
   let realizedPnl = 0;
 
   if (input.side === 'buy') {
-    const oldQty = existing?.qty ?? 0;
-    const oldAvg = existing?.avgEntry ?? 0;
-    const newQty = oldQty + input.qty;
-    const avgEntry = newQty === 0 ? 0 : (oldQty * oldAvg + input.qty * price) / newQty;
-    state.positions[input.symbol] = {
-      symbol: input.symbol,
-      qty: newQty,
-      avgEntry,
-      markPrice: price,
-      unrealizedPnl: newQty * (price - avgEntry),
-      notionalUsd: newQty * price,
-    };
+    const position =
+      existing ??
+      ({
+        symbol: input.symbol,
+        qty: 0,
+        avgEntry: 0,
+        markPrice: price,
+        unrealizedPnl: 0,
+        notionalUsd: 0,
+        lots: [],
+      } satisfies DemoPosition);
+    position.lots.push({ qty: input.qty, price });
+    applyLots(position, price);
+    state.positions[input.symbol] = position;
     state.cash -= fee;
   } else {
     const position = existing as DemoPosition;
-    realizedPnl = input.qty * (price - position.avgEntry);
-    const newQty = position.qty - input.qty;
+    let remaining = input.qty;
+    while (remaining > LOT_EPSILON && position.lots.length > 0) {
+      const lot = position.lots[0];
+      const closed = Math.min(lot.qty, remaining);
+      realizedPnl += closed * (price - lot.price);
+      lot.qty -= closed;
+      remaining -= closed;
+      if (lot.qty <= LOT_EPSILON) {
+        position.lots.shift();
+      }
+    }
     state.cash += realizedPnl - fee;
-    if (Math.abs(newQty) < 1e-9) {
+    if (position.lots.length === 0) {
       delete state.positions[input.symbol];
     } else {
-      state.positions[input.symbol] = {
-        ...position,
-        qty: newQty,
-        markPrice: price,
-        unrealizedPnl: newQty * (price - position.avgEntry),
-        notionalUsd: newQty * price,
-      };
+      applyLots(position, price);
     }
   }
 

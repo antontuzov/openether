@@ -32,7 +32,8 @@
 //!   simulated market price crosses them; the mark price then follows the fill.
 
 use crate::exchange::{
-    AccountRestore, ExchangeConnector, ExchangeError, ExchangeResult, OpenOrder, TickSink,
+    AccountRestore, ExchangeConnector, ExchangeError, ExchangeResult, OpenOrder, RestoredPosition,
+    TickSink,
 };
 use crate::types::*;
 use async_trait::async_trait;
@@ -151,11 +152,71 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PaperLot {
+    /// Size of the lot, always positive. The position's sign says the side.
+    qty: f64,
+    price: f64,
+}
+
 #[derive(Debug, Clone)]
 struct PaperPosition {
     /// Signed size: positive = long, negative = short.
     qty: f64,
+    /// Weighted average of the lots still open. Derived from `lots`.
     avg_entry: f64,
+    /// Open purchases, oldest first. Closes consume the front of the queue,
+    /// so realized PnL is FIFO rather than a blend of every entry.
+    lots: Vec<PaperLot>,
+}
+
+const LOT_EPSILON: f64 = 1e-12;
+
+impl PaperPosition {
+    fn flat() -> Self {
+        Self {
+            qty: 0.0,
+            avg_entry: 0.0,
+            lots: Vec::new(),
+        }
+    }
+
+    /// Close `qty` of the position at `price` against the oldest lots first.
+    ///
+    /// Returns the realized PnL of the closed part. `qty` must not exceed the
+    /// open size; the caller separates the closing part from a flip.
+    fn close(&mut self, qty: f64, price: f64) -> f64 {
+        let direction = if self.qty >= 0.0 { 1.0 } else { -1.0 };
+        let mut remaining = qty.min(self.qty.abs());
+        let mut realized = 0.0;
+        while remaining > LOT_EPSILON && !self.lots.is_empty() {
+            let lot = &mut self.lots[0];
+            let take = lot.qty.min(remaining);
+            realized += (price - lot.price) * take * direction;
+            lot.qty -= take;
+            remaining -= take;
+            if lot.qty <= LOT_EPSILON {
+                self.lots.remove(0);
+            }
+        }
+        realized
+    }
+
+    /// Add a lot and refresh `qty` and the weighted average.
+    fn open(&mut self, qty: f64, price: f64, signed_qty: f64) {
+        self.lots.push(PaperLot { qty, price });
+        self.set_qty(signed_qty);
+    }
+
+    fn set_qty(&mut self, qty: f64) {
+        self.qty = qty;
+        let total: f64 = self.lots.iter().map(|lot| lot.qty).sum();
+        self.avg_entry = if total > LOT_EPSILON {
+            self.lots.iter().map(|lot| lot.qty * lot.price).sum::<f64>() / total
+        } else {
+            0.0
+        };
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -770,29 +831,36 @@ fn execute_fill(
         .get(symbol)
         .map(|p| p.avg_entry)
         .unwrap_or(0.0);
+    let new_qty = old_qty + signed;
 
-    // Realised PnL of the portion that closes an existing position.
-    let mut realized = 0.0;
-    if old_qty != 0.0 && (old_qty > 0.0) != (signed > 0.0) {
-        let closing = old_qty.abs().min(qty);
-        realized = closing * (price - old_avg) * old_qty.signum();
+    // Work on a copy so a margin refusal does not leave a half-applied book.
+    let mut position = state
+        .positions
+        .get(symbol)
+        .cloned()
+        .unwrap_or_else(PaperPosition::flat);
+
+    // FIFO: the closing part consumes the oldest lots, the rest opens new ones
+    // at this fill's price. A fill that crosses zero does both.
+    let closing = if old_qty != 0.0 && (old_qty > 0.0) != (signed > 0.0) {
+        old_qty.abs().min(qty)
+    } else {
+        0.0
+    };
+    let realized = position.close(closing, price);
+    let opening = qty - closing;
+    if opening > LOT_EPSILON {
+        if closing > LOT_EPSILON {
+            // The old side is fully closed; its queue must not leak into the
+            // new side's cost basis.
+            position.lots.clear();
+        }
+        position.open(opening, price, new_qty);
+    } else {
+        position.set_qty(new_qty);
     }
 
-    // New average entry price.
-    let new_avg = if old_qty == 0.0 {
-        price
-    } else if (old_qty > 0.0) == (signed > 0.0) {
-        // Increasing the position: weighted average.
-        (old_qty.abs() * old_avg + qty * price) / (old_qty.abs() + qty)
-    } else if qty > old_qty.abs() {
-        // Flipped through zero.
-        price
-    } else {
-        // Partial close, the remaining position keeps its entry.
-        old_avg
-    };
-
-    let new_qty = old_qty + signed;
+    let new_avg = position.avg_entry;
     let old_margin = old_qty.abs() * old_avg;
     let new_margin = new_qty.abs() * new_avg;
     let margin_delta = new_margin - old_margin;
@@ -816,16 +884,10 @@ fn execute_fill(
     state.cash += realized;
     state.realized_pnl += realized;
 
-    if new_qty.abs() < f64::EPSILON {
+    if new_qty.abs() < LOT_EPSILON {
         state.positions.remove(symbol);
     } else {
-        state.positions.insert(
-            symbol.to_string(),
-            PaperPosition {
-                qty: new_qty,
-                avg_entry: new_avg,
-            },
-        );
+        state.positions.insert(symbol.to_string(), position);
     }
 
     Ok(TradeRecord {
@@ -1078,7 +1140,12 @@ impl ExchangeConnector for PaperConnector {
             positions: state
                 .positions
                 .iter()
-                .map(|(symbol, p)| (symbol.clone(), p.qty, p.avg_entry))
+                .map(|(symbol, p)| RestoredPosition {
+                    symbol: symbol.clone(),
+                    qty: p.qty,
+                    avg_entry: p.avg_entry,
+                    lots: p.lots.iter().map(|lot| (lot.qty, lot.price)).collect(),
+                })
                 .collect(),
         })
     }
@@ -1088,7 +1155,7 @@ impl ExchangeConnector for PaperConnector {
         let locked: f64 = account
             .positions
             .iter()
-            .map(|(_, qty, avg_entry)| qty.abs() * avg_entry)
+            .map(|p| p.qty.abs() * p.avg_entry)
             .sum();
         // The persisted cash is spendable cash, so the wallet balance is that
         // plus the margin the restored positions lock up again.
@@ -1097,14 +1164,35 @@ impl ExchangeConnector for PaperConnector {
         state.positions = account
             .positions
             .iter()
-            .map(|(symbol, qty, avg_entry)| {
-                (
-                    symbol.clone(),
-                    PaperPosition {
-                        qty: *qty,
-                        avg_entry: *avg_entry,
-                    },
-                )
+            .map(|p| {
+                let lots = if p.lots.is_empty() {
+                    // A venue that only knows its average entry comes back as
+                    // one lot, which keeps the average and loses the FIFO
+                    // history it never had.
+                    if p.qty.abs() > LOT_EPSILON {
+                        vec![PaperLot {
+                            qty: p.qty.abs(),
+                            price: p.avg_entry,
+                        }]
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    p.lots
+                        .iter()
+                        .map(|(qty, price)| PaperLot {
+                            qty: *qty,
+                            price: *price,
+                        })
+                        .collect()
+                };
+                let mut position = PaperPosition {
+                    qty: p.qty,
+                    avg_entry: p.avg_entry,
+                    lots,
+                };
+                position.set_qty(p.qty);
+                (p.symbol.clone(), position)
             })
             .collect();
         Ok(())
@@ -1289,6 +1377,119 @@ mod tests {
         let sell = &trades[1];
         let expected_price = 142.0 * (1.0 + 2.0 / 10_000.0) * (1.0 - 2.0 / 10_000.0);
         assert!((sell.price - expected_price).abs() < 1e-9, "{}", sell.price);
+    }
+
+    /// A connector that fills market orders at the last mark with no
+    /// slippage, so a test can assert exact prices and FIFO lots.
+    fn quiet_connector() -> PaperConnector {
+        let cfg = PaperConfig {
+            seed: 7,
+            starting_cash: 10_000.0,
+            slippage_bps: 0.0,
+            taker_fee_bps: 5.0,
+            vol_bps: 0.0,
+            ..PaperConfig::default()
+        };
+        PaperConnector::with_config(cfg)
+    }
+
+    #[tokio::test]
+    async fn closing_fills_consume_the_oldest_lot_first() {
+        let c = quiet_connector();
+        c.set_price("SOL/USDT", 100.0);
+        c.place_order(&market("SOL/USDT", Side::Buy, 1.0))
+            .await
+            .unwrap();
+        c.set_price("SOL/USDT", 120.0);
+        c.place_order(&market("SOL/USDT", Side::Buy, 1.0))
+            .await
+            .unwrap();
+
+        // Two lots; the displayed entry is their weighted average.
+        let position = &c.positions()[0];
+        assert!((position.qty - 2.0).abs() < 1e-9);
+        assert!((position.avg_entry - 110.0).abs() < 1e-9);
+
+        c.set_price("SOL/USDT", 130.0);
+        c.place_order(&market("SOL/USDT", Side::Sell, 1.0))
+            .await
+            .unwrap();
+
+        // FIFO sells the 100 lot, not half of each: +30, not +20.
+        let sell = c.trades().last().cloned().expect("a sell fill");
+        assert!(
+            (sell.realized_pnl - 30.0).abs() < 1e-9,
+            "{}",
+            sell.realized_pnl
+        );
+        let position = &c.positions()[0];
+        assert!((position.qty - 1.0).abs() < 1e-9);
+        assert!(
+            (position.avg_entry - 120.0).abs() < 1e-9,
+            "the remaining cost basis is the 120 lot, got {}",
+            position.avg_entry
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fill_that_crosses_zero_closes_then_reopens_at_the_fill_price() {
+        let c = quiet_connector();
+        c.set_price("SOL/USDT", 100.0);
+        c.place_order(&market("SOL/USDT", Side::Buy, 1.0))
+            .await
+            .unwrap();
+        c.set_price("SOL/USDT", 110.0);
+        c.place_order(&market("SOL/USDT", Side::Sell, 2.0))
+            .await
+            .unwrap();
+
+        let sell = c.trades().last().cloned().expect("a sell fill");
+        assert!(
+            (sell.realized_pnl - 10.0).abs() < 1e-9,
+            "{}",
+            sell.realized_pnl
+        );
+        let position = &c.positions()[0];
+        assert!(
+            (position.qty + 1.0).abs() < 1e-9,
+            "the position flipped short"
+        );
+        assert!(
+            (position.avg_entry - 110.0).abs() < 1e-9,
+            "the new short opens at the fill, got {}",
+            position.avg_entry
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_lots_keep_their_fifo_order() {
+        let c = quiet_connector();
+        c.set_price("SOL/USDT", 100.0);
+        c.place_order(&market("SOL/USDT", Side::Buy, 1.0))
+            .await
+            .unwrap();
+        c.set_price("SOL/USDT", 120.0);
+        c.place_order(&market("SOL/USDT", Side::Buy, 1.0))
+            .await
+            .unwrap();
+
+        let captured = c.account_state().expect("paper reports its account");
+        assert_eq!(captured.positions[0].lots.len(), 2);
+        assert!((captured.positions[0].lots[0].1 - 100.0).abs() < 1e-9);
+
+        let restored = quiet_connector();
+        restored.restore_account(&captured).unwrap();
+        restored.set_price("SOL/USDT", 130.0);
+        restored
+            .place_order(&market("SOL/USDT", Side::Sell, 1.0))
+            .await
+            .unwrap();
+        let sell = restored.trades().last().cloned().expect("a sell fill");
+        assert!(
+            (sell.realized_pnl - 30.0).abs() < 1e-9,
+            "the restored queue must still sell the oldest lot first, got {}",
+            sell.realized_pnl
+        );
     }
 
     #[tokio::test]

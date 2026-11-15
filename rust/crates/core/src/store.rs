@@ -44,12 +44,21 @@ impl Default for PortfolioRow {
 /// shape.
 pub use crate::risk::RiskRow;
 
-/// One open position: signed quantity and average entry price.
+/// One open lot, always positive. The position's sign says the side.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PositionLot {
+    pub qty: f64,
+    pub price: f64,
+}
+
+/// One open position: signed quantity, average entry price and its FIFO lots.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PositionRow {
     pub symbol: String,
     pub qty: f64,
     pub avg_entry: f64,
+    /// Open lots, oldest first.
+    pub lots: Vec<PositionLot>,
 }
 
 fn default_journal_limit() -> usize {
@@ -256,6 +265,14 @@ CREATE TABLE IF NOT EXISTS positions (
     avg_entry  REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS position_lots (
+    symbol TEXT    NOT NULL,
+    seq    INTEGER NOT NULL,
+    qty    REAL    NOT NULL,
+    price  REAL    NOT NULL,
+    PRIMARY KEY (symbol, seq)
+);
+
 CREATE TABLE IF NOT EXISTS trades (
     id           TEXT PRIMARY KEY,
     venue        TEXT NOT NULL,
@@ -395,33 +412,62 @@ impl Store {
 
     /// Replace the position table with `positions`.
     ///
-    /// The whole set is written in one transaction so a crash can never leave
-    /// half the book on disk.
+    /// The positions and their FIFO lots are written in one transaction so a
+    /// crash can never leave half the book, or a queue that disagrees with the
+    /// size it belongs to, on disk.
     pub fn save_positions(&self, positions: &[PositionRow]) -> anyhow::Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM positions", [])?;
+        tx.execute("DELETE FROM position_lots", [])?;
         for p in positions {
             tx.execute(
                 "INSERT INTO positions (symbol, qty, avg_entry) VALUES (?1, ?2, ?3)",
                 params![p.symbol, p.qty, p.avg_entry],
             )?;
+            for (seq, lot) in p.lots.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO position_lots (symbol, seq, qty, price) VALUES (?1, ?2, ?3, ?4)",
+                    params![p.symbol, seq as i64, lot.qty, lot.price],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// Read every open position.
+    /// Read every open position, with its lots oldest first.
     pub fn load_positions(&self) -> anyhow::Result<Vec<PositionRow>> {
         let conn = self.lock()?;
+        let mut lots: std::collections::HashMap<String, Vec<PositionLot>> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt =
+                conn.prepare("SELECT symbol, qty, price FROM position_lots ORDER BY symbol, seq")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    PositionLot {
+                        qty: r.get(1)?,
+                        price: r.get(2)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (symbol, lot) = row?;
+                lots.entry(symbol).or_default().push(lot);
+            }
+        }
         let mut stmt =
             conn.prepare("SELECT symbol, qty, avg_entry FROM positions ORDER BY symbol")?;
         let rows = stmt
             .query_map([], |r| {
+                let symbol: String = r.get(0)?;
                 Ok(PositionRow {
-                    symbol: r.get(0)?,
+                    symbol: symbol.clone(),
                     qty: r.get(1)?,
                     avg_entry: r.get(2)?,
+                    lots: lots.remove(&symbol).unwrap_or_default(),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -917,11 +963,25 @@ mod tests {
                 symbol: "SOL/USDT".into(),
                 qty: 2.0,
                 avg_entry: 140.0,
+                lots: vec![
+                    PositionLot {
+                        qty: 1.0,
+                        price: 130.0,
+                    },
+                    PositionLot {
+                        qty: 1.0,
+                        price: 150.0,
+                    },
+                ],
             },
             PositionRow {
                 symbol: "BTC/USDT".into(),
                 qty: -0.5,
                 avg_entry: 60_000.0,
+                lots: vec![PositionLot {
+                    qty: 0.5,
+                    price: 60_000.0,
+                }],
             },
         ])
         .unwrap();
@@ -929,17 +989,27 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].symbol, "BTC/USDT");
         assert_eq!(loaded[0].qty, -0.5);
+        assert_eq!(loaded[1].lots.len(), 2);
+        assert_eq!(loaded[1].lots[0].price, 130.0, "oldest lot comes first");
+        assert_eq!(loaded[1].lots[1].price, 150.0);
 
-        // A closed position must disappear, not linger with a stale quantity.
+        // A closed position must disappear, not linger with a stale quantity
+        // or leave its lots behind.
         s.save_positions(&[PositionRow {
             symbol: "SOL/USDT".into(),
             qty: 2.0,
             avg_entry: 140.0,
+            lots: vec![PositionLot {
+                qty: 2.0,
+                price: 140.0,
+            }],
         }])
         .unwrap();
         let loaded = s.load_positions().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].symbol, "SOL/USDT");
+        assert_eq!(loaded[0].lots.len(), 1);
+        assert_eq!(loaded[0].lots[0].qty, 2.0);
     }
 
     #[test]
