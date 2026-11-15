@@ -27,6 +27,23 @@ jobs:
         working-directory: rust
         run: cargo test --workspace
 
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build the core
+        working-directory: rust
+        run: cargo build --bin openether-core
+      - name: Drive the live HTTP surface
+        run: node scripts/e2e.mjs
+
   typescript:
     runs-on: ubuntu-latest
     steps:

@@ -1,0 +1,119 @@
+name: Release
+
+# A tag is the release trigger: `git tag v0.2.0 && git push origin v0.2.0`.
+# Binaries are built natively on each platform rather than cross-compiled, so
+# what ships is what a machine of that shape can run.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    name: Binaries (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-13
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: ${{ matrix.target }}
+      - name: Build the workspace
+        working-directory: rust
+        run: cargo build --release --workspace --bins --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="openether-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "rust/target/${{ matrix.target }}/release/openether-core" \
+             "rust/target/${{ matrix.target }}/release/openether-live" \
+             "rust/target/${{ matrix.target }}/release/openether-wallet" \
+             "rust/target/${{ matrix.target }}/release/openether-mcp-server" \
+             "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openether-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  dashboard:
+    name: Dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: ts/pnpm-lock.yaml
+      - name: Install dependencies
+        working-directory: ts
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        working-directory: ts
+        env:
+          # Leave the secret unset to ship a dashboard with the admin panel
+          # locked behind the core's operator token only.
+          VITE_ADMIN_PASSWORD_HASH: ${{ secrets.ADMIN_PASSWORD_HASH }}
+        run: pnpm --filter @openether/ui build
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="openether-dashboard-${{ github.ref_name }}"
+          mkdir -p "dist/$name"
+          cp -R ts/packages/ui/dist/. "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openether-dashboard
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: [binaries, dashboard]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum ./*.tar.gz > SHA256SUMS
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            artifacts/*.tar.gz artifacts/SHA256SUMS

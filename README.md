@@ -217,7 +217,18 @@ cargo test --workspace --manifest-path rust/Cargo.toml   # 280 tests
 pnpm --dir ts -r test                                    # 133 tests
 pnpm --dir ts -r typecheck
 pnpm --dir ts -r build
+
+cargo build --manifest-path rust/Cargo.toml --bin openether-core
+node scripts/e2e.mjs                                     # 14 checks, real core
 ```
+
+The unit suites run the engine in-process. `scripts/e2e.mjs` spawns the real
+`openether-core` on a free port with a throwaway SQLite file and drives the
+money path the way a client does: the token gate, a fill, the position and
+journal, a forged oversized order that halts trading, the webhook that must
+fire once, a tokened reset, and a restart that has to bring the book back. It
+drops every inherited `OPENETHER_*` variable, so a developer's arming record
+can never leak into a test run. CI runs it in the `e2e` job.
 
 ---
 
@@ -1003,6 +1014,24 @@ To publish your own fork:
 3. Settings → Pages → Source: **GitHub Actions**.
 4. Optionally add the `ADMIN_PASSWORD_HASH` secret.
 
+### Releases
+
+Tag a commit to publish binaries:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+`release.yml` builds `openether-core`, `openether-live`, `openether-wallet`
+and `openether-mcp-server` natively for Linux x86_64 and macOS (Intel and
+Apple silicon) — no cross-compiled artifacts — plus the dashboard bundle, and
+attaches the tarballs and a `SHA256SUMS` file to the GitHub Release. A
+`workflow_dispatch` run builds the same artifacts without publishing, so the
+pipeline can be checked before a tag exists. The dashboard tarball bakes in
+`ADMIN_PASSWORD_HASH` when the secret is set; without it the panel is locked
+behind the core's operator token alone.
+
 ---
 
 ## Configuration
@@ -1115,6 +1144,16 @@ Checked locally on macOS (arm64):
 - `pnpm -r test` — **133 passing** across the agent guard and verify loop, the
   data server, the browser trading engine and the order accounting.
 - `pnpm -r typecheck` and `pnpm -r build` — clean.
+- `node scripts/e2e.mjs` — **14 checks** against a spawned core over HTTP:
+  paper mode with live trading off, `admin_auth: required`, a public
+  `/api/risk`, an untokened order refused with `admin_token_required`, the
+  token authorizing without being echoed, a 2 SOL buy filling at exactly 142
+  with a 0.142 fee, the portfolio showing that position and equity
+  `10000 − fee`, the journal booking the entry as unrealized, a 20 SOL order
+  refused with `position_size_exceeds_max_pct` and halting trading, one
+  `breaker_opened` alert and no repeat while open, a tokened reset closing the
+  breaker and alerting it, a restart restoring the position, basis, equity and
+  journal, and a post-restart round trip costing exactly two fees.
 - The risk contract proven to be shared: the Rust risk layer and the browser
   simulator were driven side by side and refused the same orders with the same
   reason codes — `notional_too_small`, `notional_too_large`,
