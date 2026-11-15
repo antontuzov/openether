@@ -14,6 +14,7 @@ import { StrategyPanel } from './components/StrategyPanel';
 import { TickerStrip } from './components/TickerStrip';
 import { TradeTicket } from './components/TradeTicket';
 import { TradesTable } from './components/TradesTable';
+import { VenuesPanel } from './components/VenuesPanel';
 import { WalletPanel } from './components/WalletPanel';
 import { useDashboard } from './hooks/useDashboard';
 import { useDemoEngine } from './hooks/useDemoEngine';
@@ -88,7 +89,7 @@ export default function App() {
   );
 
   const venueName = dash.portfolio?.venue ?? dash.venues[0]?.venue ?? 'paper';
-  const liveVenue = dash.venues.find((venue) => venue.live);
+  const liveVenues = dash.venues.filter((venue) => venue.live);
   const inSim = view === 'sim';
 
   const handleReload = useCallback(
@@ -153,10 +154,14 @@ export default function App() {
   const header = {
     venueLabel: inSim
       ? 'SIMULATION'
-      : liveVenue
-        ? `LIVE · ${liveVenue.venue.toUpperCase()}`
-        : venueName.toUpperCase(),
-    venueLive: !inSim && Boolean(liveVenue),
+      : liveVenues.length > 1
+        ? `LIVE · ${liveVenues.length} VENUES`
+        : liveVenues.length === 1
+          ? `LIVE · ${liveVenues[0].venue.toUpperCase()}`
+          : dash.venues.length > 1
+            ? `${dash.venues.length} VENUES · NONE ARMED`
+            : venueName.toUpperCase(),
+    venueLive: !inSim && liveVenues.length > 0,
     connection: inSim ? ('sim' as const) : dash.connection,
     equity: inSim ? demoPortfolio.equity_usd : dash.portfolio?.equity_usd ?? null,
     dayPnl: inSim ? demoRisk.daily_pnl_usd : dash.risk?.daily_pnl_usd ?? null,
@@ -231,12 +236,13 @@ export default function App() {
             <div className="dash__col">
               <PortfolioPanel portfolio={dash.portfolio} equitySeries={dash.equitySeries} />
               <WalletPanel wallet={dash.wallet} />
-              <PositionsTable positions={dash.positions} />
+              <PositionsTable positions={dash.positions} showVenue={dash.venues.length > 1} />
               <OrdersPanel orders={dash.orders} onCancel={handleCancelOrder} />
               <TradesTable trades={dash.trades} />
             </div>
 
             <div className="dash__col">
+              <VenuesPanel venues={dash.venues} />
               <RiskPanel risk={dash.risk} positions={dash.positions} trades={dash.trades} />
               <StrategyPanel
                 strategy={dash.strategy}

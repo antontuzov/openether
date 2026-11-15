@@ -669,10 +669,15 @@ async fn venues(State(state): State<Arc<AppState>>) -> Json<Vec<serde_json::Valu
             Some(connector) => connector.health().await.is_ok(),
             None => false,
         };
+        // `tradable` is whether the venue can place an order at all in this
+        // build; `live` is whether it may do so with real money right now. An
+        // armed Hyperliquid is tradable in neither sense.
+        let tradable = *venue == Venue::Paper || venue.trades_live();
         out.push(serde_json::json!({
             "venue": venue.as_str(),
             "healthy": healthy,
-            "live": state.config.is_live(*venue) && *venue != Venue::Paper,
+            "tradable": tradable,
+            "live": state.config.is_live(*venue) && venue.trades_live(),
             "active": *venue == state.venue(),
             "max_order_notional_usd": state.config.armed_cap(*venue),
         }));

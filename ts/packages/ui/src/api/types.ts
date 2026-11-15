@@ -210,11 +210,18 @@ export interface StrategyInfo {
   fuel_used: number;
 }
 
-/** Health of a single venue. */
+/** Health of a single configured venue. */
 export interface VenueHealth {
   venue: Venue;
   healthy: boolean;
+  /** Whether the venue can place an order at all in this build. */
+  tradable: boolean;
+  /** Whether it may place real orders right now: armed and not simulated. */
   live: boolean;
+  /** The venue the book is reported under. */
+  active: boolean;
+  /** The per-order cap the risk layer applies to this venue. */
+  max_order_notional_usd: number;
 }
 
 /** Engine lifecycle status pushed as a `status` frame. */

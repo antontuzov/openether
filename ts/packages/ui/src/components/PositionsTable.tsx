@@ -4,6 +4,8 @@ import { Panel } from './Panel';
 
 interface PositionsTableProps {
   positions: Position[];
+  /** Show which venue holds each position; meaningful only with several venues. */
+  showVenue?: boolean;
 }
 
 function sideOf(qty: number): 'long' | 'short' | 'flat' {
@@ -12,7 +14,7 @@ function sideOf(qty: number): 'long' | 'short' | 'flat' {
   return 'flat';
 }
 
-export function PositionsTable({ positions }: PositionsTableProps) {
+export function PositionsTable({ positions, showVenue = false }: PositionsTableProps) {
   return (
     <Panel title="Positions" hint={`${positions.length} open`} bodyClassName="panel__bd--flush">
       {positions.length === 0 ? (
@@ -61,7 +63,14 @@ export function PositionsTable({ positions }: PositionsTableProps) {
                 const side = sideOf(position.qty);
                 return (
                   <tr key={`${position.venue}-${position.symbol}`}>
-                    <td className="sym">{position.symbol}</td>
+                    <td className="sym">
+                      {position.symbol}
+                      {showVenue ? (
+                        <span className="venue-tag" title="The venue that holds this position">
+                          {position.venue}
+                        </span>
+                      ) : null}
+                    </td>
                     <td>
                       <span className={`side side--${side}`}>{side.toUpperCase()}</span>
                     </td>

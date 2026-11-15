@@ -1033,6 +1033,111 @@ body::after {
   color: var(--fg-3);
 }
 
+/* ---------------------------------------------------------------- venues */
+
+.venue-tag {
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--line-2);
+  background: var(--overlay-1);
+  color: var(--fg-3);
+  font-family: var(--mono);
+  font-size: 8.5px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  vertical-align: 1px;
+}
+
+.venues {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.venues__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+.venues__row:last-child {
+  border-bottom: none;
+}
+
+.venues__dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+}
+
+.venues__dot--ok {
+  background: var(--up);
+}
+
+.venues__dot--bad {
+  background: var(--down);
+}
+
+.venues__name {
+  color: var(--fg-hi);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.venues__state {
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--line-2);
+  color: var(--fg-3);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.venues__state--live {
+  color: var(--tint-down);
+  border-color: color-mix(in srgb, var(--down) 50%, transparent);
+  background: var(--down-dim);
+}
+
+.venues__state--paper {
+  color: var(--fg-2);
+}
+
+.venues__state--readonly {
+  color: var(--fg-3);
+}
+
+.venues__state--unarmed {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 50%, transparent);
+  background: var(--warn-dim);
+}
+
+.venues__book {
+  padding: 1px 5px;
+  border: 1px dashed var(--line-2);
+  border-radius: 3px;
+  color: var(--fg-3);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.venues__cap {
+  margin-left: auto;
+  color: var(--fg-2);
+  white-space: nowrap;
+}
+
 /* ------------------------------------------------------------ empty states */
 
 .empty {
